@@ -42,7 +42,9 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 static void S_Voip_Play_Callback (cvar_t *var, char *string, qbool *cancel);
 void CL_SendClientCommand (qbool reliable, char *format, ...);
 
+#ifndef __ANDROID__
 static cvar_t s_inputdevice = { "s_inputdevice", "0" };                                // SDL device to use as microphone
+#endif
 static cvar_t cl_voip_send = { "cl_voip_send", "0" };                                  // Sends voice-over-ip data to the server whenever it is set.
 static cvar_t cl_voip_vad_threshhold = { "cl_voip_vad_threshhold", "15" };             // This is the threshhold for voice-activation-detection when sending voip data.
 static cvar_t cl_voip_vad_delay = { "cl_voip_vad_delay", "0.3" };                      // Keeps sending voice data for this many seconds after voice activation would normally stop.
@@ -130,6 +132,11 @@ static qbool S_Speex_Init (void)
 
 static int S_CaptureDriverInit (int sampleRate)
 {
+#ifdef __ANDROID__
+	(void)sampleRate;
+	Com_Printf ("Android VOIP capture is not enabled in this build.\n");
+	return 0;
+#else
 	SDL_AudioDeviceID inputdevid = 0;
 	SDL_AudioSpec desired, obtained;
 	int ret = 0;
@@ -184,6 +191,7 @@ static int S_CaptureDriverInit (int sampleRate)
 	SDL_PauseAudioDevice (inputdevid, 0);
 
 	return inputdevid;
+#endif
 }
 
 static void S_CaptureDriverStart (void *ctx)

@@ -52,13 +52,13 @@ qbool VK_CreateSwapChain(SDL_Window* window, VkInstance instance, VkSurfaceKHR s
 	createInfo.imageArrayLayers = 1;
 	createInfo.imageColorSpace = vk_options.physicalDeviceSurfaceFormat.colorSpace;
 	createInfo.imageFormat = vk_options.physicalDeviceSurfaceFormat.format;
-	if (vk_options.physicalDeviceSurfaceCapabilities.currentExtent.width == ~(uint32_t)0) {
+	if (vk_options.physicalDeviceSurfaceCapabilities.currentExtent.width != ~(uint32_t)0) {
 		createInfo.imageExtent = vk_options.physicalDeviceSurfaceCapabilities.currentExtent;
 	}
 	else {
 		int width, height;
 
-		SDL_GL_GetDrawableSize(window, &width, &height);
+		SDL_Vulkan_GetDrawableSize(window, &width, &height);
 
 		width = bound(vk_options.physicalDeviceSurfaceCapabilities.minImageExtent.width, width, vk_options.physicalDeviceSurfaceCapabilities.maxImageExtent.width);
 		height = bound(vk_options.physicalDeviceSurfaceCapabilities.minImageExtent.height, height, vk_options.physicalDeviceSurfaceCapabilities.maxImageExtent.height);
@@ -128,8 +128,57 @@ qbool VK_CreateSwapChain(SDL_Window* window, VkInstance instance, VkSurfaceKHR s
 	return true;
 }
 
+qbool VK_CreateSwapChainFramebuffers(void)
+{
+	uint32_t i;
+	VkRenderPass renderPass = VK_MainRenderPass();
+
+	if (renderPass == VK_NULL_HANDLE || !vk_options.swapChain.imageViews) {
+		return false;
+	}
+
+	vk_options.swapChain.framebuffers = Q_malloc(vk_options.swapChain.imageCount * sizeof(vk_options.swapChain.framebuffers[0]));
+	for (i = 0; i < vk_options.swapChain.imageCount; ++i) {
+		VkImageView attachments[] = { vk_options.swapChain.imageViews[i] };
+		VkFramebufferCreateInfo framebufferInfo = { 0 };
+
+		framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+		framebufferInfo.renderPass = renderPass;
+		framebufferInfo.attachmentCount = sizeof(attachments) / sizeof(attachments[0]);
+		framebufferInfo.pAttachments = attachments;
+		framebufferInfo.width = vk_options.swapChain.imageSize.width;
+		framebufferInfo.height = vk_options.swapChain.imageSize.height;
+		framebufferInfo.layers = 1;
+
+		if (vkCreateFramebuffer(vk_options.logicalDevice, &framebufferInfo, NULL, &vk_options.swapChain.framebuffers[i]) != VK_SUCCESS) {
+			VK_DestroySwapChainFramebuffers();
+			return false;
+		}
+	}
+
+	return true;
+}
+
+void VK_DestroySwapChainFramebuffers(void)
+{
+	if (vk_options.swapChain.framebuffers) {
+		uint32_t i;
+
+		for (i = 0; i < vk_options.swapChain.imageCount; ++i) {
+			if (vk_options.swapChain.framebuffers[i] != VK_NULL_HANDLE) {
+				vkDestroyFramebuffer(vk_options.logicalDevice, vk_options.swapChain.framebuffers[i], NULL);
+			}
+		}
+
+		Q_free(vk_options.swapChain.framebuffers);
+		vk_options.swapChain.framebuffers = NULL;
+	}
+}
+
 void VK_DestroySwapChain(void)
 {
+	VK_DestroySwapChainFramebuffers();
+
 	if (vk_options.swapChain.imageViews) {
 		uint32_t i;
 
@@ -138,12 +187,17 @@ void VK_DestroySwapChain(void)
 		}
 
 		Q_free(vk_options.swapChain.imageViews);
+		vk_options.swapChain.imageViews = NULL;
 	}
 
 	if (vk_options.swapChain.handle != VK_NULL_HANDLE) {
 		vkDestroySwapchainKHR(vk_options.logicalDevice, vk_options.swapChain.handle, NULL);
 		vk_options.swapChain.handle = VK_NULL_HANDLE;
 	}
+
+	Q_free(vk_options.swapChain.images);
+	vk_options.swapChain.images = NULL;
+	vk_options.swapChain.imageCount = 0;
 }
 
 #endif // RENDERER_OPTION_VULKAN

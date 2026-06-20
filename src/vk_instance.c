@@ -117,7 +117,7 @@ qbool VK_CreateInstance(SDL_Window* window, VkInstance* instance)
 	createInfo.ppEnabledExtensionNames = extensionStrings;
 
 	result = vkCreateInstance(&createInfo, NULL, instance);
-	Q_free((void*)extensionStrings);
+	Q_free(extensionStrings);
 	if (result != VK_SUCCESS) {
 		*instance = NULL;
 		Con_Printf("vulkan:GetInstanceExtensions() failed\n");

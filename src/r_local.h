@@ -51,7 +51,9 @@ extern struct mleaf_s* r_oldviewleaf2;	// 2 is for watervis hack
 #undef EZ_MULTIPLE_RENDERERS
 #endif
 
-#if defined(RENDERER_OPTION_CLASSIC_OPENGL) && defined(RENDERER_OPTION_MODERN_OPENGL)
+#if (defined(RENDERER_OPTION_CLASSIC_OPENGL) && defined(RENDERER_OPTION_MODERN_OPENGL)) || \
+	(defined(RENDERER_OPTION_CLASSIC_OPENGL) && defined(RENDERER_OPTION_VULKAN)) || \
+	(defined(RENDERER_OPTION_MODERN_OPENGL) && defined(RENDERER_OPTION_VULKAN))
 #define EZ_MULTIPLE_RENDERERS
 
 extern cvar_t vid_renderer;
@@ -72,6 +74,10 @@ void R_SelectRenderer(void);
 #define R_UseImmediateOpenGL()    (0)
 #define R_UseModernOpenGL()       (1)
 #define R_UseVulkan()             (0)
+#elif defined(RENDERER_OPTION_VULKAN)
+#define R_UseImmediateOpenGL()    (0)
+#define R_UseModernOpenGL()       (0)
+#define R_UseVulkan()             (1)
 #else
 #error No renderer options defined
 #endif

@@ -29,19 +29,20 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include "vk_local.h"
 
 typedef enum {
-	vk_renderpass_none,
+	vk_renderpass_main,
 
 	vk_renderpass_count
 } vk_renderpass_id;
 
 static VkRenderPass renderPasses[vk_renderpass_count];
 
-qbool VK_RenderPassCreate(vk_renderpass_id id)
+qbool VK_RenderPassCreate(void)
 {
 	VkAttachmentDescription colorAttachment;
 	VkAttachmentReference colorAttachmentRef;
 	VkSubpassDescription subpass;
 	VkRenderPassCreateInfo renderPassInfo;
+	const vk_renderpass_id id = vk_renderpass_main;
 
 	// single color buffer attachment
 	VK_InitialiseStructure(colorAttachment);
@@ -80,7 +81,12 @@ qbool VK_RenderPassCreate(vk_renderpass_id id)
 	return true;
 }
 
-void VK_RenderPassDelete(vk_renderpass_id id)
+VkRenderPass VK_MainRenderPass(void)
+{
+	return renderPasses[vk_renderpass_main];
+}
+
+void VK_RenderPassDelete(void)
 {
 	int i;
 

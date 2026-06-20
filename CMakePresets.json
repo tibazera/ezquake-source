@@ -207,6 +207,37 @@
             }
         },
         {
+            "name": "android-arm64",
+            "displayName": "Android arm64-v8a",
+            "description": "Configure Android native library for arm64-v8a using the Android NDK and vcpkg",
+            "generator": "Ninja Multi-Config",
+            "inherits": "template-vcpkg",
+            "cacheVariables": {
+                "CMAKE_SYSTEM_NAME": "Android",
+                "CMAKE_SYSTEM_VERSION": "29",
+                "CMAKE_ANDROID_ARCH_ABI": "arm64-v8a",
+                "ANDROID_ABI": "arm64-v8a",
+                "ANDROID_PLATFORM": "android-29",
+                "CMAKE_ANDROID_NDK": "$env{HOME}/Android/Sdk/ndk/28.2.13676358",
+                "VCPKG_CHAINLOAD_TOOLCHAIN_FILE": "$env{HOME}/Android/Sdk/ndk/28.2.13676358/build/cmake/android.toolchain.cmake",
+                "VCPKG_TARGET_TRIPLET": "arm64-android",
+                "RENDERER_CLASSIC_OPENGL": "OFF",
+                "RENDERER_MODERN_OPENGL": "OFF",
+                "RENDERER_VULKAN": "ON",
+                "ENABLE_LTO": "OFF"
+            },
+            "environment": {
+                "ANDROID_HOME": "$env{HOME}/Android/Sdk",
+                "ANDROID_SDK_ROOT": "$env{HOME}/Android/Sdk",
+                "ANDROID_NDK_HOME": "$env{HOME}/Android/Sdk/ndk/28.2.13676358"
+            },
+            "condition": {
+                "type": "notEquals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
+        },
+        {
             "name": "dynamic",
             "description": "Configure XCode project file",
             "generator": "Ninja Multi-Config",
@@ -223,6 +254,20 @@
         }
     ],
     "buildPresets": [
+        {
+            "name": "android-arm64-debug",
+            "configurePreset": "android-arm64",
+            "displayName": "Build Android arm64-v8a debug",
+            "description": "Build Android arm64-v8a Debug configuration",
+            "configuration": "Debug"
+        },
+        {
+            "name": "android-arm64-release",
+            "configurePreset": "android-arm64",
+            "displayName": "Build Android arm64-v8a release",
+            "description": "Build Android arm64-v8a Release configuration",
+            "configuration": "Release"
+        },
         {
             "name": "msbuild-x64-debug",
             "configurePreset": "msbuild-x64",

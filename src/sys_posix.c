@@ -337,7 +337,7 @@ int main(int argc, char **argv)
 
 	// we need to check for -noconinput and -nostdout before Host_Init is called
 	if (!(noconinput = COM_CheckParm(cmdline_param_client_nostdinput)))
-		fcntl(0, F_SETFL, fcntl (0, F_GETFL, 0) | FNDELAY);
+		fcntl(0, F_SETFL, fcntl (0, F_GETFL, 0) | O_NDELAY);
 
 	if (COM_CheckParm(cmdline_param_client_nostdoutput))
 		sys_nostdout.value = 1;
