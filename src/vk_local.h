@@ -27,6 +27,8 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 typedef struct SDL_Window SDL_Window;
 typedef struct gltexture_s gltexture_t;
+struct entity_s;
+struct model_s;
 
 #define EZ_VKFUNC_DECL_LOAD(instance, func) PFN_##func q##func = (PFN_##func)vkGetInstanceProcAddr(instance, #func)
 #define EZ_VKFUNC_LOAD(instance, func) q##func = (PFN_##func)vkGetInstanceProcAddr(instance, #func)
@@ -36,6 +38,8 @@ typedef struct gltexture_s gltexture_t;
 qbool VK_Initialise(SDL_Window* window);
 void VK_Shutdown(r_shutdown_mode_t mode);
 void VK_PopulateConfig(void);
+void VK_RequestSwapChainRecreate(void);
+void VK_RequestSurfaceRecreate(void);
 
 // vk_instance.c
 qbool VK_CreateInstance(SDL_Window* window, VkInstance* instance);
@@ -65,6 +69,7 @@ void VK_DestroySwapChainFramebuffers(void);
 qbool VK_RenderPassCreate(void);
 void VK_RenderPassDelete(void);
 VkRenderPass VK_MainRenderPass(void);
+VkFormat VK_DepthFormat(void);
 
 // vk_blending.c
 void VK_BlendingConfigure(VkPipelineColorBlendStateCreateInfo* info, VkPipelineColorBlendAttachmentState* blending, r_blendfunc_t func);
@@ -86,6 +91,7 @@ void VK_AllocateTextureNames(gltexture_t* glt);
 void VK_UploadTexture(texture_ref texture, int mode, int width, int height, byte* data);
 VkDescriptorSetLayout VK_TextureDescriptorSetLayout(void);
 VkDescriptorSet VK_TextureDescriptorSet(texture_ref texture);
+qbool VK_TextureDescriptorImageInfo(texture_ref texture, qbool nearest, VkDescriptorImageInfo* info);
 qbool VK_TextureReady(texture_ref texture);
 void VK_TextureInitialiseState(void);
 void VK_TextureShutdown(void);
@@ -107,6 +113,32 @@ void VK_TextureSetAnisotropy(texture_ref texture, int anisotropy);
 // vk_draw.c
 void VK_HudResourcesShutdown(void);
 void VK_HudSwapchainChanged(void);
+
+// vk_world.c
+void VK_WorldResourcesShutdown(void);
+void VK_PrepareModelRendering(qbool vid_restart);
+void VK_PreRenderView(void);
+void VK_DrawWorld(void);
+void VK_ChainBrushModelSurfaces(struct model_s* model, struct entity_s* ent);
+void VK_DrawBrushModel(struct entity_s* ent, qbool polygonOffset, qbool caustics);
+void VK_RenderView(void);
+
+// vk_aliasmodel.c
+void VK_AliasModelResourcesShutdown(void);
+void VK_AliasModelFrameReset(void);
+void VK_AliasQueueDraw(struct entity_s* ent, struct model_s* model, int firstVertex, int vertexCount, texture_ref texture, qbool outline, int effects, int render_effects, float lerpfrac);
+void VK_DrawAliasFrame(struct entity_s* ent, struct model_s* model, int pose1, int pose2, texture_ref texture, texture_ref fb_texture, qbool outline, int effects, int render_effects, float lerpfrac);
+void VK_DrawAliasModelShadow(struct entity_s* ent);
+void VK_DrawAlias3Model(struct entity_s* ent, qbool outline, qbool additive_pass);
+void VK_RenderAliasModels(qbool postscene);
+
+// vk_sprite3d.c
+void VK_Sprite3DResourcesShutdown(void);
+void VK_DrawSpriteModel(struct entity_s* ent);
+void VK_DrawSimpleItem(struct model_s* model, int skin, vec3_t origin, float scale, vec3_t up, vec3_t right);
+void VK_DrawClassicParticles(int particles_to_draw);
+void VK_Prepare3DSprites(void);
+void VK_Draw3DSprites(void);
 
 // vk_main.c
 VkCommandBuffer VK_CurrentCommandBuffer(void);
@@ -134,6 +166,9 @@ typedef struct vk_options_s {
 		VkImage* images;
 		VkImageView* imageViews;
 		VkFramebuffer* framebuffers;
+		VkImage depthImage;
+		VkDeviceMemory depthImageMemory;
+		VkImageView depthImageView;
 		VkExtent2D imageSize;
 		int imageCount;
 	} swapChain;

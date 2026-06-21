@@ -39,6 +39,8 @@ static VkDescriptorSetLayout textureDescriptorSetLayout;
 static VkDescriptorPool textureDescriptorPool;
 static texture_ref boundTextures[16];
 
+static qbool VK_TextureReferenceInRange(texture_ref texture);
+
 static qbool VK_TextureReferenceInRange(texture_ref texture)
 {
 	return texture.index > 0 && texture.index < MAX_GLTEXTURES;
@@ -407,6 +409,25 @@ VkDescriptorSet VK_TextureDescriptorSet(texture_ref texture)
 		return VK_NULL_HANDLE;
 	}
 	return textureData[texture.index].descriptorSet;
+}
+
+qbool VK_TextureDescriptorImageInfo(texture_ref texture, qbool nearest, VkDescriptorImageInfo* info)
+{
+	vk_texture_t* vktex;
+
+	if (!info || !VK_TextureReferenceInRange(texture)) {
+		return false;
+	}
+	vktex = &textureData[texture.index];
+	if (vktex->imageView == VK_NULL_HANDLE || !VK_TextureEnsureSamplers(vktex)) {
+		return false;
+	}
+
+	VK_InitialiseStructure(*info);
+	info->imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	info->imageView = vktex->imageView;
+	info->sampler = nearest ? vktex->nearestSampler : vktex->linearSampler;
+	return info->sampler != VK_NULL_HANDLE;
 }
 
 qbool VK_TextureReady(texture_ref texture)

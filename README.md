@@ -67,6 +67,137 @@ On Linux, `./build-linux.sh` produces an ezQuake binary in the top directory.
 For a more in-depth description of how to build on all platforms, have a look at 
 [BUILD.md](BUILD.md).
 
+## Android build
+
+The Android port is built with Gradle, CMake, vcpkg, SDL2, Oboe, and Vulkan.
+Gradle drives the Android native build and packages `libezquake.so` into the APK.
+
+The current Android build is:
+
+* `arm64-v8a` only
+* Vulkan renderer only
+* Oboe audio backend
+* min SDK 29, target/compile SDK 36
+* pinned Android NDK `28.2.13676358`
+* CMake `3.22.1` from the Android SDK
+
+At runtime the APK expects Quake/nQuake data in:
+
+```text
+/storage/emulated/0/Documents/ezQuake
+```
+
+The minimum data layout is:
+
+```text
+Documents/ezQuake/
+  id1/
+    pak0.pak
+    pak1.pak
+```
+
+### Android build prerequisites
+
+On Ubuntu, install the host tools, native desktop dependencies, Vulkan shader
+compiler, and a JDK:
+
+```sh
+sudo apt update
+sudo apt install -y \
+  git curl zip unzip tar \
+  build-essential cmake ninja-build pkg-config \
+  autoconf automake libtool \
+  glslang-tools openjdk-17-jdk \
+  libsdl2-dev libjansson-dev libexpat1-dev libcurl4-openssl-dev \
+  libpng-dev libjpeg-dev libspeex-dev libspeexdsp-dev \
+  libfreetype-dev libsndfile1-dev libpcre2-dev libminizip-dev \
+  libgl1-mesa-dev
+```
+
+Install the Android SDK command-line tools and the SDK packages used by this
+project:
+
+```sh
+export ANDROID_HOME="$HOME/Android/Sdk"
+export ANDROID_SDK_ROOT="$ANDROID_HOME"
+mkdir -p "$ANDROID_HOME/cmdline-tools"
+
+curl -L \
+  "https://dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip" \
+  -o /tmp/android-commandlinetools.zip
+
+rm -rf /tmp/android-cmdline-tools "$ANDROID_HOME/cmdline-tools/latest"
+mkdir -p /tmp/android-cmdline-tools
+unzip -q /tmp/android-commandlinetools.zip -d /tmp/android-cmdline-tools
+mv /tmp/android-cmdline-tools/cmdline-tools "$ANDROID_HOME/cmdline-tools/latest"
+
+export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
+
+yes | sdkmanager --licenses
+sdkmanager \
+  "platform-tools" \
+  "platforms;android-36" \
+  "build-tools;36.0.0" \
+  "cmake;3.22.1" \
+  "ndk;28.2.13676358"
+```
+
+For future shells, keep these exports in your shell profile:
+
+```sh
+export ANDROID_HOME="$HOME/Android/Sdk"
+export ANDROID_SDK_ROOT="$ANDROID_HOME"
+export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/28.2.13676358"
+export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
+```
+
+### End-to-end build commands
+
+From a fresh checkout, initialize submodules and vcpkg:
+
+```sh
+git submodule update --init --recursive
+./bootstrap.sh
+```
+
+Build a native Linux desktop binary:
+
+```sh
+./build-linux.sh
+```
+
+The desktop binary is produced under `build/`, for example
+`build/ezquake-linux-x86_64`.
+
+Build the Android native library and debug APK:
+
+```sh
+export ANDROID_HOME="$HOME/Android/Sdk"
+export ANDROID_SDK_ROOT="$ANDROID_HOME"
+export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/28.2.13676358"
+
+./gradlew :app:assembleDebug
+```
+
+The APK is written to:
+
+```text
+app/build/outputs/apk/debug/app-debug.apk
+```
+
+To install it on a connected Android device:
+
+```sh
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+To copy a local nQuake-style data tree to the device:
+
+```sh
+adb shell 'mkdir -p /storage/emulated/0/Documents/ezQuake'
+adb push /path/to/nquake/. /storage/emulated/0/Documents/ezQuake/
+```
+
 ## Nightly builds
 
 Nightly builds can be found [here][nightly]

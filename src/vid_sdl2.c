@@ -25,6 +25,9 @@
 
 #include <SDL.h>
 #include <SDL_syswm.h>
+#if defined(__ANDROID__) && defined(RENDERER_OPTION_VULKAN)
+#include <SDL_vulkan.h>
+#endif
 
 #ifdef X11_GAMMA_WORKAROUND
 #include <X11/extensions/xf86vmode.h>
@@ -69,6 +72,10 @@ void Sys_ActiveAppChanged (void);
 SDL_GLContext GLM_SDL_CreateContext(SDL_Window* window);
 SDL_GLContext GLC_SDL_CreateContext(SDL_Window* window);
 qbool VK_Initialise(SDL_Window* window);
+#ifdef RENDERER_OPTION_VULKAN
+void VK_RequestSwapChainRecreate(void);
+void VK_RequestSurfaceRecreate(void);
+#endif
 
 #ifdef __linux__
 // This is hack to ignore keyboard events we receive between FOCUS_GAINED & TAKE_FOCUS
@@ -128,6 +135,11 @@ qbool Minimized = false;
 
 double vid_vsync_lag;
 double vid_last_swap_time;
+
+#ifdef __ANDROID__
+static void VID_SDL_NormalizeLandscapeSize(int *width, int *height);
+static qbool VID_SDL_ApplyAndroidDrawableResolution(const char *reason);
+#endif
 
 static SDL_DisplayMode *modelist;
 static int modelist_count;
@@ -262,6 +274,75 @@ cvar_t vid_framebuffer_smooth      = {"vid_framebuffer_smooth",        "1",     
 cvar_t vid_framebuffer_sshotmode   = {"vid_framebuffer_sshotmode",     "0" };
 cvar_t vid_framebuffer_multisample = {"vid_framebuffer_multisample",   "0" };
 cvar_t vid_framebuffer_fxaa        = {"vid_framebuffer_fxaa",          "0" };
+
+#ifdef __ANDROID__
+static void VID_SDL_NormalizeLandscapeSize(int *width, int *height)
+{
+	if (width && height && *width > 0 && *height > 0 && *width < *height) {
+		int temp = *width;
+		*width = *height;
+		*height = temp;
+	}
+}
+
+static qbool VID_SDL_GetDrawableSize(int *width, int *height)
+{
+	int drawable_width = 0;
+	int drawable_height = 0;
+
+	if (!sdl_window || !width || !height) {
+		return false;
+	}
+
+#ifdef RENDERER_OPTION_VULKAN
+	if (R_UseVulkan()) {
+		SDL_Vulkan_GetDrawableSize(sdl_window, &drawable_width, &drawable_height);
+	}
+	else
+#endif
+	{
+		SDL_GL_GetDrawableSize(sdl_window, &drawable_width, &drawable_height);
+	}
+
+	if (drawable_width <= 0 || drawable_height <= 0) {
+		SDL_GetWindowSize(sdl_window, &drawable_width, &drawable_height);
+	}
+	if (drawable_width <= 0 || drawable_height <= 0) {
+		return false;
+	}
+
+	VID_SDL_NormalizeLandscapeSize(&drawable_width, &drawable_height);
+	*width = drawable_width;
+	*height = drawable_height;
+	return true;
+}
+
+static qbool VID_SDL_ApplyAndroidDrawableResolution(const char *reason)
+{
+	int drawable_width;
+	int drawable_height;
+
+	if (!VID_SDL_GetDrawableSize(&drawable_width, &drawable_height)) {
+		return false;
+	}
+	if (glConfig.vidWidth == drawable_width && glConfig.vidHeight == drawable_height) {
+		return false;
+	}
+
+	glConfig.vidWidth = drawable_width;
+	glConfig.vidHeight = drawable_height;
+	last_working_width = drawable_width;
+	last_working_height = drawable_height;
+	last_working_values = true;
+	Cvar_AutoSetInt(&vid_width, drawable_width);
+	Cvar_AutoSetInt(&vid_height, drawable_height);
+
+	if (developer.integer || r_verbose.integer) {
+		Com_Printf("android video: %s drawable resolution %dx%d\n", reason ? reason : "updated", drawable_width, drawable_height);
+	}
+	return true;
+}
+#endif
 
 //
 // function declaration
@@ -606,11 +687,15 @@ static void window_event(SDL_WindowEvent *event)
 	int flags = SDL_GetWindowFlags(sdl_window);
 
 	switch (event->event) {
+		case SDL_WINDOWEVENT_HIDDEN:
 		case SDL_WINDOWEVENT_MINIMIZED:
 			Minimized = true;
 
 		case SDL_WINDOWEVENT_FOCUS_LOST:
 			ActiveApp = false;
+#ifdef __ANDROID__
+			Minimized = true;
+#endif
 #ifdef __linux__
 			block_keyboard_input = in_ignore_unfocused_keyb.integer;
 #endif
@@ -629,10 +714,17 @@ static void window_event(SDL_WindowEvent *event)
 		case SDL_WINDOWEVENT_FOCUS_GAINED:
 			TP_ExecTrigger("f_focusgained");
 			/* Fall through */
+		case SDL_WINDOWEVENT_SHOWN:
+		case SDL_WINDOWEVENT_EXPOSED:
 		case SDL_WINDOWEVENT_RESTORED:
 			Minimized = false;
 			ActiveApp = true;
 			scr_skipupdate = 0;
+#if defined(__ANDROID__) && defined(RENDERER_OPTION_VULKAN)
+			if (R_UseVulkan()) {
+				VK_RequestSurfaceRecreate();
+			}
+#endif
 #ifdef X11_GAMMA_WORKAROUND
 			if (vid_gamma_workaround.integer) {
 				v_gamma.modified = true;
@@ -658,18 +750,36 @@ static void window_event(SDL_WindowEvent *event)
 			break;
 
 		case SDL_WINDOWEVENT_RESIZED:
+		case SDL_WINDOWEVENT_SIZE_CHANGED:
 			if (!(flags & SDL_WINDOW_FULLSCREEN)) {
-				glConfig.vidWidth = event->data1;
-				glConfig.vidHeight = event->data2;
+				int width = event->data1;
+				int height = event->data2;
+#ifdef __ANDROID__
+				if (!VID_SDL_GetDrawableSize(&width, &height)) {
+					VID_SDL_NormalizeLandscapeSize(&width, &height);
+				}
+#endif
+				glConfig.vidWidth = width;
+				glConfig.vidHeight = height;
 				if (r_win_save_size.integer) {
-					Cvar_LatchedSetValue(&vid_win_width, event->data1);
-					Cvar_LatchedSetValue(&vid_win_height, event->data2);
+					Cvar_LatchedSetValue(&vid_win_width, width);
+					Cvar_LatchedSetValue(&vid_win_height, height);
 				}
 				if (!r_conwidth.integer || !r_conheight.integer)
 					VID_UpdateConRes();
 			}
+#ifdef __ANDROID__
+			else if (VID_SDL_ApplyAndroidDrawableResolution("event")) {
+				VID_UpdateConRes();
+			}
+#endif
 			if (renderer.InvalidateViewport)
 				renderer.InvalidateViewport();
+#if defined(__ANDROID__) && defined(RENDERER_OPTION_VULKAN)
+			if (R_UseVulkan()) {
+				VK_RequestSwapChainRecreate();
+			}
+#endif
 			break;
 
 #ifdef __linux__
@@ -802,13 +912,9 @@ static void keyb_textinputevent(char* text)
 static void IN_UpdateTextInputState(void)
 {
 #ifdef __ANDROID__
-	qbool text_input_required = (key_dest == key_console || key_dest == key_message);
 	SDL_bool active = SDL_IsTextInputActive();
 
-	if (text_input_required && !active) {
-		SDL_StartTextInput();
-	}
-	else if (!text_input_required && active) {
+	if (active) {
 		SDL_StopTextInput();
 	}
 #endif
@@ -948,6 +1054,23 @@ static void HandleEvents(void)
 		case SDL_WINDOWEVENT:
 			window_event(&event.window);
 			break;
+#ifdef __ANDROID__
+		case SDL_APP_WILLENTERBACKGROUND:
+		case SDL_APP_DIDENTERBACKGROUND:
+			ActiveApp = false;
+			Minimized = true;
+			break;
+		case SDL_APP_WILLENTERFOREGROUND:
+		case SDL_APP_DIDENTERFOREGROUND:
+			ActiveApp = true;
+			Minimized = false;
+#ifdef RENDERER_OPTION_VULKAN
+			if (R_UseVulkan()) {
+				VK_RequestSurfaceRecreate();
+			}
+#endif
+			break;
+#endif
 		case SDL_KEYDOWN:
 		case SDL_KEYUP:
 #ifdef __APPLE__
@@ -1127,6 +1250,12 @@ static void VID_SDL_SetHints(void)
 #endif
 
 #ifdef __ANDROID__
+#ifdef SDL_HINT_ENABLE_SCREEN_KEYBOARD
+	SDL_SetHintWithPriority(SDL_HINT_ENABLE_SCREEN_KEYBOARD, "0", SDL_HINT_OVERRIDE);
+#endif
+#ifdef SDL_HINT_ORIENTATIONS
+	SDL_SetHintWithPriority(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight", SDL_HINT_OVERRIDE);
+#endif
 #ifdef SDL_HINT_MOUSE_TOUCH_EVENTS
 	SDL_SetHint(SDL_HINT_MOUSE_TOUCH_EVENTS, "0");
 #endif
@@ -1144,6 +1273,12 @@ static void VID_SDL_SetHints(void)
 #endif
 #ifdef SDL_HINT_ANDROID_TRAP_BACK_BUTTON
 		Com_Printf("android input: %s=%s\n", SDL_HINT_ANDROID_TRAP_BACK_BUTTON, SDL_GetHint(SDL_HINT_ANDROID_TRAP_BACK_BUTTON));
+#endif
+#ifdef SDL_HINT_ENABLE_SCREEN_KEYBOARD
+		Com_Printf("android input: %s=%s\n", SDL_HINT_ENABLE_SCREEN_KEYBOARD, SDL_GetHint(SDL_HINT_ENABLE_SCREEN_KEYBOARD));
+#endif
+#ifdef SDL_HINT_ORIENTATIONS
+		Com_Printf("android input: %s=%s\n", SDL_HINT_ORIENTATIONS, SDL_GetHint(SDL_HINT_ORIENTATIONS));
 #endif
 		Com_Printf("android input: %s=%s\n", SDL_HINT_MOUSE_RELATIVE_MODE_WARP, SDL_GetHint(SDL_HINT_MOUSE_RELATIVE_MODE_WARP));
 	}
@@ -1264,11 +1399,16 @@ static void VID_SetupResolution(void)
 			if (SDL_GetDesktopDisplayMode(display_nbr, &display_mode) == 0) {
 				glConfig.vidWidth = last_working_width = display_mode.w;
 				glConfig.vidHeight = last_working_height = display_mode.h;
+#ifdef __ANDROID__
+				VID_SDL_NormalizeLandscapeSize(&glConfig.vidWidth, &glConfig.vidHeight);
+				last_working_width = glConfig.vidWidth;
+				last_working_height = glConfig.vidHeight;
+#endif
 				glConfig.displayFrequency = last_working_hz = display_mode.refresh_rate;
 				last_working_display = display_nbr;
 				last_working_values = true;
-				Cvar_AutoSetInt(&vid_width, display_mode.w);
-				Cvar_AutoSetInt(&vid_height, display_mode.h);
+				Cvar_AutoSetInt(&vid_width, glConfig.vidWidth);
+				Cvar_AutoSetInt(&vid_height, glConfig.vidHeight);
 				Cvar_AutoSetInt(&r_displayRefresh, display_mode.refresh_rate);
 				return;
 			} else {
@@ -1306,6 +1446,10 @@ static void VID_SetupResolution(void)
 		glConfig.vidHeight = bound(240, vid_win_height.integer, vid_win_height.integer);
 		glConfig.displayFrequency = 0;
 	}
+
+#ifdef __ANDROID__
+	VID_SDL_NormalizeLandscapeSize(&glConfig.vidWidth, &glConfig.vidHeight);
+#endif
 }
 
 int VID_GetCurrentModeIndex(void)
@@ -1619,6 +1763,9 @@ static void VID_SDL_Init(void)
 						sdl_window = NULL;
 					}
 					else {
+#ifdef __ANDROID__
+						VID_SDL_ApplyAndroidDrawableResolution("initial");
+#endif
 						break;
 					}
 				}

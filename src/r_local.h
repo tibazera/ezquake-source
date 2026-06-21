@@ -87,7 +87,7 @@ void R_SelectRenderer(void);
 #define R_DebugProfileContext()  ((IsDeveloperMode() && COM_CheckParm(cmdline_param_client_video_r_debug)) || COM_CheckParm(cmdline_param_client_video_r_trace))
 #define R_CompressFullbrightTextures() (!R_UseImmediateOpenGL())
 #define R_LumaTexturesMustMatchDimensions() (!R_UseImmediateOpenGL())
-#define R_UseCubeMapForSkyBox() (!R_UseImmediateOpenGL() || GL_Supported(R_SUPPORT_SEAMLESS_CUBEMAPS))
+#define R_UseCubeMapForSkyBox() (!R_UseVulkan() && (!R_UseImmediateOpenGL() || GL_Supported(R_SUPPORT_SEAMLESS_CUBEMAPS)))
 
 // bloom.c
 void R_InitBloomTextures(void);

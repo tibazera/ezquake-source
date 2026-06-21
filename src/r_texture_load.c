@@ -150,6 +150,7 @@ mpic_t* R_LoadPicImage(const char *filename, char *id, int matchwidth, int match
 
 	if (mode & TEX_ALPHA) {
 		R_ImagePreMultiplyAlpha(data, real_width, real_height, false);
+		mode |= TEX_PREMUL_ALPHA;
 	}
 
 	R_TextureSizeRoundUp(pic.width, pic.height, &width, &height);
@@ -214,6 +215,7 @@ qbool R_LoadCharsetImage(char *filename, char *identifier, int flags, charset_t*
 	}
 
 	R_ImagePreMultiplyAlpha(data, real_width, real_height, false);
+	flags |= TEX_PREMUL_ALPHA;
 
 	if (!identifier) {
 		identifier = filename;
@@ -541,6 +543,11 @@ static void R_Upload32(gltexture_t* glt, unsigned *data, int width, int height, 
 		R_TextureUtil_Brighten32(newdata, width * height * 4);
 	}
 
+	if (R_UseVulkan() && (mode & TEX_ALPHA) && !(mode & TEX_PREMUL_ALPHA)) {
+		R_ImagePreMultiplyAlpha(newdata, width, height, mode & TEX_ZERO_ALPHA);
+		mode |= TEX_PREMUL_ALPHA;
+	}
+
 	if (R_UseImmediateOpenGL() || R_UseModernOpenGL()) {
 		GL_UploadTexture(glt->reference, glt->texmode, width, height, newdata);
 	}
@@ -589,6 +596,7 @@ static void R_Upload8(gltexture_t* glt, byte *data, int width, int height, int m
 				trans[i] = (p == 255) ? LittleLong(0xff535b9f) : table[p]; // Fullbright. Disable transparancy on fullbright colors (255).
 			}
 		}
+		mode |= TEX_PREMUL_ALPHA;
 	}
 	else if (mode & TEX_ALPHA) {
 		// If there are no transparent pixels, make it a 3 component
@@ -600,6 +608,9 @@ static void R_Upload8(gltexture_t* glt, byte *data, int width, int height, int m
 				mode |= TEX_ALPHA;
 			}
 			trans[i] = table[p];
+		}
+		if (mode & TEX_ALPHA) {
+			mode |= TEX_PREMUL_ALPHA;
 		}
 	}
 	else {

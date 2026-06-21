@@ -21,6 +21,7 @@ of the License, or (at your option) any later version.
 #include "r_matrix.h"
 #include "r_renderer.h"
 #include "r_state.h"
+#include "r_texture_internal.h"
 #include "tr_types.h"
 #include "glsl/constants.glsl"
 #include "vk_local.h"
@@ -470,12 +471,16 @@ static qbool VK_HudEnsureResources(void)
 	return true;
 }
 
-static qbool VK_HudBindImagePipeline(VkCommandBuffer commandBuffer, texture_ref texture)
+static qbool VK_HudBindImagePipeline(VkCommandBuffer commandBuffer, texture_ref texture, const char* draw_type, int start, int end)
 {
 	VkBuffer vertexBuffer;
 	VkDeviceSize offsets[] = { 0 };
 	VkDescriptorSet descriptorSet;
 	vk_hud_image_push_t push;
+
+	(void)draw_type;
+	(void)start;
+	(void)end;
 
 	if (!VK_TextureReady(texture)) {
 		return false;
@@ -572,7 +577,7 @@ void VK_HudDrawImages(texture_ref texture, int start, int end)
 		return;
 	}
 	VK_HudUploadImageDataIfDirty();
-	if (!VK_HudBindImagePipeline(commandBuffer, texture)) {
+	if (!VK_HudBindImagePipeline(commandBuffer, texture, "IMAGES", start, end)) {
 		return;
 	}
 
@@ -595,7 +600,7 @@ void VK_HudDrawPolygons(texture_ref texture, int start, int end)
 		return;
 	}
 	VK_HudUploadImageDataIfDirty();
-	if (!VK_HudBindImagePipeline(commandBuffer, texture)) {
+	if (!VK_HudBindImagePipeline(commandBuffer, texture, "POLYGONS", start, end)) {
 		return;
 	}
 
@@ -684,7 +689,7 @@ void VK_HudDrawLines(texture_ref texture, int start, int end)
 	buffers.Update(r_buffer_hud_image_vertex_data, sizeof(lineQuadData[0]) * lineCount * 4, lineQuadData);
 	hudImageBufferDirty = true;
 
-	if (!VK_HudBindImagePipeline(commandBuffer, texture)) {
+	if (!VK_HudBindImagePipeline(commandBuffer, texture, "LINES", 0, lineCount - 1)) {
 		return;
 	}
 

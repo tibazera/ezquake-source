@@ -532,6 +532,19 @@ if(RENDERER_VULKAN)
     add_vulkan_shader(vulkan_spirv_shaders ${VULKAN_SHADER_DIR}/vk_hud_image.frag vk_hud_image_frag.spv)
     add_vulkan_shader(vulkan_spirv_shaders ${VULKAN_SHADER_DIR}/vk_hud_color.vert vk_hud_color_vert.spv)
     add_vulkan_shader(vulkan_spirv_shaders ${VULKAN_SHADER_DIR}/vk_hud_color.frag vk_hud_color_frag.spv)
+    add_vulkan_shader(vulkan_spirv_shaders ${VULKAN_SHADER_DIR}/vk_world_flat.vert vk_world_flat_vert.spv)
+    add_vulkan_shader(vulkan_spirv_shaders ${VULKAN_SHADER_DIR}/vk_world_flat.frag vk_world_flat_frag.spv)
+    add_vulkan_shader(vulkan_spirv_shaders ${VULKAN_SHADER_DIR}/vk_world_textured.vert vk_world_textured_vert.spv)
+    add_vulkan_shader(vulkan_spirv_shaders ${VULKAN_SHADER_DIR}/vk_world_textured.frag vk_world_textured_frag.spv)
+    add_vulkan_shader(vulkan_spirv_shaders ${VULKAN_SHADER_DIR}/vk_world_overlay.frag vk_world_overlay_frag.spv)
+    add_vulkan_shader(vulkan_spirv_shaders ${VULKAN_SHADER_DIR}/vk_world_lightmapped.vert vk_world_lightmapped_vert.spv)
+    add_vulkan_shader(vulkan_spirv_shaders ${VULKAN_SHADER_DIR}/vk_world_lightmapped.frag vk_world_lightmapped_frag.spv)
+    add_vulkan_shader(vulkan_spirv_shaders ${VULKAN_SHADER_DIR}/vk_world_alpha_textured.vert vk_world_alpha_textured_vert.spv)
+    add_vulkan_shader(vulkan_spirv_shaders ${VULKAN_SHADER_DIR}/vk_world_alpha_textured.frag vk_world_alpha_textured_frag.spv)
+    add_vulkan_shader(vulkan_spirv_shaders ${VULKAN_SHADER_DIR}/vk_alias_model.vert vk_alias_model_vert.spv)
+    add_vulkan_shader(vulkan_spirv_shaders ${VULKAN_SHADER_DIR}/vk_alias_model.frag vk_alias_model_frag.spv)
+    add_vulkan_shader(vulkan_spirv_shaders ${VULKAN_SHADER_DIR}/vk_sprite3d.vert vk_sprite3d_vert.spv)
+    add_vulkan_shader(vulkan_spirv_shaders ${VULKAN_SHADER_DIR}/vk_sprite3d.frag vk_sprite3d_frag.spv)
     add_resources(shaders_vulkan ${vulkan_spirv_shaders})
 
     set(vulkan_renderer_headers
@@ -539,6 +552,7 @@ if(RENDERER_VULKAN)
             ${SOURCE_DIR}/vk_vao.h
     )
     set(vulkan_renderer
+            ${SOURCE_DIR}/vk_aliasmodel.c
             ${SOURCE_DIR}/vk_blending.c
             ${SOURCE_DIR}/vk_buffers.c
             ${SOURCE_DIR}/vk_debug.c
@@ -554,10 +568,12 @@ if(RENDERER_VULKAN)
             ${SOURCE_DIR}/vk_renderpass.c
             ${SOURCE_DIR}/vk_renderer_stubs.c
             ${SOURCE_DIR}/vk_sdl.c
+            ${SOURCE_DIR}/vk_sprite3d.c
             ${SOURCE_DIR}/vk_swapchain.c
             ${SOURCE_DIR}/vk_texture.c
             ${SOURCE_DIR}/vk_vao.c
             ${SOURCE_DIR}/vk_window_surface.c
+            ${SOURCE_DIR}/vk_world.c
             ${vulkan_renderer_headers}
     )
     source_group(TREE ${SOURCE_DIR} PREFIX "Source Files/vulkan" FILES ${vulkan_renderer})

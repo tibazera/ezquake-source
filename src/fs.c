@@ -44,6 +44,10 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #endif
 #endif
 
+#ifdef __ANDROID__
+#define ANDROID_EZQUAKE_BASEDIR "/storage/emulated/0/Documents/ezQuake"
+#endif
+
 static void FS_RebuildFSHash(void);
 #ifdef SERVERONLY
 static const char *FS_GetCleanPath(const char *pattern, char *outbuf, int outlen);
@@ -701,11 +705,13 @@ void FS_InitFilesystemEx( qbool guess_cwd ) {
 	FS_ShutDown();
 
 	if (guess_cwd) { // so, com_basedir directory will be where ezquake*.exe located
-#ifndef __APPLE__
+#if !defined(__APPLE__) && !defined(__ANDROID__)
 		char *e;
 #endif
 
-#if defined(_WIN32)
+#if defined(__ANDROID__)
+		strlcpy(com_basedir, ANDROID_EZQUAKE_BASEDIR, sizeof(com_basedir));
+#elif defined(_WIN32)
 		if(!(i = GetModuleFileName(NULL, com_basedir, sizeof(com_basedir)-1)))
 			Sys_Error("FS_InitFilesystemEx: GetModuleFileName failed");
 		com_basedir[i] = 0; // ensure null terminator
@@ -723,7 +729,7 @@ void FS_InitFilesystemEx( qbool guess_cwd ) {
 		com_basedir[0] = 0; // FIXME: others
 #endif
 
-#ifndef __APPLE__
+#if !defined(__APPLE__) && !defined(__ANDROID__)
 		// strip ezquake*.exe, we need only path
 		for (e = com_basedir+strlen(com_basedir)-1; e >= com_basedir; e--)
 			if (*e == '/' || *e == '\\')

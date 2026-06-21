@@ -27,12 +27,58 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #include <SDL.h>
 #include <SDL_vulkan.h>
+#ifdef __ANDROID__
+#include <jni.h>
+#include <SDL_system.h>
+#endif
 
+#include "gl_model.h"
+#include "r_aliasmodel.h"
 #include "r_renderer.h"
 #include "tr_types.h"
+#include "glsl/constants.glsl"
 #include "vk_local.h"
 
 vk_options_t vk_options;
+static qbool vk_recreate_swapchain_requested;
+static qbool vk_recreate_surface_requested;
+
+#ifdef __ANDROID__
+static qbool vk_android_startup_splash_hidden;
+
+static void VK_AndroidHideStartupSplash(void)
+{
+	JNIEnv* env;
+	jobject activity;
+	jclass activity_class;
+	jmethodID hide_method;
+
+	if (vk_android_startup_splash_hidden) {
+		return;
+	}
+
+	env = (JNIEnv*) SDL_AndroidGetJNIEnv();
+	activity = (jobject) SDL_AndroidGetActivity();
+	if (!env || !activity) {
+		return;
+	}
+
+	activity_class = (*env)->GetObjectClass(env, activity);
+	if (!activity_class) {
+		(*env)->DeleteLocalRef(env, activity);
+		return;
+	}
+
+	hide_method = (*env)->GetMethodID(env, activity_class, "hideStartupSplash", "()V");
+	if (hide_method) {
+		(*env)->CallVoidMethod(env, activity, hide_method);
+		vk_android_startup_splash_hidden = true;
+	}
+
+	(*env)->DeleteLocalRef(env, activity_class);
+	(*env)->DeleteLocalRef(env, activity);
+}
+#endif
 
 void VK_DrawImage(float x, float y, float width, float height, float tex_s, float tex_t, float tex_width, float tex_height, byte* color, int flags);
 void VK_DrawRectangle(float x, float y, float width, float height, byte* color);
@@ -41,7 +87,11 @@ void VK_TextureLoadCubemapFace(texture_ref cubemap, r_cubemap_direction_id direc
 void VK_CreateLightmapTextures(void);
 void VK_UploadLightmap(int textureUnit, int lightmapnum);
 void VK_BuildLightmap(int lightmapnum);
-void VK_DrawAlias3Model(entity_t* ent, qbool outline, qbool additive_pass);
+void VK_InvalidateLightmapTextures(void);
+void VK_LightmapFrameInit(void);
+void VK_LightmapShutdown(void);
+void VK_RenderDynamicLightmaps(msurface_t* surface, qbool world);
+void VK_DrawWaterSurfaces(void);
 void VK_DeleteVAOs(void);
 void VK_GenVertexArray(r_vao_id vao, const char* name);
 void VK_BindVertexArray(r_vao_id vao);
@@ -86,11 +136,6 @@ static void VK_NoOperationViewport(int x, int y, int width, int height)
 	(void)height;
 }
 
-static void VK_NoOperationModel(qbool vid_restart)
-{
-	(void)vid_restart;
-}
-
 static void VK_NoOperationAliasModel(model_t* model, aliashdr_t* hdr)
 {
 	(void)model;
@@ -126,38 +171,49 @@ static void VK_NoOperationParticles(int count)
 	(void)count;
 }
 
-static void VK_NoOperationLightmapSurface(msurface_t* surf, qbool world)
-{
-	(void)surf;
-	(void)world;
-}
-
-static void VK_NoOperationBrushChain(model_t* model, entity_t* ent)
-{
-	(void)model;
-	(void)ent;
-}
-
-static void VK_NoOperationBrushModel(entity_t* ent, qbool polygonOffset, qbool caustics)
-{
-	(void)ent;
-	(void)polygonOffset;
-	(void)caustics;
-}
-
 static int VK_BrushModelCopyVertToBuffer(model_t* mod, void* vbo_buffer_, int position, float* source, int lightmap, int material, float scaleS, float scaleT, msurface_t* surf, qbool has_fb_texture, qbool has_luma_texture)
 {
-	(void)mod;
-	(void)vbo_buffer_;
-	(void)source;
-	(void)lightmap;
-	(void)material;
-	(void)scaleS;
-	(void)scaleT;
-	(void)surf;
 	(void)has_fb_texture;
 	(void)has_luma_texture;
-	return position;
+	{
+		vbo_world_vert_t* target = (vbo_world_vert_t*)vbo_buffer_ + position;
+		byte rgba[4];
+
+		VectorCopy(source, target->position);
+		target->material_coords[0] = source[3] * (scaleS ? scaleS : 1);
+		target->material_coords[1] = source[4] * (scaleT ? scaleT : 1);
+		target->material_coords[2] = material;
+		target->lightmap_coords[0] = source[5];
+		target->lightmap_coords[1] = source[6];
+		target->lightmap_coords[2] = lightmap;
+		target->detail_coords[0] = source[7];
+		target->detail_coords[1] = source[8];
+
+		if (surf->flags & SURF_DRAWSKY) {
+			target->flags = TEXTURE_TURB_SKY;
+		}
+		else if (surf->flags & SURF_DRAWTURB) {
+			target->flags = (surf->texinfo->texture->turbType & EZQ_SURFACE_TYPE);
+			if (!target->flags) {
+				target->flags = TEXTURE_TURB_OTHER;
+			}
+		}
+		else if (mod->isworldmodel) {
+			target->flags = EZQ_SURFACE_WORLD;
+			target->flags += (surf->flags & SURF_DRAWFLAT_FLOOR ? EZQ_SURFACE_IS_FLOOR : 0);
+			target->flags += (surf->flags & SURF_UNDERWATER ? EZQ_SURFACE_UNDERWATER : 0);
+		}
+		else {
+			target->flags = 0;
+		}
+		target->flags += (surf->flags & SURF_DRAWALPHA ? EZQ_SURFACE_ALPHATEST : 0);
+
+		COLOR_TO_RGBA(surf->texinfo->texture->flatcolor3ub, rgba);
+		VectorScale(rgba, 1 / 255.0f, target->flatcolor);
+		target->surface_num = mod->isworldmodel ? surf - mod->surfaces : 0;
+	}
+
+	return position + 1;
 }
 
 static qbool VK_False(void)
@@ -290,15 +346,75 @@ static qbool VK_RecreateSwapChain(void)
 	return true;
 }
 
+static qbool VK_RecreateSurfaceAndSwapChain(void)
+{
+	if (vk_options.window == NULL || vk_options.instance == VK_NULL_HANDLE || vk_options.logicalDevice == VK_NULL_HANDLE) {
+		return false;
+	}
+
+	vkDeviceWaitIdle(vk_options.logicalDevice);
+
+	VK_DestroyFrameResources();
+	VK_DestroySwapChain();
+	VK_DestroyWindowSurface(vk_options.instance, vk_options.surface);
+	vk_options.surface = VK_NULL_HANDLE;
+
+	if (!VK_CreateWindowSurface(vk_options.window, vk_options.instance, &vk_options.surface)) {
+		return false;
+	}
+	if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(vk_options.physicalDevice, vk_options.surface, &vk_options.physicalDeviceSurfaceCapabilities) != VK_SUCCESS) {
+		return false;
+	}
+	if (!VK_CreateSwapChain(vk_options.window, vk_options.instance, vk_options.surface)) {
+		return false;
+	}
+	if (!VK_CreateSwapChainFramebuffers()) {
+		return false;
+	}
+	if (!VK_CreateFrameResources()) {
+		return false;
+	}
+
+	VK_HudSwapchainChanged();
+	return true;
+}
+
+void VK_RequestSwapChainRecreate(void)
+{
+	vk_recreate_swapchain_requested = true;
+}
+
+void VK_RequestSurfaceRecreate(void)
+{
+	vk_recreate_surface_requested = true;
+	vk_recreate_swapchain_requested = true;
+}
+
 void VK_BeginFrame(void)
 {
 	VkResult result;
 	VkCommandBufferBeginInfo beginInfo = { 0 };
 	VkRenderPassBeginInfo renderPassInfo = { 0 };
-	VkClearValue clearValue = { 0 };
+	VkClearValue clearValues[2] = { 0 };
 	VkCommandBuffer commandBuffer;
 
-	if (vk_options.logicalDevice == VK_NULL_HANDLE || vk_options.swapChain.handle == VK_NULL_HANDLE || vk_options.frame.active) {
+	if (vk_options.logicalDevice == VK_NULL_HANDLE || vk_options.frame.active) {
+		return;
+	}
+	if (vk_recreate_surface_requested) {
+		if (!VK_RecreateSurfaceAndSwapChain()) {
+			return;
+		}
+		vk_recreate_surface_requested = false;
+		vk_recreate_swapchain_requested = false;
+	}
+	else if (vk_recreate_swapchain_requested) {
+		if (!VK_RecreateSwapChain()) {
+			return;
+		}
+		vk_recreate_swapchain_requested = false;
+	}
+	if (vk_options.swapChain.handle == VK_NULL_HANDLE) {
 		return;
 	}
 
@@ -306,7 +422,7 @@ void VK_BeginFrame(void)
 
 	result = vkAcquireNextImageKHR(vk_options.logicalDevice, vk_options.swapChain.handle, UINT64_MAX, vk_options.frame.imageAvailableSemaphore, VK_NULL_HANDLE, &vk_options.frame.imageIndex);
 	if (result == VK_ERROR_OUT_OF_DATE_KHR) {
-		VK_RecreateSwapChain();
+		VK_RequestSwapChainRecreate();
 		return;
 	}
 	if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
@@ -323,10 +439,12 @@ void VK_BeginFrame(void)
 		return;
 	}
 
-	clearValue.color.float32[0] = vk_options.clearColor[0];
-	clearValue.color.float32[1] = vk_options.clearColor[1];
-	clearValue.color.float32[2] = vk_options.clearColor[2];
-	clearValue.color.float32[3] = vk_options.clearColor[3] ? vk_options.clearColor[3] : 1.0f;
+	clearValues[0].color.float32[0] = vk_options.clearColor[0];
+	clearValues[0].color.float32[1] = vk_options.clearColor[1];
+	clearValues[0].color.float32[2] = vk_options.clearColor[2];
+	clearValues[0].color.float32[3] = vk_options.clearColor[3] ? vk_options.clearColor[3] : 1.0f;
+	clearValues[1].depthStencil.depth = glConfig.reversed_depth ? 0.0f : 1.0f;
+	clearValues[1].depthStencil.stencil = 0;
 
 	renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
 	renderPassInfo.renderPass = VK_MainRenderPass();
@@ -334,8 +452,8 @@ void VK_BeginFrame(void)
 	renderPassInfo.renderArea.offset.x = 0;
 	renderPassInfo.renderArea.offset.y = 0;
 	renderPassInfo.renderArea.extent = vk_options.swapChain.imageSize;
-	renderPassInfo.clearValueCount = 1;
-	renderPassInfo.pClearValues = &clearValue;
+	renderPassInfo.clearValueCount = sizeof(clearValues) / sizeof(clearValues[0]);
+	renderPassInfo.pClearValues = clearValues;
 
 	vkCmdBeginRenderPass(commandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
 	vk_options.frame.active = true;
@@ -356,6 +474,7 @@ void VK_EndFrame(void)
 	VkSubmitInfo submitInfo = { 0 };
 	VkPresentInfoKHR presentInfo = { 0 };
 	VkResult result;
+	qbool presented = false;
 
 	if (!vk_options.frame.active) {
 		return;
@@ -394,11 +513,20 @@ void VK_EndFrame(void)
 
 	result = vkQueuePresentKHR(vk_options.presentQueue, &presentInfo);
 	if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
-		VK_RecreateSwapChain();
+		VK_RequestSwapChainRecreate();
+		presented = (result == VK_SUBOPTIMAL_KHR);
 	}
 	else if (result != VK_SUCCESS) {
 		Con_DPrintf("vulkan: vkQueuePresentKHR failed: %d\n", result);
 	}
+	else {
+		presented = true;
+	}
+#ifdef __ANDROID__
+	if (presented) {
+		VK_AndroidHideStartupSplash();
+	}
+#endif
 
 	vk_options.frame.active = false;
 }
@@ -460,6 +588,9 @@ void VK_Shutdown(r_shutdown_mode_t mode)
 		}
 
 		VK_HudResourcesShutdown();
+		VK_WorldResourcesShutdown();
+		VK_AliasModelResourcesShutdown();
+		VK_Sprite3DResourcesShutdown();
 		VK_TextureShutdown();
 		VK_DestroyImmediateCommandPool();
 		VK_DestroyFrameResources();
@@ -487,6 +618,8 @@ void VK_Shutdown(r_shutdown_mode_t mode)
 
 void VK_PopulateConfig(void)
 {
+	const VkPhysicalDeviceLimits* limits = &vk_options.physicalDeviceProperties.limits;
+
 	memset(&renderer, 0, sizeof(renderer));
 
 	glConfig.renderer_string = (const unsigned char*)vk_options.physicalDeviceProperties.deviceName;
@@ -496,8 +629,11 @@ void VK_PopulateConfig(void)
 	glConfig.majorVersion = VK_VERSION_MAJOR(vk_options.physicalDeviceProperties.apiVersion);
 	glConfig.minorVersion = VK_VERSION_MINOR(vk_options.physicalDeviceProperties.apiVersion);
 	glConfig.texture_units = 16;
-	glConfig.max_texture_depth = 256;
-	glConfig.max_3d_texture_size = 2048;
+	glConfig.gl_max_size_default = limits->maxImageDimension2D ? (int)limits->maxImageDimension2D : 4096;
+	glConfig.max_texture_depth = limits->maxImageArrayLayers ? (int)limits->maxImageArrayLayers : 1;
+	glConfig.max_3d_texture_size = limits->maxImageDimension3D ? (int)limits->maxImageDimension3D : 1;
+	glConfig.uniformBufferOffsetAlignment = (int)limits->minUniformBufferOffsetAlignment;
+	glConfig.shaderStorageBufferOffsetAlignment = (int)limits->minStorageBufferOffsetAlignment;
 	glConfig.supported_features =
 		R_SUPPORT_FRAMEBUFFERS |
 		R_SUPPORT_RENDERING_SHADERS |
@@ -513,34 +649,34 @@ void VK_PopulateConfig(void)
 #define VK_Viewport                       VK_NoOperationViewport
 #define VK_InvalidateViewport             VK_NoOperation
 #define VK_ApplyRenderingState            VK_NoOperationState
-#define VK_PrepareModelRendering          VK_NoOperationModel
-#define VK_PrepareAliasModel              VK_NoOperationAliasModel
+#define VK_PrepareModelRendering          VK_PrepareModelRendering
+#define VK_PrepareAliasModel              GL_PrepareAliasModel
 #define VK_DrawSky                        VK_NoOperation
-#define VK_DrawWorld                      VK_NoOperation
-#define VK_DrawAliasFrame                 VK_NoOperationAliasFrame
-#define VK_DrawAliasModelShadow           VK_NoOperationEntity
+#define VK_DrawWorld                      VK_DrawWorld
+#define VK_DrawAliasFrame                 VK_DrawAliasFrame
+#define VK_DrawAliasModelShadow           VK_DrawAliasModelShadow
 #define VK_DrawAliasModelPowerupShell     VK_NoOperationEntity
 #define VK_DrawAlias3ModelPowerupShell    VK_NoOperationEntity
-#define VK_DrawSpriteModel                VK_NoOperationEntity
-#define VK_DrawSimpleItem                 VK_NoOperationSimpleItem
-#define VK_DrawClassicParticles           VK_NoOperationParticles
+#define VK_DrawSpriteModel                VK_DrawSpriteModel
+#define VK_DrawSimpleItem                 VK_DrawSimpleItem
+#define VK_DrawClassicParticles           VK_DrawClassicParticles
 #define VK_DrawDisc                       VK_NoOperation
-#define VK_LightmapFrameInit              VK_NoOperation
-#define VK_RenderDynamicLightmaps         VK_NoOperationLightmapSurface
-#define VK_InvalidateLightmapTextures     VK_NoOperation
-#define VK_LightmapShutdown               VK_NoOperation
+#define VK_LightmapFrameInit              VK_LightmapFrameInit
+#define VK_RenderDynamicLightmaps         VK_RenderDynamicLightmaps
+#define VK_InvalidateLightmapTextures     VK_InvalidateLightmapTextures
+#define VK_LightmapShutdown               VK_LightmapShutdown
 #define VK_SetupGL                        VK_NoOperation
-#define VK_ChainBrushModelSurfaces        VK_NoOperationBrushChain
-#define VK_DrawBrushModel                 VK_NoOperationBrushModel
+#define VK_ChainBrushModelSurfaces        VK_ChainBrushModelSurfaces
+#define VK_DrawBrushModel                 VK_DrawBrushModel
 #define VK_BrushModelCopyVertToBuffer     VK_BrushModelCopyVertToBuffer
 #define VK_ClearRenderingSurface          VK_ClearRenderingSurface
-#define VK_DrawWaterSurfaces              VK_NoOperation
+#define VK_DrawWaterSurfaces              VK_DrawWaterSurfaces
 #define VK_ScreenDrawStart                VK_NoOperation
 #define VK_EnsureFinished                 VK_NoOperation
 #define VK_Begin2DRendering               VK_NoOperation
 #define VK_IsFramebufferEnabled3D         VK_False
-#define VK_RenderView                     VK_NoOperation
-#define VK_PreRenderView                  VK_NoOperation
+#define VK_RenderView                     VK_RenderView
+#define VK_PreRenderView                  VK_PreRenderView
 #define VK_PostProcessScreen              VK_NoOperation
 #define VK_BrightenScreen                 VK_NoOperation
 #define VK_PolyBlend                      VK_NoOperationFloat4
@@ -548,8 +684,8 @@ void VK_PopulateConfig(void)
 #define VK_Screenshot                     VK_Screenshot
 #define VK_ScreenshotWidth                VK_ScreenshotWidth
 #define VK_ScreenshotHeight               VK_ScreenshotHeight
-#define VK_Prepare3DSprites               VK_NoOperation
-#define VK_Draw3DSprites                  VK_NoOperation
+#define VK_Prepare3DSprites               VK_Prepare3DSprites
+#define VK_Draw3DSprites                  VK_Draw3DSprites
 #define VK_Draw3DSpritesInline            VK_NoOperation
 #define VK_RenderFramebuffers             VK_NoOperation
 #define VK_FramebufferCreate              VK_FalseFramebuffer

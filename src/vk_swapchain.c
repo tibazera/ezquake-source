@@ -30,6 +30,59 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #include "vk_local.h"
 
+static void VK_DestroySwapChainDepthResources(void)
+{
+	if (vk_options.swapChain.depthImageView != VK_NULL_HANDLE) {
+		vkDestroyImageView(vk_options.logicalDevice, vk_options.swapChain.depthImageView, NULL);
+		vk_options.swapChain.depthImageView = VK_NULL_HANDLE;
+	}
+	if (vk_options.swapChain.depthImage != VK_NULL_HANDLE) {
+		vkDestroyImage(vk_options.logicalDevice, vk_options.swapChain.depthImage, NULL);
+		vk_options.swapChain.depthImage = VK_NULL_HANDLE;
+	}
+	if (vk_options.swapChain.depthImageMemory != VK_NULL_HANDLE) {
+		vkFreeMemory(vk_options.logicalDevice, vk_options.swapChain.depthImageMemory, NULL);
+		vk_options.swapChain.depthImageMemory = VK_NULL_HANDLE;
+	}
+}
+
+static qbool VK_CreateSwapChainDepthResources(void)
+{
+	VkImageViewCreateInfo createImageViewInfo;
+
+	VK_DestroySwapChainDepthResources();
+
+	if (!VK_CreateImageResource(
+			vk_options.swapChain.imageSize.width,
+			vk_options.swapChain.imageSize.height,
+			VK_DepthFormat(),
+			VK_IMAGE_TILING_OPTIMAL,
+			VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+			VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+			&vk_options.swapChain.depthImage,
+			&vk_options.swapChain.depthImageMemory)) {
+		return false;
+	}
+
+	VK_InitialiseStructure(createImageViewInfo);
+	createImageViewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+	createImageViewInfo.image = vk_options.swapChain.depthImage;
+	createImageViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+	createImageViewInfo.format = VK_DepthFormat();
+	createImageViewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+	createImageViewInfo.subresourceRange.baseMipLevel = 0;
+	createImageViewInfo.subresourceRange.levelCount = 1;
+	createImageViewInfo.subresourceRange.baseArrayLayer = 0;
+	createImageViewInfo.subresourceRange.layerCount = 1;
+
+	if (vkCreateImageView(vk_options.logicalDevice, &createImageViewInfo, NULL, &vk_options.swapChain.depthImageView) != VK_SUCCESS) {
+		VK_DestroySwapChainDepthResources();
+		return false;
+	}
+
+	return true;
+}
+
 qbool VK_CreateSwapChain(SDL_Window* window, VkInstance instance, VkSurfaceKHR surface)
 {
 	uint32_t requestedImageCount;
@@ -80,7 +133,15 @@ qbool VK_CreateSwapChain(SDL_Window* window, VkInstance instance, VkSurfaceKHR s
 		createInfo.queueFamilyIndexCount = 0;
 		createInfo.pQueueFamilyIndices = NULL;
 	}
-	createInfo.preTransform = vk_options.physicalDeviceSurfaceCapabilities.currentTransform;
+#ifdef __ANDROID__
+	if (vk_options.physicalDeviceSurfaceCapabilities.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) {
+		createInfo.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+	}
+	else
+#endif
+	{
+		createInfo.preTransform = vk_options.physicalDeviceSurfaceCapabilities.currentTransform;
+	}
 	createInfo.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
 	createInfo.presentMode = vk_options.physicalDevicePresentationMode;
 	createInfo.clipped = VK_FALSE; // meag: setting this to false so we can read-back for screenshots
@@ -137,9 +198,13 @@ qbool VK_CreateSwapChainFramebuffers(void)
 		return false;
 	}
 
-	vk_options.swapChain.framebuffers = Q_malloc(vk_options.swapChain.imageCount * sizeof(vk_options.swapChain.framebuffers[0]));
+	if (!VK_CreateSwapChainDepthResources()) {
+		return false;
+	}
+
+	vk_options.swapChain.framebuffers = Q_calloc(vk_options.swapChain.imageCount, sizeof(vk_options.swapChain.framebuffers[0]));
 	for (i = 0; i < vk_options.swapChain.imageCount; ++i) {
-		VkImageView attachments[] = { vk_options.swapChain.imageViews[i] };
+		VkImageView attachments[] = { vk_options.swapChain.imageViews[i], vk_options.swapChain.depthImageView };
 		VkFramebufferCreateInfo framebufferInfo = { 0 };
 
 		framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
@@ -173,6 +238,8 @@ void VK_DestroySwapChainFramebuffers(void)
 		Q_free(vk_options.swapChain.framebuffers);
 		vk_options.swapChain.framebuffers = NULL;
 	}
+
+	VK_DestroySwapChainDepthResources();
 }
 
 void VK_DestroySwapChain(void)

@@ -18,7 +18,9 @@ layout(location = 0) out vec4 fragColour;
 
 void main()
 {
-	vec4 texColour = texture(hudTexture[inNearest], inTexCoord);
+	vec4 linearColour = texture(hudTexture[0], inTexCoord);
+	vec4 nearestColour = texture(hudTexture[1], inTexCoord);
+	vec4 texColour = mix(linearColour, nearestColour, float(inNearest));
 
 	if (inAlphaTest != 0.0 && texColour.a < 0.666) {
 		discard;
