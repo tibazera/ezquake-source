@@ -135,6 +135,25 @@ static qbool VK_PhysicalDeviceBestPresentationMode(VkPhysicalDevice device, VkSu
 	return true;
 }
 
+// Re-evaluates the present mode against the current r_swapInterval value.
+// VK_PhysicalDeviceBestPresentationMode() is normally only invoked once,
+// while picking the physical device at startup; toggling "Vertical Sync" in
+// the menu needs this re-run before the swapchain is recreated, otherwise
+// the swapchain just gets rebuilt with the same present mode it already had.
+qbool VK_RefreshPresentationMode(void)
+{
+	VkPresentModeKHR best;
+
+	if (vk_options.physicalDevice == VK_NULL_HANDLE || vk_options.surface == VK_NULL_HANDLE) {
+		return false;
+	}
+	if (!VK_PhysicalDeviceBestPresentationMode(vk_options.physicalDevice, vk_options.surface, &best)) {
+		return false;
+	}
+	vk_options.physicalDevicePresentationMode = best;
+	return true;
+}
+
 static qbool VK_PhysicalDeviceSwapChainCompatible(VkPhysicalDevice device, VkSurfaceKHR surface, VkSurfaceFormatKHR* preferred_format, VkSurfaceCapabilitiesKHR* capabilities)
 {
 	extern cvar_t vid_gammacorrection;

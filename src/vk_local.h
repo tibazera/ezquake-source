@@ -54,6 +54,7 @@ void VK_InitialiseDebugCallback(VkInstance instance);
 qbool VK_SelectPhysicalDevice(VkInstance instance, VkSurfaceKHR surface);
 uint32_t VK_PhysicalDeviceGraphicsQueueFamilyIndex(void);
 uint32_t VK_PhysicalDeviceComputeQueueFamilyIndex(void);
+qbool VK_RefreshPresentationMode(void);
 uint32_t VK_PhysicalDevicePresentQueueFamilyIndex(void);
 qbool VK_CreateLogicalDevice(VkInstance instance);
 

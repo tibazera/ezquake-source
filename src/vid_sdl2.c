@@ -77,6 +77,7 @@ qbool VK_Initialise(SDL_Window* window);
 #ifdef RENDERER_OPTION_VULKAN
 void VK_RequestSwapChainRecreate(void);
 void VK_RequestSurfaceRecreate(void);
+qbool VK_RefreshPresentationMode(void);
 #endif
 
 #ifdef __linux__
@@ -1918,6 +1919,23 @@ void R_EndRendering(void)
 {
 #ifdef RENDERER_OPTION_VULKAN
 	if (R_UseVulkan()) {
+		if (r_swapInterval.modified) {
+			// SDL_GL_SetSwapInterval below only applies to the OpenGL
+			// backend; Vulkan picks its present mode (which encodes vsync
+			// on/off) once, at swapchain creation, so toggling "Vertical
+			// Sync" in the menu had no effect at all until the swapchain
+			// was recreated for some unrelated reason. Re-evaluate the
+			// present mode here specifically (while the surface is in a
+			// known-good, non-transitional state) rather than inside the
+			// generic swapchain-recreate path, which also runs for
+			// unrelated reasons (GFX preset reload, resize) where
+			// re-enumerating present modes mid-transition was observed to
+			// occasionally drop MAILBOX and settle on IMMEDIATE permanently,
+			// saturating the compositor's buffer queue and freezing the app.
+			VK_RefreshPresentationMode();
+			VK_RequestSwapChainRecreate();
+			r_swapInterval.modified = false;
+		}
 		if (renderer.EndFrame) {
 			renderer.EndFrame();
 		}
