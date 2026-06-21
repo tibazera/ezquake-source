@@ -179,12 +179,16 @@ check_dependency(Jansson  "jansson"    "jansson"            "jansson::jansson"  
 check_dependency(MiniZip  "minizip"    "unofficial-minizip" "unofficial::minizip::minizip" REQUIRED)
 check_dependency(PCRE2    "libpcre2-8" "PCRE2"              "pcre2::pcre2-8-static"        REQUIRED)
 check_dependency(PNG      "libpng"     "PNG"                "PNG::PNG"                     REQUIRED)
-check_dependency(SDL2     "sdl2"       "SDL2"               "SDL2::SDL2-static"            REQUIRED)
+check_dependency(SDL3     "sdl3"       "SDL3"               "SDL3::SDL3-static"            REQUIRED)
 check_dependency(SndFile  "sndfile"    "SndFile"            "SndFile::sndfile"             REQUIRED)
 check_dependency(Speex    "speex"      "Speex"              "SPEEX::SPEEX"                 OPTIONAL)
 check_dependency(SpeexDSP "speexdsp"   "SpeexDSP"           "SPEEX::SPEEXDSP"              OPTIONAL)
 check_dependency(cURL     "libcurl"    "CURL"               "CURL::libcurl"                REQUIRED CONFIG)
 check_dependency(zlib     "zlib"       "ZLIB"               "ZLIB::ZLIB"                   REQUIRED)
+
+# ezQuake's SDL platform sources historically include headers without the
+# SDL3/ prefix. Keep that source layout while using SDL3's namespaced install.
+find_path(EZQUAKE_SDL_INCLUDE_DIR NAMES SDL.h PATH_SUFFIXES SDL3 REQUIRED)
 
 if(USE_SYSTEM_LIBS AND HAVE_MINIZIP)
     find_path(EZQUAKE_MINIZIP_INCLUDE_DIR
@@ -998,6 +1002,7 @@ endif()
 
 target_include_directories(ezquake PRIVATE
         ${SOURCE_DIR}/qwprot/src
+        ${EZQUAKE_SDL_INCLUDE_DIR}
         ${EZQUAKE_MINIZIP_INCLUDE_DIR}
         ${OBOE_INCLUDE_DIR}
 )
@@ -1005,6 +1010,9 @@ target_include_directories(ezquake PRIVATE
 target_compile_definitions(ezquake PRIVATE
         BUILDSTRING="${CMAKE_SYSTEM_NAME}"
         CPUSTRING="${CMAKE_SYSTEM_PROCESSOR}"
+
+        EZQUAKE_SDL3
+        SDL_ENABLE_OLD_NAMES
 
         JSS_CAM
         USE_PR2
@@ -1055,7 +1063,7 @@ target_link_libraries(ezquake PRIVATE
         Dep::Expat
         Dep::JPEG
         Dep::PCRE2
-        Dep::SDL2
+        Dep::SDL3
         Dep::Jansson
         Dep::SndFile
         Dep::PNG

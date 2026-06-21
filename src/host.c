@@ -715,7 +715,7 @@ void Host_Init (int argc, char **argv, int default_memsize)
 	COM_InitArgv (argc, argv);
 	COM_StoreOriginalCmdline(argc, argv);
 
-	if (SDL_Init(0) != 0)
+	if (!SDL_Init(0))
 	{
 		fprintf(stderr, "Failed to initialize SDL: %s\n", SDL_GetError());
 		exit(EXIT_FAILURE);

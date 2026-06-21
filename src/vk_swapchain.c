@@ -111,7 +111,7 @@ qbool VK_CreateSwapChain(SDL_Window* window, VkInstance instance, VkSurfaceKHR s
 	else {
 		int width, height;
 
-		SDL_Vulkan_GetDrawableSize(window, &width, &height);
+		SDL_GetWindowSizeInPixels(window, &width, &height);
 
 		width = bound(vk_options.physicalDeviceSurfaceCapabilities.minImageExtent.width, width, vk_options.physicalDeviceSurfaceCapabilities.maxImageExtent.width);
 		height = bound(vk_options.physicalDeviceSurfaceCapabilities.minImageExtent.height, height, vk_options.physicalDeviceSurfaceCapabilities.maxImageExtent.height);

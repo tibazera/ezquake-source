@@ -556,7 +556,7 @@ const char* ResolutionRead(void)
 		return "";
 	}
 
-	snprintf(buf, sizeof(buf), "%dx%d@%dHz", mode->w, mode->h, mode->refresh_rate);
+	snprintf(buf, sizeof(buf), "%dx%d@%dHz", mode->w, mode->h, (int)mode->refresh_rate);
 		
 	return buf;
 }

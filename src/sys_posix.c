@@ -137,7 +137,7 @@ static void Android_ShowStartupError(const char *title, const char *message)
 {
 	fprintf(stderr, "%s: %s\n", title, message);
 
-	if (SDL_Init(0) == 0) {
+	if (SDL_Init(0)) {
 		SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, title, message, NULL);
 		SDL_Quit();
 	}
@@ -460,6 +460,9 @@ double Sys_DoubleTime(void)
 }
 #endif
 
+#ifdef __ANDROID__
+__attribute__((visibility("default")))
+#endif
 int main(int argc, char **argv)
 {
 	double time, oldtime, newtime;

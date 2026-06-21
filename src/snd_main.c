@@ -175,7 +175,7 @@ void S_LockMixer(void)
 
 qbool S_TryLockMixer(void)
 {
-	return smutex && SDL_TryLockMutex(smutex) == 0;
+	return smutex && SDL_TryLockMutex(smutex);
 }
 
 void S_UnlockMixer(void)

@@ -8,6 +8,11 @@ public class EzQuakeActivity extends SDLActivity {
         return new String[] { "ezquake" };
     }
 
+    @Override
+    protected String getMainFunction() {
+        return "main";
+    }
+
     // Called via JNI (GetMethodID "hideStartupSplash" "()V") from vk_main.c
     // once the Vulkan renderer has drawn its first frame, so the static
     // splash drawable set as the window background doesn't linger behind it.

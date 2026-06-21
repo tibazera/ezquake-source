@@ -196,29 +196,45 @@ static int S_CaptureDriverInit (int sampleRate)
 
 static void S_CaptureDriverStart (void *ctx)
 {
+#ifdef __ANDROID__
+	(void)ctx;
+#else
 	SDL_AudioDeviceID inputdevid = (SDL_AudioDeviceID)ctx;
 
-	SDL_PauseAudioDevice (inputdevid, 0);
+	SDL_ResumeAudioDevice (inputdevid);
+#endif
 }
 
 static void S_CaptureDriverStop (void *ctx)
 {
+#ifdef __ANDROID__
+	(void)ctx;
+#else
 	SDL_AudioDeviceID inputdevid = (SDL_AudioDeviceID)ctx;
 
-	SDL_PauseAudioDevice (inputdevid, 1);
+	SDL_PauseAudioDevice (inputdevid);
+#endif
 }
 
 static void S_CaptureDriverShutdown (void *ctx)
 {
+#ifdef __ANDROID__
+	(void)ctx;
+#else
 	SDL_AudioDeviceID inputdevid = (SDL_AudioDeviceID)ctx;
 
 	if (inputdevid) {
 		SDL_CloseAudioDevice (inputdevid);
 	}
+#endif
 }
 
 static unsigned int S_CaptureDriverUpdate (void* driverContext, unsigned char* buffer, int minBytes, int maxBytes)
 {
+#ifdef __ANDROID__
+	(void)driverContext; (void)buffer; (void)minBytes; (void)maxBytes;
+	return 0;
+#else
 	SDL_AudioDeviceID inputdevid = (SDL_AudioDeviceID)driverContext;
 	unsigned int available = SDL_GetQueuedAudioSize (inputdevid);
 
@@ -227,6 +243,7 @@ static unsigned int S_CaptureDriverUpdate (void* driverContext, unsigned char* b
 	}
 
 	return 0;
+#endif
 }
 
 typedef struct voip_data_s {
