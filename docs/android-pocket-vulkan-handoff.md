@@ -23,7 +23,10 @@ Build with `gradlew.bat :app:assembleDebug`. The APK is generated at `app/build/
 
 ## Device-specific pitfalls
 
-- Do not package or commit Quake data. On the test device, `id1/gpl_maps.pk3` contained replacement simple-texture BSPs for dm3, dm4 and dm6 and shadowed the original maps from pak1. Removing those three BSP entries restored wall textures. A backup was kept on the device as `gpl_maps.pk3.simpletextures-backup`.
+- Do not implement a code-side fix, automatic archive rewrite or special-case map loading for the texture issue described below. Quake data must not be packaged or committed in this repository. The intended solution is to distribute a separate, corrected PK3 and let the normal filesystem precedence rules load it.
+- Root cause observed on the test device: `id1/gpl_maps.pk3` contained replacement simple-texture BSPs at `maps/dm3.bsp`, `maps/dm4.bsp` and `maps/dm6.bsp`. Because that archive had higher filesystem precedence, those BSPs shadowed the original maps from `pak1.pak`. Animated lava, portals and item textures still appeared, but most wall and geometry textures were missing, which initially looked like a Vulkan texture-upload failure.
+- Diagnostic confirmation: removing only those three BSP entries from the active archive immediately restored the original textured maps. This was a device-side experiment, not a project fix. A copy named `gpl_maps.pk3.simpletextures-backup` was retained on the test device.
+- Follow-up data task: build or obtain a clean replacement PK3 that does not override dm3, dm4 and dm6 with the simple-texture BSP variants. Validate its contents and load order against `pak1.pak` before distributing it. Renderer changes should only be reconsidered if the problem reproduces with known-good BSP and texture data.
 - scrcpy captures Android audio by default and routes it to `AUDIO_DEVICE_OUT_REMOTE_SUBMIX`, making the phone speaker appear silent. Use `scrcpy --keyboard=uhid --mouse=uhid --no-audio` when sound must remain on the phone.
 - Xiaomi blocks normal ADB input injection unless its additional USB debugging security option is enabled. UHID keyboard and mouse work without that permission.
 
