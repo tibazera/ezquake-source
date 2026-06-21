@@ -20,7 +20,7 @@
     { "name": "libsndfile", "default-features": false, "features": ["external-libs"] },
     { "name": "alsa", "default-features": false, "platform": "linux" },
     { "name": "oboe", "default-features": false, "platform": "android" },
-    { "name": "sdl3", "default-features": false, "platform": "windows, osx" },
+    { "name": "sdl3", "default-features": false, "features": ["vulkan"], "platform": "windows, osx" },
     { "name": "sdl3", "default-features": false, "features": ["wayland", "x11", "alsa"], "platform": "linux" },
     { "name": "sdl3", "default-features": false, "features": ["vulkan"], "platform": "android" }
   ]
