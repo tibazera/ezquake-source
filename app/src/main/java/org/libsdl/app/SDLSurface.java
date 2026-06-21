@@ -48,6 +48,9 @@ public class SDLSurface extends SurfaceView implements SurfaceHolder.Callback,
     // Pinch events
     private final ScaleGestureDetector scaleGestureDetector;
 
+    private static final int MAX_RENDER_WIDTH = 1920;
+    private static final int MAX_RENDER_HEIGHT = 1080;
+
     // Startup
     protected SDLSurface(Context context) {
         super(context);
@@ -65,6 +68,8 @@ public class SDLSurface extends SurfaceView implements SurfaceHolder.Callback,
         mDisplay = ((WindowManager)context.getSystemService(Context.WINDOW_SERVICE)).getDefaultDisplay();
         mSensorManager = (SensorManager)context.getSystemService(Context.SENSOR_SERVICE);
 
+        configureRenderSurfaceSize();
+
         setOnGenericMotionListener(SDLActivity.getMotionListener());
 
         // Some arbitrary defaults to avoid a potential division by zero
@@ -72,6 +77,29 @@ public class SDLSurface extends SurfaceView implements SurfaceHolder.Callback,
         mHeight = 1.0f;
 
         mIsSurfaceReady = false;
+    }
+
+    private void configureRenderSurfaceSize() {
+        try {
+            DisplayMetrics metrics = new DisplayMetrics();
+            mDisplay.getRealMetrics(metrics);
+
+            int deviceWidth = Math.max(metrics.widthPixels, metrics.heightPixels);
+            int deviceHeight = Math.min(metrics.widthPixels, metrics.heightPixels);
+            float scale = Math.min(1.0f, Math.min(
+                    (float)MAX_RENDER_WIDTH / deviceWidth,
+                    (float)MAX_RENDER_HEIGHT / deviceHeight));
+
+            int renderWidth = Math.max(1, Math.round(deviceWidth * scale));
+            int renderHeight = Math.max(1, Math.round(deviceHeight * scale));
+            if (renderWidth != deviceWidth || renderHeight != deviceHeight) {
+                getHolder().setFixedSize(renderWidth, renderHeight);
+                Log.i("SDL", "Android render surface capped at " + renderWidth + "x" + renderHeight
+                        + " for display " + deviceWidth + "x" + deviceHeight);
+            }
+        } catch (Exception exception) {
+            Log.w("SDL", "Unable to configure Android render surface size", exception);
+        }
     }
 
     protected void handlePause() {
@@ -222,19 +250,21 @@ public class SDLSurface extends SurfaceView implements SurfaceHolder.Callback,
 
     private float getNormalizedX(float x)
     {
-        if (mWidth <= 1) {
+        int touchWidth = getWidth();
+        if (touchWidth <= 1) {
             return 0.5f;
         } else {
-            return (x / (mWidth - 1));
+            return (x / (touchWidth - 1));
         }
     }
 
     private float getNormalizedY(float y)
     {
-        if (mHeight <= 1) {
+        int touchHeight = getHeight();
+        if (touchHeight <= 1) {
             return 0.5f;
         } else {
-            return (y / (mHeight - 1));
+            return (y / (touchHeight - 1));
         }
     }
 
