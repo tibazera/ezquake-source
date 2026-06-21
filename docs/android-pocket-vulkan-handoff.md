@@ -8,6 +8,7 @@ Branch: `feature/android-pocket-vulkan`
 - The SDL3 Java bootstrap is synced with SDL 3.4 and starts the exported native `main` entry point.
 - SDL3 boolean return contracts are applied to initialization, mutexes, semaphores, events and Vulkan surface creation.
 - Dynamic lightmap sub-image updates are queued and copied through a persistent mapped staging buffer in the next frame command buffer. This removes the immediate-command-buffer and queue-idle path from normal frame updates.
+- The renderer now permits two frames in flight instead of waiting for the previous frame at every `VK_BeginFrame`. Each frame owns its synchronization objects and lightmap staging buffer, while each swapchain image tracks the fence that last used it.
 - Voice capture is disabled on Android; playback uses Oboe.
 
 ## Build
@@ -36,6 +37,6 @@ The SDL2 expression `SDL_TryLockMutex(mutex) == 0` was invalid after migration b
 
 ## Next performance work
 
-- Measure dm3/dm4/dm6 frame timings after the lightmap batching change.
+- Measure dm3/dm4/dm6 frame timings after the lightmap batching and two-frames-in-flight changes. Startup/stability has been validated on the Xiaomi test device, but the in-map FPS gain is not yet measured.
 - Profile world draw-call count, pipeline switches and CPU/GPU frame split before importing broader renderer changes from vkQuake or FTEQW.
-- If multiple frames in flight are introduced later, make the persistent upload buffer frame-indexed. The current renderer uses one global in-flight fence, so one buffer is safe today.
+- The test device exposes a 2712x1220 landscape surface and was running its physical display at 120 Hz. If synchronization changes are insufficient, measure fill-rate pressure at native resolution before implementing a lower-resolution render target or Android surface scaling.
