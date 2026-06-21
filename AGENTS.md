@@ -123,6 +123,8 @@ O renderer originalmente usava um único fence global e esperava no começo de t
 
 No Xiaomi de teste, o surface em paisagem é 2712x1220 e o display físico foi observado a 120 Hz. O build com dois frames em voo iniciou e permaneceu estável, sem fatal ou erro Vulkan no logcat. O ganho real de FPS em dm3/dm4/dm6 ainda não foi medido; não o trate como resultado confirmado.
 
+`dumpsys gfxinfo` mede principalmente a UI Java e não representa os frames Vulkan do `SurfaceView`. Para observar apresentação real, obtenha o nome exato da layer BLAST no `dumpsys SurfaceFlinger` e use `dumpsys SurfaceFlinger --latency '<nome da layer>'`. A primeira linha é o período do display em nanossegundos e as seguintes contêm timestamps por frame. No menu desconectado foram observados intervalos próximos de 33–40 ms, mas isso não é benchmark de gameplay: `CL_MinFrameTime()` aplica `cl_maxfps_menu` ou a frequência detectada quando `cls.state == ca_disconnected`. O config ativo tinha `cl_maxfps 308`, `cl_maxfps_menu 0` e `vid_vsync 0`.
+
 Não importe grandes blocos de vkQuake/FTEQW por intuição. Primeiro meça:
 
 - tempo de CPU e GPU por frame;
