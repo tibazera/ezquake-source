@@ -43,6 +43,14 @@ android {
         }
     }
 
+    buildTypes {
+        release {
+            // Signed with the debug keystore for internal testing; replace
+            // with a real signing config before any public distribution.
+            signingConfig = signingConfigs.getByName("debug")
+        }
+    }
+
     externalNativeBuild {
         cmake {
             path = file("../CMakeLists.txt")
