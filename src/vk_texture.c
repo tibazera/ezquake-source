@@ -54,29 +54,31 @@ static int pendingTextureUploadCount;
 static byte* pendingTextureUploadData;
 static size_t pendingTextureUploadDataSize;
 static size_t pendingTextureUploadDataCapacity;
-static VkBuffer frameUploadBuffer;
-static VkDeviceMemory frameUploadMemory;
-static VkDeviceSize frameUploadCapacity;
-static void* frameUploadMapped;
+static VkBuffer frameUploadBuffers[VK_MAX_FRAMES_IN_FLIGHT];
+static VkDeviceMemory frameUploadMemories[VK_MAX_FRAMES_IN_FLIGHT];
+static VkDeviceSize frameUploadCapacities[VK_MAX_FRAMES_IN_FLIGHT];
+static void* frameUploadMapped[VK_MAX_FRAMES_IN_FLIGHT];
 
 static qbool VK_TextureReferenceInRange(texture_ref texture);
 
-static void VK_TextureDestroyFrameUploadBuffer(void)
+static void VK_TextureDestroyFrameUploadBuffer(uint32_t frameIndex)
 {
+	if (frameIndex >= VK_MAX_FRAMES_IN_FLIGHT) return;
 	if (vk_options.logicalDevice != VK_NULL_HANDLE) {
-		if (frameUploadMapped && frameUploadMemory != VK_NULL_HANDLE) vkUnmapMemory(vk_options.logicalDevice, frameUploadMemory);
-		if (frameUploadBuffer != VK_NULL_HANDLE) vkDestroyBuffer(vk_options.logicalDevice, frameUploadBuffer, NULL);
-		if (frameUploadMemory != VK_NULL_HANDLE) vkFreeMemory(vk_options.logicalDevice, frameUploadMemory, NULL);
+		if (frameUploadMapped[frameIndex] && frameUploadMemories[frameIndex] != VK_NULL_HANDLE) vkUnmapMemory(vk_options.logicalDevice, frameUploadMemories[frameIndex]);
+		if (frameUploadBuffers[frameIndex] != VK_NULL_HANDLE) vkDestroyBuffer(vk_options.logicalDevice, frameUploadBuffers[frameIndex], NULL);
+		if (frameUploadMemories[frameIndex] != VK_NULL_HANDLE) vkFreeMemory(vk_options.logicalDevice, frameUploadMemories[frameIndex], NULL);
 	}
-	frameUploadBuffer = VK_NULL_HANDLE;
-	frameUploadMemory = VK_NULL_HANDLE;
-	frameUploadCapacity = 0;
-	frameUploadMapped = NULL;
+	frameUploadBuffers[frameIndex] = VK_NULL_HANDLE;
+	frameUploadMemories[frameIndex] = VK_NULL_HANDLE;
+	frameUploadCapacities[frameIndex] = 0;
+	frameUploadMapped[frameIndex] = NULL;
 }
 
 static void VK_TextureDestroyFrameUploadResources(void)
 {
-	VK_TextureDestroyFrameUploadBuffer();
+	uint32_t i;
+	for (i = 0; i < VK_MAX_FRAMES_IN_FLIGHT; ++i) VK_TextureDestroyFrameUploadBuffer(i);
 	Q_free(pendingTextureUploadData);
 	pendingTextureUploadData = NULL;
 	pendingTextureUploadDataSize = 0;
@@ -743,28 +745,28 @@ static void VK_TextureRecordBarrier(VkCommandBuffer commandBuffer, vk_texture_t*
 	vkCmdPipelineBarrier(commandBuffer, sourceStage, destinationStage, 0, 0, NULL, 0, NULL, 1, &barrier);
 }
 
-void VK_TextureFlushPendingUploads(VkCommandBuffer commandBuffer)
+void VK_TextureFlushPendingUploads(VkCommandBuffer commandBuffer, uint32_t frameIndex)
 {
 	VkDeviceSize requiredCapacity;
 	int i;
 
-	if (commandBuffer == VK_NULL_HANDLE || pendingTextureUploadCount == 0 || pendingTextureUploadDataSize == 0) return;
+	if (commandBuffer == VK_NULL_HANDLE || frameIndex >= VK_MAX_FRAMES_IN_FLIGHT || pendingTextureUploadCount == 0 || pendingTextureUploadDataSize == 0) return;
 
 	requiredCapacity = pendingTextureUploadDataSize;
-	if (frameUploadCapacity < requiredCapacity) {
+	if (frameUploadCapacities[frameIndex] < requiredCapacity) {
 		VkDeviceSize newCapacity = max((VkDeviceSize)(4 * 1024 * 1024), requiredCapacity);
-		VK_TextureDestroyFrameUploadBuffer();
+		VK_TextureDestroyFrameUploadBuffer(frameIndex);
 		if (!VK_CreateBufferResource(newCapacity, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
 			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-			&frameUploadBuffer, &frameUploadMemory) ||
-			vkMapMemory(vk_options.logicalDevice, frameUploadMemory, 0, newCapacity, 0, &frameUploadMapped) != VK_SUCCESS) {
-			VK_TextureDestroyFrameUploadBuffer();
+			&frameUploadBuffers[frameIndex], &frameUploadMemories[frameIndex]) ||
+			vkMapMemory(vk_options.logicalDevice, frameUploadMemories[frameIndex], 0, newCapacity, 0, &frameUploadMapped[frameIndex]) != VK_SUCCESS) {
+			VK_TextureDestroyFrameUploadBuffer(frameIndex);
 			return;
 		}
-		frameUploadCapacity = newCapacity;
+		frameUploadCapacities[frameIndex] = newCapacity;
 	}
 
-	memcpy(frameUploadMapped, pendingTextureUploadData, pendingTextureUploadDataSize);
+	memcpy(frameUploadMapped[frameIndex], pendingTextureUploadData, pendingTextureUploadDataSize);
 	for (i = 0; i < pendingTextureUploadCount; ++i) {
 		vk_pending_texture_upload_t* upload = &pendingTextureUploads[i];
 		vk_texture_t* vktex;
@@ -783,7 +785,7 @@ void VK_TextureFlushPendingUploads(VkCommandBuffer commandBuffer)
 		region.imageExtent.width = upload->width;
 		region.imageExtent.height = upload->height;
 		region.imageExtent.depth = 1;
-		vkCmdCopyBufferToImage(commandBuffer, frameUploadBuffer, vktex->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+		vkCmdCopyBufferToImage(commandBuffer, frameUploadBuffers[frameIndex], vktex->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 		VK_TextureRecordBarrier(commandBuffer, vktex, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 	}
 

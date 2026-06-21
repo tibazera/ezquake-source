@@ -256,23 +256,28 @@ static void VK_ClearRenderingSurface(qbool clear_color)
 
 static void VK_DestroyFrameResources(void)
 {
+	uint32_t i;
+
 	if (vk_options.logicalDevice == VK_NULL_HANDLE) {
 		return;
 	}
 
-	if (vk_options.frame.imageAvailableSemaphore != VK_NULL_HANDLE) {
-		vkDestroySemaphore(vk_options.logicalDevice, vk_options.frame.imageAvailableSemaphore, NULL);
-	}
-	if (vk_options.frame.renderFinishedSemaphore != VK_NULL_HANDLE) {
-		vkDestroySemaphore(vk_options.logicalDevice, vk_options.frame.renderFinishedSemaphore, NULL);
-	}
-	if (vk_options.frame.inFlightFence != VK_NULL_HANDLE) {
-		vkDestroyFence(vk_options.logicalDevice, vk_options.frame.inFlightFence, NULL);
+	for (i = 0; i < VK_MAX_FRAMES_IN_FLIGHT; ++i) {
+		if (vk_options.frame.imageAvailableSemaphores[i] != VK_NULL_HANDLE) {
+			vkDestroySemaphore(vk_options.logicalDevice, vk_options.frame.imageAvailableSemaphores[i], NULL);
+		}
+		if (vk_options.frame.renderFinishedSemaphores[i] != VK_NULL_HANDLE) {
+			vkDestroySemaphore(vk_options.logicalDevice, vk_options.frame.renderFinishedSemaphores[i], NULL);
+		}
+		if (vk_options.frame.inFlightFences[i] != VK_NULL_HANDLE) {
+			vkDestroyFence(vk_options.logicalDevice, vk_options.frame.inFlightFences[i], NULL);
+		}
 	}
 	if (vk_options.frame.commandPool != VK_NULL_HANDLE) {
 		vkDestroyCommandPool(vk_options.logicalDevice, vk_options.frame.commandPool, NULL);
 	}
 	Q_free(vk_options.frame.commandBuffers);
+	Q_free(vk_options.frame.imageInFlightFences);
 	memset(&vk_options.frame, 0, sizeof(vk_options.frame));
 }
 
@@ -282,6 +287,7 @@ static qbool VK_CreateFrameResources(void)
 	VkCommandBufferAllocateInfo allocInfo = { 0 };
 	VkSemaphoreCreateInfo semaphoreInfo = { 0 };
 	VkFenceCreateInfo fenceInfo = { 0 };
+	uint32_t i;
 
 	poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
 	poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -301,18 +307,17 @@ static qbool VK_CreateFrameResources(void)
 	}
 
 	semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-	if (vkCreateSemaphore(vk_options.logicalDevice, &semaphoreInfo, NULL, &vk_options.frame.imageAvailableSemaphore) != VK_SUCCESS ||
-		vkCreateSemaphore(vk_options.logicalDevice, &semaphoreInfo, NULL, &vk_options.frame.renderFinishedSemaphore) != VK_SUCCESS) {
-		VK_DestroyFrameResources();
-		return false;
-	}
-
 	fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
 	fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-	if (vkCreateFence(vk_options.logicalDevice, &fenceInfo, NULL, &vk_options.frame.inFlightFence) != VK_SUCCESS) {
-		VK_DestroyFrameResources();
-		return false;
+	for (i = 0; i < VK_MAX_FRAMES_IN_FLIGHT; ++i) {
+		if (vkCreateSemaphore(vk_options.logicalDevice, &semaphoreInfo, NULL, &vk_options.frame.imageAvailableSemaphores[i]) != VK_SUCCESS ||
+			vkCreateSemaphore(vk_options.logicalDevice, &semaphoreInfo, NULL, &vk_options.frame.renderFinishedSemaphores[i]) != VK_SUCCESS ||
+			vkCreateFence(vk_options.logicalDevice, &fenceInfo, NULL, &vk_options.frame.inFlightFences[i]) != VK_SUCCESS) {
+			VK_DestroyFrameResources();
+			return false;
+		}
 	}
+	vk_options.frame.imageInFlightFences = Q_calloc(vk_options.swapChain.imageCount, sizeof(vk_options.frame.imageInFlightFences[0]));
 
 	return true;
 }
@@ -397,6 +402,8 @@ void VK_BeginFrame(void)
 	VkRenderPassBeginInfo renderPassInfo = { 0 };
 	VkClearValue clearValues[2] = { 0 };
 	VkCommandBuffer commandBuffer;
+	uint32_t frameIndex;
+	VkFence frameFence;
 
 	if (vk_options.logicalDevice == VK_NULL_HANDLE || vk_options.frame.active) {
 		return;
@@ -418,9 +425,11 @@ void VK_BeginFrame(void)
 		return;
 	}
 
-	vkWaitForFences(vk_options.logicalDevice, 1, &vk_options.frame.inFlightFence, VK_TRUE, UINT64_MAX);
+	frameIndex = vk_options.frame.currentFrame;
+	frameFence = vk_options.frame.inFlightFences[frameIndex];
+	vkWaitForFences(vk_options.logicalDevice, 1, &frameFence, VK_TRUE, UINT64_MAX);
 
-	result = vkAcquireNextImageKHR(vk_options.logicalDevice, vk_options.swapChain.handle, UINT64_MAX, vk_options.frame.imageAvailableSemaphore, VK_NULL_HANDLE, &vk_options.frame.imageIndex);
+	result = vkAcquireNextImageKHR(vk_options.logicalDevice, vk_options.swapChain.handle, UINT64_MAX, vk_options.frame.imageAvailableSemaphores[frameIndex], VK_NULL_HANDLE, &vk_options.frame.imageIndex);
 	if (result == VK_ERROR_OUT_OF_DATE_KHR) {
 		VK_RequestSwapChainRecreate();
 		return;
@@ -429,6 +438,10 @@ void VK_BeginFrame(void)
 		Con_DPrintf("vulkan: vkAcquireNextImageKHR failed: %d\n", result);
 		return;
 	}
+	if (vk_options.frame.imageInFlightFences[vk_options.frame.imageIndex] != VK_NULL_HANDLE) {
+		vkWaitForFences(vk_options.logicalDevice, 1, &vk_options.frame.imageInFlightFences[vk_options.frame.imageIndex], VK_TRUE, UINT64_MAX);
+	}
+	vk_options.frame.imageInFlightFences[vk_options.frame.imageIndex] = frameFence;
 
 	commandBuffer = vk_options.frame.commandBuffers[vk_options.frame.imageIndex];
 	vkResetCommandBuffer(commandBuffer, 0);
@@ -442,7 +455,7 @@ void VK_BeginFrame(void)
 	// Dynamic lightmaps queued by the previous frame are copied before the
 	// render pass. This keeps transfer work on the frame submission and avoids
 	// the queue-wide stalls caused by immediate command buffers.
-	VK_TextureFlushPendingUploads(commandBuffer);
+	VK_TextureFlushPendingUploads(commandBuffer, frameIndex);
 
 	clearValues[0].color.float32[0] = vk_options.clearColor[0];
 	clearValues[0].color.float32[1] = vk_options.clearColor[1];
@@ -480,10 +493,14 @@ void VK_EndFrame(void)
 	VkPresentInfoKHR presentInfo = { 0 };
 	VkResult result;
 	qbool presented = false;
+	uint32_t frameIndex;
+	VkFence frameFence;
 
 	if (!vk_options.frame.active) {
 		return;
 	}
+	frameIndex = vk_options.frame.currentFrame;
+	frameFence = vk_options.frame.inFlightFences[frameIndex];
 
 	commandBuffer = vk_options.frame.commandBuffers[vk_options.frame.imageIndex];
 	vkCmdEndRenderPass(commandBuffer);
@@ -495,15 +512,15 @@ void VK_EndFrame(void)
 
 	submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
 	submitInfo.waitSemaphoreCount = 1;
-	submitInfo.pWaitSemaphores = &vk_options.frame.imageAvailableSemaphore;
+	submitInfo.pWaitSemaphores = &vk_options.frame.imageAvailableSemaphores[frameIndex];
 	submitInfo.pWaitDstStageMask = waitStages;
 	submitInfo.commandBufferCount = 1;
 	submitInfo.pCommandBuffers = &commandBuffer;
 	submitInfo.signalSemaphoreCount = 1;
-	submitInfo.pSignalSemaphores = &vk_options.frame.renderFinishedSemaphore;
+	submitInfo.pSignalSemaphores = &vk_options.frame.renderFinishedSemaphores[frameIndex];
 
-	vkResetFences(vk_options.logicalDevice, 1, &vk_options.frame.inFlightFence);
-	if (vkQueueSubmit(vk_options.graphicsQueue, 1, &submitInfo, vk_options.frame.inFlightFence) != VK_SUCCESS) {
+	vkResetFences(vk_options.logicalDevice, 1, &frameFence);
+	if (vkQueueSubmit(vk_options.graphicsQueue, 1, &submitInfo, frameFence) != VK_SUCCESS) {
 		vk_options.frame.active = false;
 		Con_DPrintf("vulkan: vkQueueSubmit failed\n");
 		return;
@@ -511,7 +528,7 @@ void VK_EndFrame(void)
 
 	presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
 	presentInfo.waitSemaphoreCount = 1;
-	presentInfo.pWaitSemaphores = &vk_options.frame.renderFinishedSemaphore;
+	presentInfo.pWaitSemaphores = &vk_options.frame.renderFinishedSemaphores[frameIndex];
 	presentInfo.swapchainCount = 1;
 	presentInfo.pSwapchains = &vk_options.swapChain.handle;
 	presentInfo.pImageIndices = &vk_options.frame.imageIndex;
@@ -534,6 +551,7 @@ void VK_EndFrame(void)
 #endif
 
 	vk_options.frame.active = false;
+	vk_options.frame.currentFrame = (frameIndex + 1) % VK_MAX_FRAMES_IN_FLIGHT;
 }
 
 qbool VK_Initialise(SDL_Window* window)

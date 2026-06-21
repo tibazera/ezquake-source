@@ -25,6 +25,8 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include "r_local.h"
 #include "r_state.h"
 
+#define VK_MAX_FRAMES_IN_FLIGHT 2
+
 typedef struct SDL_Window SDL_Window;
 typedef struct gltexture_s gltexture_t;
 struct entity_s;
@@ -107,7 +109,7 @@ void VK_TextureCompressionSet(qbool enabled);
 void VK_TextureCreate2D(texture_ref* reference, int width, int height, const char* name, qbool is_lightmap);
 void VK_TexturesCreate(r_texture_type_id type, int count, texture_ref* textures);
 void VK_TextureReplaceSubImageRGBA(texture_ref texture, int offsetx, int offsety, int width, int height, byte* buffer);
-void VK_TextureFlushPendingUploads(VkCommandBuffer commandBuffer);
+void VK_TextureFlushPendingUploads(VkCommandBuffer commandBuffer, uint32_t frameIndex);
 void VK_TextureSetFiltering(texture_ref texture, texture_minification_id min_filter, texture_magnification_id mag_filter);
 void VK_TextureSetAnisotropy(texture_ref texture, int anisotropy);
 
@@ -176,9 +178,11 @@ typedef struct vk_options_s {
 	struct {
 		VkCommandPool commandPool;
 		VkCommandBuffer* commandBuffers;
-		VkSemaphore imageAvailableSemaphore;
-		VkSemaphore renderFinishedSemaphore;
-		VkFence inFlightFence;
+		VkSemaphore imageAvailableSemaphores[VK_MAX_FRAMES_IN_FLIGHT];
+		VkSemaphore renderFinishedSemaphores[VK_MAX_FRAMES_IN_FLIGHT];
+		VkFence inFlightFences[VK_MAX_FRAMES_IN_FLIGHT];
+		VkFence* imageInFlightFences;
+		uint32_t currentFrame;
 		uint32_t imageIndex;
 		qbool active;
 	} frame;
