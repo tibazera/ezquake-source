@@ -107,6 +107,7 @@ void VK_TextureCompressionSet(qbool enabled);
 void VK_TextureCreate2D(texture_ref* reference, int width, int height, const char* name, qbool is_lightmap);
 void VK_TexturesCreate(r_texture_type_id type, int count, texture_ref* textures);
 void VK_TextureReplaceSubImageRGBA(texture_ref texture, int offsetx, int offsety, int width, int height, byte* buffer);
+void VK_TextureFlushPendingUploads(VkCommandBuffer commandBuffer);
 void VK_TextureSetFiltering(texture_ref texture, texture_minification_id min_filter, texture_magnification_id mag_filter);
 void VK_TextureSetAnisotropy(texture_ref texture, int anisotropy);
 

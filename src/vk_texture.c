@@ -39,7 +39,50 @@ static VkDescriptorSetLayout textureDescriptorSetLayout;
 static VkDescriptorPool textureDescriptorPool;
 static texture_ref boundTextures[16];
 
+#define VK_MAX_PENDING_TEXTURE_UPLOADS 1024
+typedef struct vk_pending_texture_upload_s {
+	texture_ref texture;
+	VkDeviceSize dataOffset;
+	int offsetx;
+	int offsety;
+	int width;
+	int height;
+} vk_pending_texture_upload_t;
+
+static vk_pending_texture_upload_t pendingTextureUploads[VK_MAX_PENDING_TEXTURE_UPLOADS];
+static int pendingTextureUploadCount;
+static byte* pendingTextureUploadData;
+static size_t pendingTextureUploadDataSize;
+static size_t pendingTextureUploadDataCapacity;
+static VkBuffer frameUploadBuffer;
+static VkDeviceMemory frameUploadMemory;
+static VkDeviceSize frameUploadCapacity;
+static void* frameUploadMapped;
+
 static qbool VK_TextureReferenceInRange(texture_ref texture);
+
+static void VK_TextureDestroyFrameUploadBuffer(void)
+{
+	if (vk_options.logicalDevice != VK_NULL_HANDLE) {
+		if (frameUploadMapped && frameUploadMemory != VK_NULL_HANDLE) vkUnmapMemory(vk_options.logicalDevice, frameUploadMemory);
+		if (frameUploadBuffer != VK_NULL_HANDLE) vkDestroyBuffer(vk_options.logicalDevice, frameUploadBuffer, NULL);
+		if (frameUploadMemory != VK_NULL_HANDLE) vkFreeMemory(vk_options.logicalDevice, frameUploadMemory, NULL);
+	}
+	frameUploadBuffer = VK_NULL_HANDLE;
+	frameUploadMemory = VK_NULL_HANDLE;
+	frameUploadCapacity = 0;
+	frameUploadMapped = NULL;
+}
+
+static void VK_TextureDestroyFrameUploadResources(void)
+{
+	VK_TextureDestroyFrameUploadBuffer();
+	Q_free(pendingTextureUploadData);
+	pendingTextureUploadData = NULL;
+	pendingTextureUploadDataSize = 0;
+	pendingTextureUploadDataCapacity = 0;
+	pendingTextureUploadCount = 0;
+}
 
 static qbool VK_TextureReferenceInRange(texture_ref texture)
 {
@@ -180,21 +223,27 @@ static qbool VK_TextureEnsureDescriptor(texture_ref texture)
 	allocInfo.descriptorSetCount = 1;
 	allocInfo.pSetLayouts = &textureDescriptorSetLayout;
 
-	return vkAllocateDescriptorSets(vk_options.logicalDevice, &allocInfo, &vktex->descriptorSet) == VK_SUCCESS;
+	{
+		VkResult result = vkAllocateDescriptorSets(vk_options.logicalDevice, &allocInfo, &vktex->descriptorSet);
+		if (result != VK_SUCCESS) {
+			return false;
+		}
+	}
+	return true;
 }
 
-static void VK_TextureUpdateDescriptor(texture_ref texture)
+static qbool VK_TextureUpdateDescriptor(texture_ref texture)
 {
 	vk_texture_t* vktex;
 	VkDescriptorImageInfo imageInfos[2];
 	VkWriteDescriptorSet descriptorWrite;
 
 	if (!VK_TextureReferenceInRange(texture)) {
-		return;
+		return false;
 	}
 	vktex = &textureData[texture.index];
 	if (vktex->imageView == VK_NULL_HANDLE || !VK_TextureEnsureSamplers(vktex) || !VK_TextureEnsureDescriptor(texture)) {
-		return;
+		return false;
 	}
 
 	VK_InitialiseStructure(imageInfos[0]);
@@ -217,6 +266,7 @@ static void VK_TextureUpdateDescriptor(texture_ref texture)
 	descriptorWrite.pImageInfo = imageInfos;
 
 	vkUpdateDescriptorSets(vk_options.logicalDevice, 1, &descriptorWrite, 0, NULL);
+	return true;
 }
 
 static void VK_TextureTransitionLayout(vk_texture_t* vktex, VkImageLayout newLayout)
@@ -364,12 +414,18 @@ void VK_UploadTexture(texture_ref texture, int mode, int width, int height, byte
 	else {
 		memset(vktex->pixels, 0, vktex->pixelsSize);
 	}
-
 	if (!VK_CreateBufferResource(imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &stagingBuffer, &stagingMemory)) {
 		VK_TextureDestroyObjects(texture);
 		return;
 	}
-	if (vkMapMemory(vk_options.logicalDevice, stagingMemory, 0, imageSize, 0, &mapped) == VK_SUCCESS) {
+	{
+		VkResult result = vkMapMemory(vk_options.logicalDevice, stagingMemory, 0, imageSize, 0, &mapped);
+		if (result != VK_SUCCESS) {
+			vkDestroyBuffer(vk_options.logicalDevice, stagingBuffer, NULL);
+			vkFreeMemory(vk_options.logicalDevice, stagingMemory, NULL);
+			VK_TextureDestroyObjects(texture);
+			return;
+		}
 		memcpy(mapped, vktex->pixels, (size_t)imageSize);
 		vkUnmapMemory(vk_options.logicalDevice, stagingMemory);
 	}
@@ -390,7 +446,12 @@ void VK_UploadTexture(texture_ref texture, int mode, int width, int height, byte
 	VK_TextureTransitionLayout(vktex, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 	VK_TextureCopyBufferToImage(stagingBuffer, vktex, 0, 0, width, height);
 	VK_TextureTransitionLayout(vktex, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-	VK_TextureUpdateDescriptor(texture);
+	if (!VK_TextureUpdateDescriptor(texture)) {
+		vkDestroyBuffer(vk_options.logicalDevice, stagingBuffer, NULL);
+		vkFreeMemory(vk_options.logicalDevice, stagingMemory, NULL);
+		VK_TextureDestroyObjects(texture);
+		return;
+	}
 
 	vkDestroyBuffer(vk_options.logicalDevice, stagingBuffer, NULL);
 	vkFreeMemory(vk_options.logicalDevice, stagingMemory, NULL);
@@ -473,6 +534,7 @@ void VK_TextureShutdown(void)
 	if (vk_options.logicalDevice == VK_NULL_HANDLE) {
 		return;
 	}
+	VK_TextureDestroyFrameUploadResources();
 
 	for (i = 0; i < MAX_GLTEXTURES; ++i) {
 		texture_ref ref;
@@ -648,6 +710,87 @@ void VK_TexturesCreate(r_texture_type_id type, int count, texture_ref* textures)
 	}
 }
 
+static void VK_TextureRecordBarrier(VkCommandBuffer commandBuffer, vk_texture_t* vktex, VkImageLayout oldLayout, VkImageLayout newLayout)
+{
+	VkImageMemoryBarrier barrier;
+	VkPipelineStageFlags sourceStage;
+	VkPipelineStageFlags destinationStage;
+
+	VK_InitialiseStructure(barrier);
+	barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	barrier.oldLayout = oldLayout;
+	barrier.newLayout = newLayout;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.image = vktex->image;
+	barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	barrier.subresourceRange.levelCount = 1;
+	barrier.subresourceRange.layerCount = 1;
+
+	if (oldLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL && newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+		barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+		barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		sourceStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+		destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+	}
+	else {
+		barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+		sourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+		destinationStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+	}
+
+	vkCmdPipelineBarrier(commandBuffer, sourceStage, destinationStage, 0, 0, NULL, 0, NULL, 1, &barrier);
+}
+
+void VK_TextureFlushPendingUploads(VkCommandBuffer commandBuffer)
+{
+	VkDeviceSize requiredCapacity;
+	int i;
+
+	if (commandBuffer == VK_NULL_HANDLE || pendingTextureUploadCount == 0 || pendingTextureUploadDataSize == 0) return;
+
+	requiredCapacity = pendingTextureUploadDataSize;
+	if (frameUploadCapacity < requiredCapacity) {
+		VkDeviceSize newCapacity = max((VkDeviceSize)(4 * 1024 * 1024), requiredCapacity);
+		VK_TextureDestroyFrameUploadBuffer();
+		if (!VK_CreateBufferResource(newCapacity, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+			&frameUploadBuffer, &frameUploadMemory) ||
+			vkMapMemory(vk_options.logicalDevice, frameUploadMemory, 0, newCapacity, 0, &frameUploadMapped) != VK_SUCCESS) {
+			VK_TextureDestroyFrameUploadBuffer();
+			return;
+		}
+		frameUploadCapacity = newCapacity;
+	}
+
+	memcpy(frameUploadMapped, pendingTextureUploadData, pendingTextureUploadDataSize);
+	for (i = 0; i < pendingTextureUploadCount; ++i) {
+		vk_pending_texture_upload_t* upload = &pendingTextureUploads[i];
+		vk_texture_t* vktex;
+		VkBufferImageCopy region;
+
+		if (!VK_TextureReady(upload->texture)) continue;
+		vktex = &textureData[upload->texture.index];
+		VK_TextureRecordBarrier(commandBuffer, vktex, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+		VK_InitialiseStructure(region);
+		region.bufferOffset = upload->dataOffset;
+		region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		region.imageSubresource.layerCount = 1;
+		region.imageOffset.x = upload->offsetx;
+		region.imageOffset.y = upload->offsety;
+		region.imageExtent.width = upload->width;
+		region.imageExtent.height = upload->height;
+		region.imageExtent.depth = 1;
+		vkCmdCopyBufferToImage(commandBuffer, frameUploadBuffer, vktex->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+		VK_TextureRecordBarrier(commandBuffer, vktex, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+	}
+
+	pendingTextureUploadCount = 0;
+	pendingTextureUploadDataSize = 0;
+}
+
 void VK_TextureReplaceSubImageRGBA(texture_ref texture, int offsetx, int offsety, int width, int height, byte* buffer)
 {
 	vk_texture_t* vktex;
@@ -670,6 +813,24 @@ void VK_TextureReplaceSubImageRGBA(texture_ref texture, int offsetx, int offsety
 	}
 
 	imageSize = (VkDeviceSize)width * height * 4;
+	if (VK_CurrentCommandBuffer() != VK_NULL_HANDLE && pendingTextureUploadCount < VK_MAX_PENDING_TEXTURE_UPLOADS) {
+		vk_pending_texture_upload_t* upload = &pendingTextureUploads[pendingTextureUploadCount++];
+		size_t requiredSize = pendingTextureUploadDataSize + (size_t)imageSize;
+		if (requiredSize > pendingTextureUploadDataCapacity) {
+			size_t newCapacity = max((size_t)(4 * 1024 * 1024), requiredSize * 2);
+			pendingTextureUploadData = Q_realloc(pendingTextureUploadData, newCapacity);
+			pendingTextureUploadDataCapacity = newCapacity;
+		}
+		upload->texture = texture;
+		upload->dataOffset = pendingTextureUploadDataSize;
+		upload->offsetx = offsetx;
+		upload->offsety = offsety;
+		upload->width = width;
+		upload->height = height;
+		memcpy(pendingTextureUploadData + pendingTextureUploadDataSize, buffer, (size_t)imageSize);
+		pendingTextureUploadDataSize = requiredSize;
+		return;
+	}
 	if (!VK_CreateBufferResource(imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &stagingBuffer, &stagingMemory)) {
 		return;
 	}

@@ -439,6 +439,11 @@ void VK_BeginFrame(void)
 		return;
 	}
 
+	// Dynamic lightmaps queued by the previous frame are copied before the
+	// render pass. This keeps transfer work on the frame submission and avoids
+	// the queue-wide stalls caused by immediate command buffers.
+	VK_TextureFlushPendingUploads(commandBuffer);
+
 	clearValues[0].color.float32[0] = vk_options.clearColor[0];
 	clearValues[0].color.float32[1] = vk_options.clearColor[1];
 	clearValues[0].color.float32[2] = vk_options.clearColor[2];
