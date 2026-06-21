@@ -11,6 +11,9 @@ of the License, or (at your option) any later version.
 
 #include <vulkan/vulkan.h>
 #include "quakedef.h"
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
 
 #include "r_renderer.h"
 #include "r_texture_internal.h"
@@ -89,6 +92,38 @@ static void VK_TextureDestroyFrameUploadResources(void)
 static qbool VK_TextureReferenceInRange(texture_ref texture)
 {
 	return texture.index > 0 && texture.index < MAX_GLTEXTURES;
+}
+
+// Shared by VK_UploadTexture and VK_TextureReplaceSubImageRGBA: queues raw
+// pixel data for upload on the next VK_TextureFlushPendingUploads call instead
+// of an immediate per-texture submit+vkQueueWaitIdle. Returns false if the
+// batch is full so callers can fall back to an immediate upload.
+static qbool VK_TextureQueuePendingUpload(texture_ref texture, int offsetx, int offsety, int width, int height, const byte* buffer)
+{
+	VkDeviceSize imageSize = (VkDeviceSize)width * height * 4;
+	vk_pending_texture_upload_t* upload;
+	size_t requiredSize;
+
+	if (pendingTextureUploadCount >= VK_MAX_PENDING_TEXTURE_UPLOADS) {
+		return false;
+	}
+
+	upload = &pendingTextureUploads[pendingTextureUploadCount++];
+	requiredSize = pendingTextureUploadDataSize + (size_t)imageSize;
+	if (requiredSize > pendingTextureUploadDataCapacity) {
+		size_t newCapacity = max((size_t)(4 * 1024 * 1024), requiredSize * 2);
+		pendingTextureUploadData = Q_realloc(pendingTextureUploadData, newCapacity);
+		pendingTextureUploadDataCapacity = newCapacity;
+	}
+	upload->texture = texture;
+	upload->dataOffset = pendingTextureUploadDataSize;
+	upload->offsetx = offsetx;
+	upload->offsety = offsety;
+	upload->width = width;
+	upload->height = height;
+	memcpy(pendingTextureUploadData + pendingTextureUploadDataSize, buffer, (size_t)imageSize);
+	pendingTextureUploadDataSize = requiredSize;
+	return true;
 }
 
 static void VK_TextureDestroyObjects(texture_ref texture)
@@ -271,19 +306,13 @@ static qbool VK_TextureUpdateDescriptor(texture_ref texture)
 	return true;
 }
 
-static void VK_TextureTransitionLayout(vk_texture_t* vktex, VkImageLayout newLayout)
+static void VK_TextureRecordTransitionBarrier(VkCommandBuffer commandBuffer, vk_texture_t* vktex, VkImageLayout newLayout)
 {
-	VkCommandBuffer commandBuffer;
 	VkImageMemoryBarrier barrier;
 	VkPipelineStageFlags sourceStage;
 	VkPipelineStageFlags destinationStage;
 
 	if (vktex->image == VK_NULL_HANDLE || vktex->layout == newLayout) {
-		return;
-	}
-
-	commandBuffer = VK_BeginImmediateCommands();
-	if (commandBuffer == VK_NULL_HANDLE) {
 		return;
 	}
 
@@ -326,12 +355,15 @@ static void VK_TextureTransitionLayout(vk_texture_t* vktex, VkImageLayout newLay
 	}
 
 	vkCmdPipelineBarrier(commandBuffer, sourceStage, destinationStage, 0, 0, NULL, 0, NULL, 1, &barrier);
-	if (VK_EndImmediateCommands(commandBuffer)) {
-		vktex->layout = newLayout;
-	}
+	vktex->layout = newLayout;
 }
 
-static void VK_TextureCopyBufferToImage(VkBuffer buffer, vk_texture_t* vktex, int offsetx, int offsety, int width, int height)
+// Combines transition+copy+transition into a single immediate command buffer
+// submit/wait instead of three: VK_EndImmediateCommands does a full
+// vkQueueWaitIdle, so calling it 3x per texture (as the old TransitionLayout/
+// CopyBufferToImage call sequence did) meant 3 full GPU drains per texture --
+// for a dm3-scale map's ~420 world textures that is ~1260 drains during load.
+static void VK_TextureUploadBufferToImageImmediate(VkBuffer buffer, vk_texture_t* vktex, int offsetx, int offsety, int width, int height)
 {
 	VkCommandBuffer commandBuffer;
 	VkBufferImageCopy region;
@@ -340,6 +372,8 @@ static void VK_TextureCopyBufferToImage(VkBuffer buffer, vk_texture_t* vktex, in
 	if (commandBuffer == VK_NULL_HANDLE) {
 		return;
 	}
+
+	VK_TextureRecordTransitionBarrier(commandBuffer, vktex, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 
 	VK_InitialiseStructure(region);
 	region.bufferOffset = 0;
@@ -355,8 +389,10 @@ static void VK_TextureCopyBufferToImage(VkBuffer buffer, vk_texture_t* vktex, in
 	region.imageExtent.width = width;
 	region.imageExtent.height = height;
 	region.imageExtent.depth = 1;
-
 	vkCmdCopyBufferToImage(commandBuffer, buffer, vktex->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+	VK_TextureRecordTransitionBarrier(commandBuffer, vktex, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
 	VK_EndImmediateCommands(commandBuffer);
 }
 
@@ -390,10 +426,7 @@ void VK_AllocateTextureNames(gltexture_t* glt)
 void VK_UploadTexture(texture_ref texture, int mode, int width, int height, byte* data)
 {
 	vk_texture_t* vktex;
-	VkBuffer stagingBuffer = VK_NULL_HANDLE;
-	VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
 	VkDeviceSize imageSize;
-	void* mapped;
 
 	if (!VK_TextureReferenceInRange(texture) || vk_options.logicalDevice == VK_NULL_HANDLE || width <= 0 || height <= 0) {
 		return;
@@ -416,47 +449,42 @@ void VK_UploadTexture(texture_ref texture, int mode, int width, int height, byte
 	else {
 		memset(vktex->pixels, 0, vktex->pixelsSize);
 	}
-	if (!VK_CreateBufferResource(imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &stagingBuffer, &stagingMemory)) {
-		VK_TextureDestroyObjects(texture);
-		return;
-	}
-	{
-		VkResult result = vkMapMemory(vk_options.logicalDevice, stagingMemory, 0, imageSize, 0, &mapped);
-		if (result != VK_SUCCESS) {
-			vkDestroyBuffer(vk_options.logicalDevice, stagingBuffer, NULL);
-			vkFreeMemory(vk_options.logicalDevice, stagingMemory, NULL);
-			VK_TextureDestroyObjects(texture);
-			return;
-		}
-		memcpy(mapped, vktex->pixels, (size_t)imageSize);
-		vkUnmapMemory(vk_options.logicalDevice, stagingMemory);
-	}
 
 	if (!VK_CreateImageResource(width, height, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &vktex->image, &vktex->memory)) {
-		vkDestroyBuffer(vk_options.logicalDevice, stagingBuffer, NULL);
-		vkFreeMemory(vk_options.logicalDevice, stagingMemory, NULL);
 		VK_TextureDestroyObjects(texture);
 		return;
 	}
 	if (!VK_TextureCreateImageView(texture)) {
-		vkDestroyBuffer(vk_options.logicalDevice, stagingBuffer, NULL);
-		vkFreeMemory(vk_options.logicalDevice, stagingMemory, NULL);
 		VK_TextureDestroyObjects(texture);
 		return;
 	}
-
-	VK_TextureTransitionLayout(vktex, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-	VK_TextureCopyBufferToImage(stagingBuffer, vktex, 0, 0, width, height);
-	VK_TextureTransitionLayout(vktex, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 	if (!VK_TextureUpdateDescriptor(texture)) {
-		vkDestroyBuffer(vk_options.logicalDevice, stagingBuffer, NULL);
-		vkFreeMemory(vk_options.logicalDevice, stagingMemory, NULL);
 		VK_TextureDestroyObjects(texture);
 		return;
 	}
 
-	vkDestroyBuffer(vk_options.logicalDevice, stagingBuffer, NULL);
-	vkFreeMemory(vk_options.logicalDevice, stagingMemory, NULL);
+	// Queue the GPU upload through the same shared per-frame batch the
+	// dynamic lightmap path uses, instead of an immediate submit+wait per
+	// texture: bulk map loads create hundreds of world textures back to
+	// back, and that used to mean one full GPU drain each. Falls back to a
+	// single immediate upload only if the batch capacity is exhausted.
+	if (!VK_TextureQueuePendingUpload(texture, 0, 0, width, height, vktex->pixels)) {
+		VkBuffer stagingBuffer = VK_NULL_HANDLE;
+		VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+		void* mapped;
+
+		if (!VK_CreateBufferResource(imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &stagingBuffer, &stagingMemory)) {
+			return;
+		}
+		if (vkMapMemory(vk_options.logicalDevice, stagingMemory, 0, imageSize, 0, &mapped) == VK_SUCCESS) {
+			memcpy(mapped, vktex->pixels, (size_t)imageSize);
+			vkUnmapMemory(vk_options.logicalDevice, stagingMemory);
+		}
+		VK_TextureUploadBufferToImageImmediate(stagingBuffer, vktex, 0, 0, width, height);
+		vkDestroyBuffer(vk_options.logicalDevice, stagingBuffer, NULL);
+		vkFreeMemory(vk_options.logicalDevice, stagingMemory, NULL);
+	}
+
 	gltextures[texture.index].texnum = texture.index;
 }
 
@@ -712,43 +740,30 @@ void VK_TexturesCreate(r_texture_type_id type, int count, texture_ref* textures)
 	}
 }
 
-static void VK_TextureRecordBarrier(VkCommandBuffer commandBuffer, vk_texture_t* vktex, VkImageLayout oldLayout, VkImageLayout newLayout)
-{
-	VkImageMemoryBarrier barrier;
-	VkPipelineStageFlags sourceStage;
-	VkPipelineStageFlags destinationStage;
-
-	VK_InitialiseStructure(barrier);
-	barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-	barrier.oldLayout = oldLayout;
-	barrier.newLayout = newLayout;
-	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	barrier.image = vktex->image;
-	barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-	barrier.subresourceRange.levelCount = 1;
-	barrier.subresourceRange.layerCount = 1;
-
-	if (oldLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL && newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
-		barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-		barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-		sourceStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-		destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-	}
-	else {
-		barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-		barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-		sourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-		destinationStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-	}
-
-	vkCmdPipelineBarrier(commandBuffer, sourceStage, destinationStage, 0, 0, NULL, 0, NULL, 1, &barrier);
-}
-
 void VK_TextureFlushPendingUploads(VkCommandBuffer commandBuffer, uint32_t frameIndex)
 {
 	VkDeviceSize requiredCapacity;
 	int i;
+
+#ifdef __ANDROID__
+	{
+		static unsigned int profile_frames;
+		static unsigned int profile_uploads_accum;
+		static VkDeviceSize profile_bytes_accum;
+
+		profile_uploads_accum += (unsigned int)pendingTextureUploadCount;
+		profile_bytes_accum += pendingTextureUploadDataSize;
+		if (++profile_frames >= 60) {
+			__android_log_print(ANDROID_LOG_INFO, "VK_PROFILE",
+				"lightmap uploads avg count=%.1f avg bytes=%.0f per frame",
+				profile_uploads_accum / (float)profile_frames,
+				profile_bytes_accum / (float)profile_frames);
+			profile_frames = 0;
+			profile_uploads_accum = 0;
+			profile_bytes_accum = 0;
+		}
+	}
+#endif
 
 	if (commandBuffer == VK_NULL_HANDLE || frameIndex >= VK_MAX_FRAMES_IN_FLIGHT || pendingTextureUploadCount == 0 || pendingTextureUploadDataSize == 0) return;
 
@@ -774,7 +789,11 @@ void VK_TextureFlushPendingUploads(VkCommandBuffer commandBuffer, uint32_t frame
 
 		if (!VK_TextureReady(upload->texture)) continue;
 		vktex = &textureData[upload->texture.index];
-		VK_TextureRecordBarrier(commandBuffer, vktex, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+		// Reads/updates vktex->layout instead of assuming SHADER_READ_ONLY_OPTIMAL,
+		// so freshly created textures (real layout UNDEFINED) queued here by
+		// VK_UploadTexture get a correct discard transition instead of a bogus
+		// "read" barrier on contents that were never written.
+		VK_TextureRecordTransitionBarrier(commandBuffer, vktex, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 
 		VK_InitialiseStructure(region);
 		region.bufferOffset = upload->dataOffset;
@@ -786,7 +805,7 @@ void VK_TextureFlushPendingUploads(VkCommandBuffer commandBuffer, uint32_t frame
 		region.imageExtent.height = upload->height;
 		region.imageExtent.depth = 1;
 		vkCmdCopyBufferToImage(commandBuffer, frameUploadBuffers[frameIndex], vktex->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-		VK_TextureRecordBarrier(commandBuffer, vktex, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+		VK_TextureRecordTransitionBarrier(commandBuffer, vktex, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 	}
 
 	pendingTextureUploadCount = 0;
@@ -815,22 +834,11 @@ void VK_TextureReplaceSubImageRGBA(texture_ref texture, int offsetx, int offsety
 	}
 
 	imageSize = (VkDeviceSize)width * height * 4;
-	if (VK_CurrentCommandBuffer() != VK_NULL_HANDLE && pendingTextureUploadCount < VK_MAX_PENDING_TEXTURE_UPLOADS) {
-		vk_pending_texture_upload_t* upload = &pendingTextureUploads[pendingTextureUploadCount++];
-		size_t requiredSize = pendingTextureUploadDataSize + (size_t)imageSize;
-		if (requiredSize > pendingTextureUploadDataCapacity) {
-			size_t newCapacity = max((size_t)(4 * 1024 * 1024), requiredSize * 2);
-			pendingTextureUploadData = Q_realloc(pendingTextureUploadData, newCapacity);
-			pendingTextureUploadDataCapacity = newCapacity;
-		}
-		upload->texture = texture;
-		upload->dataOffset = pendingTextureUploadDataSize;
-		upload->offsetx = offsetx;
-		upload->offsety = offsety;
-		upload->width = width;
-		upload->height = height;
-		memcpy(pendingTextureUploadData + pendingTextureUploadDataSize, buffer, (size_t)imageSize);
-		pendingTextureUploadDataSize = requiredSize;
+	// Queue regardless of whether a frame is currently active: bulk callers
+	// outside the render loop (initial lightmap build at map load) rely on
+	// this path too, so the whole batch gets flushed through one shared
+	// command buffer/wait instead of one immediate submit per surface.
+	if (VK_TextureQueuePendingUpload(texture, offsetx, offsety, width, height, buffer)) {
 		return;
 	}
 	if (!VK_CreateBufferResource(imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &stagingBuffer, &stagingMemory)) {
@@ -841,9 +849,7 @@ void VK_TextureReplaceSubImageRGBA(texture_ref texture, int offsetx, int offsety
 		vkUnmapMemory(vk_options.logicalDevice, stagingMemory);
 	}
 
-	VK_TextureTransitionLayout(vktex, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-	VK_TextureCopyBufferToImage(stagingBuffer, vktex, offsetx, offsety, width, height);
-	VK_TextureTransitionLayout(vktex, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+	VK_TextureUploadBufferToImageImmediate(stagingBuffer, vktex, offsetx, offsety, width, height);
 
 	vkDestroyBuffer(vk_options.logicalDevice, stagingBuffer, NULL);
 	vkFreeMemory(vk_options.logicalDevice, stagingMemory, NULL);
