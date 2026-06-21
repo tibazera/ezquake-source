@@ -35,6 +35,8 @@ Não substitua a base por FTEQW. FTEQW e vkQuake são referências para soluçõ
 - Atualizações dinâmicas de lightmaps são enfileiradas e copiadas por um staging buffer persistente no command buffer do frame seguinte.
 - O caminho normal de atualização de lightmaps não cria vários command buffers imediatos nem executa `vkQueueWaitIdle` por atualização.
 - O loop Vulkan permite dois frames em voo. Cada frame possui semáforos, fence e staging de lightmap próprios; cada imagem do swapchain rastreia seu último fence.
+- A superfície de render Android é limitada ao envelope 1920x1080, preservando a proporção física e sem fazer upscale. No Xiaomi 2712x1220, o buffer validado é 1920x864 e o SurfaceView é escalado pelo compositor para preencher a tela.
+- `SDLActivity.mLayout.addView(mSurface, ...)` agora passa `RelativeLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT)` explícito. Sem isso, o `RelativeLayout` usava `WRAP_CONTENT` por padrão e, depois do `setFixedSize()` do item acima, o `SurfaceView` media seu próprio tamanho preferido como o buffer fixo (1920x864) em vez de preencher a tela — confirmado via `dumpsys SurfaceFlinger` (bounds da layer do SurfaceView = 1920x864 contra os 2712x1220 da Activity) e visualmente (área preta cobrindo o resto da tela). Corrigido; confirmado visualmente no Xiaomi que a tela volta a preencher por completo.
 - dm3, dm4 e dm6 voltaram a carregar com texturas depois de isolar um conflito de conteúdo PK3 no aparelho.
 
 Commits de referência no momento em que esta memória foi criada:
@@ -42,6 +44,7 @@ Commits de referência no momento em que esta memória foi criada:
 - `675fb197` — migração do cliente Android/Vulkan para SDL3.
 - `cea4a636` — batching das atualizações dinâmicas de lightmap.
 - `691a5959` — dois frames Vulkan em voo com sincronização e staging por frame.
+- `53fdaa54` — superfície Android limitada proporcionalmente ao envelope 1920x1080.
 - `e33e1597` — handoff Android/Vulkan inicial.
 - `eff9b8f2` — estratégia documentada para o conflito de PK3.
 
@@ -107,6 +110,10 @@ Não abra instâncias duplicadas do scrcpy. Verifique processos existentes antes
 
 Durante o diagnóstico, o callback Oboe foi temporariamente alterado para bloquear no mutex e foram adicionados logs de amostras. Essas experiências foram revertidas. O callback final permanece não bloqueante como no port do Lele; a correção real foi a semântica SDL3 do mutex.
 
+### Tela preta depois de limitar a resolução de render
+
+Depois de introduzir `getHolder().setFixedSize()` em `SDLSurface` para limitar o buffer ao envelope 1920x1080, a tela passou a mostrar o jogo renderizado num retângulo no canto superior esquerdo, com o resto preto. A causa não foi o compositor: `SDLActivity` adicionava o `SurfaceView` ao `RelativeLayout` sem `LayoutParams` explícito (`mLayout.addView(mSurface)`), então o layout usava `WRAP_CONTENT`. Sem tamanho fixo de buffer isso nunca importava; com o buffer fixo, o `onMeasure()` do `SurfaceView` passou a reportar o tamanho fixo como preferido, e a View ficou do tamanho do buffer (1920x864) em vez de preencher a Activity (2712x1220). Confirmado via `dumpsys SurfaceFlinger` comparando `bounds`/`geomLayerBounds` da layer do SurfaceView com a layer da Activity. Corrigido passando `RelativeLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT)` no `addView`. Ao tocar em `setFixedSize`/dimensionamento de buffer em qualquer SurfaceView, confirme sempre que o `LayoutParams` do pai força preenchimento total — não assuma que o compositor escala automaticamente sem isso.
+
 ### Entrada remota no Xiaomi
 
 `adb shell input` e a injeção normal do scrcpy falharam com `INJECT_EVENTS`. O modo UHID de teclado e mouse funciona sem essa permissão adicional. Não conclua que o SDL3 perdeu entrada antes de separar restrição do Android/Xiaomi de falha no engine.
@@ -122,6 +129,8 @@ O primeiro gargalo atacado foi a atualização dinâmica de lightmaps, que usava
 O renderer originalmente usava um único fence global e esperava no começo de todo frame. Isso anulava o benefício das várias imagens do swapchain e podia provocar degraus de frame pacing em FIFO. A implementação atual usa dois frames em voo, synchronization objects por frame, fence por imagem e staging de upload separado por frame. Se o número de frames em voo mudar, mantenha todas essas estruturas dimensionadas em conjunto.
 
 No Xiaomi de teste, o surface em paisagem é 2712x1220 e o display físico foi observado a 120 Hz. O build com dois frames em voo iniciou e permaneceu estável, sem fatal ou erro Vulkan no logcat. O ganho real de FPS em dm3/dm4/dm6 ainda não foi medido; não o trate como resultado confirmado.
+
+Para evitar custo de fill-rate desnecessário, `SDLSurface` chama `SurfaceHolder.setFixedSize()` com um tamanho que cabe em 1920x1080 e mantém o aspect ratio do aparelho. Exemplos: 1920x1080 permanece 1920x1080; 2712x1220 vira 1920x864; aparelhos menores mantêm sua resolução nativa. O tamanho físico do `View`, e não o tamanho reduzido do buffer, deve ser usado para normalizar eventos de toque.
 
 `dumpsys gfxinfo` mede principalmente a UI Java e não representa os frames Vulkan do `SurfaceView`. Para observar apresentação real, obtenha o nome exato da layer BLAST no `dumpsys SurfaceFlinger` e use `dumpsys SurfaceFlinger --latency '<nome da layer>'`. A primeira linha é o período do display em nanossegundos e as seguintes contêm timestamps por frame. No menu desconectado foram observados intervalos próximos de 33–40 ms, mas isso não é benchmark de gameplay: `CL_MinFrameTime()` aplica `cl_maxfps_menu` ou a frequência detectada quando `cls.state == ca_disconnected`. O config ativo tinha `cl_maxfps 308`, `cl_maxfps_menu 0` e `vid_vsync 0`.
 
@@ -163,6 +172,7 @@ Use dm3, dm4 e dm6 com dados conhecidos e limpos para comparação. e1m2 e aerow
 - `CMakeLists.txt` e `vcpkg.json`: SDL3, Oboe e dependências Android.
 - `app/src/main/java/org/ezquake/android/EzQuakeActivity.java`: entrada Android específica do app.
 - `app/src/main/java/org/libsdl/app/`: bootstrap Java SDL3.
+- `app/src/main/java/org/libsdl/app/SDLSurface.java`: limite proporcional da superfície Android e normalização física do toque.
 - `src/vid_sdl2.c` e `src/in_sdl2.c`: plataforma SDL; os nomes históricos dos arquivos permanecem apesar do SDL3.
 - `src/snd_main.c`: mutex e mixer.
 - `src/snd_backend_oboe.cpp`: saída Android Oboe.

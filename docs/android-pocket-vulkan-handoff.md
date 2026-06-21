@@ -9,6 +9,8 @@ Branch: `feature/android-pocket-vulkan`
 - SDL3 boolean return contracts are applied to initialization, mutexes, semaphores, events and Vulkan surface creation.
 - Dynamic lightmap sub-image updates are queued and copied through a persistent mapped staging buffer in the next frame command buffer. This removes the immediate-command-buffer and queue-idle path from normal frame updates.
 - The renderer now permits two frames in flight instead of waiting for the previous frame at every `VK_BeginFrame`. Each frame owns its synchronization objects and lightmap staging buffer, while each swapchain image tracks the fence that last used it.
+- Android rendering is capped to a 1920x1080 envelope while preserving device aspect ratio and never upscaling smaller displays. The 2712x1220 test device renders at 1920x864; touch normalization continues to use the physical View dimensions.
+- `SDLActivity` now adds the `SurfaceView` to its `RelativeLayout` with explicit `MATCH_PARENT` layout params. Without this, the surface-size cap above exposed a latent bug: the layout defaulted to `WRAP_CONTENT`, and once the surface had a fixed buffer size, `SurfaceView.onMeasure()` used that fixed size as its preferred view size instead of filling the screen, leaving most of the display black. Confirmed visually and via `dumpsys SurfaceFlinger` layer bounds before and after the fix.
 - Voice capture is disabled on Android; playback uses Oboe.
 
 ## Build
@@ -39,4 +41,4 @@ The SDL2 expression `SDL_TryLockMutex(mutex) == 0` was invalid after migration b
 
 - Measure dm3/dm4/dm6 frame timings after the lightmap batching and two-frames-in-flight changes. Startup/stability has been validated on the Xiaomi test device, but the in-map FPS gain is not yet measured.
 - Profile world draw-call count, pipeline switches and CPU/GPU frame split before importing broader renderer changes from vkQuake or FTEQW.
-- The test device exposes a 2712x1220 landscape surface and was running its physical display at 120 Hz. If synchronization changes are insufficient, measure fill-rate pressure at native resolution before implementing a lower-resolution render target or Android surface scaling.
+- Compare frametimes at the capped 1920x864 surface against the former native 2712x1220 path, then decide whether a user-selectable render-scale setting is still necessary.
