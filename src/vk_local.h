@@ -25,7 +25,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include "r_local.h"
 #include "r_state.h"
 
-#define VK_MAX_FRAMES_IN_FLIGHT 2
+#define VK_MAX_FRAMES_IN_FLIGHT 3
 
 typedef struct SDL_Window SDL_Window;
 typedef struct gltexture_s gltexture_t;
