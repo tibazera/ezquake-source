@@ -135,6 +135,18 @@ static void VK_TextureDestroyObjects(texture_ref texture)
 	}
 
 	vktex = &textureData[texture.index];
+
+	// The GPU may still be reading this texture's image/descriptor from an
+	// in-flight command buffer (we run up to VK_MAX_FRAMES_IN_FLIGHT frames
+	// ahead of the GPU). Destroying it underneath an in-progress draw is
+	// undefined behaviour and hangs some mobile GPU drivers outright -- this
+	// is what made vid_reload freeze the client once frames-in-flight went
+	// from 1 to 2. Only pay the (otherwise idle, near-free) wait when there's
+	// an actual GPU resource to tear down.
+	if (vktex->image != VK_NULL_HANDLE) {
+		vkDeviceWaitIdle(vk_options.logicalDevice);
+	}
+
 	if (vktex->descriptorSet != VK_NULL_HANDLE && textureDescriptorPool != VK_NULL_HANDLE) {
 		vkFreeDescriptorSets(vk_options.logicalDevice, textureDescriptorPool, 1, &vktex->descriptorSet);
 	}

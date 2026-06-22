@@ -541,6 +541,7 @@ void VK_BeginFrame(void)
 	VkCommandBuffer commandBuffer;
 	uint32_t frameIndex;
 	VkFence frameFence;
+	VkResult waitResult;
 
 #ifdef __ANDROID__
 	{
@@ -615,7 +616,7 @@ void VK_BeginFrame(void)
 		double waitStart = Sys_DoubleTime();
 		double waitDt;
 
-		vkWaitForFences(vk_options.logicalDevice, 1, &frameFence, VK_TRUE, UINT64_MAX);
+		waitResult = vkWaitForFences(vk_options.logicalDevice, 1, &frameFence, VK_TRUE, UINT64_MAX);
 		waitDt = Sys_DoubleTime() - waitStart;
 
 		profile_wait_accum += waitDt;
@@ -632,8 +633,11 @@ void VK_BeginFrame(void)
 		}
 	}
 #else
-	vkWaitForFences(vk_options.logicalDevice, 1, &frameFence, VK_TRUE, UINT64_MAX);
+	waitResult = vkWaitForFences(vk_options.logicalDevice, 1, &frameFence, VK_TRUE, UINT64_MAX);
 #endif
+	if (waitResult != VK_SUCCESS) {
+		Sys_Error("vulkan: frame fence wait failed: %d", waitResult);
+	}
 
 	// Finite timeout, not UINT64_MAX: with non-blocking present modes
 	// (IMMEDIATE/MAILBOX) the CPU can render faster than the compositor
@@ -661,35 +665,40 @@ void VK_BeginFrame(void)
 		VK_RequestSwapChainRecreate();
 		return;
 	}
-	if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
-		Con_DPrintf("vulkan: vkAcquireNextImageKHR failed: %d\n", result);
+	if (result == VK_ERROR_SURFACE_LOST_KHR) {
+		VK_RequestSurfaceRecreate();
 		return;
 	}
+	if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
+		Sys_Error("vulkan: vkAcquireNextImageKHR failed: %d", result);
+	}
 	if (vk_options.frame.imageInFlightFences[vk_options.frame.imageIndex] != VK_NULL_HANDLE) {
-		VkResult waitResult;
 #ifdef __ANDROID__
 		{
 			static vk_profile_accum_t imageWaitAccum;
 			double t0 = Sys_DoubleTime();
-			waitResult = vkWaitForFences(vk_options.logicalDevice, 1, &vk_options.frame.imageInFlightFences[vk_options.frame.imageIndex], VK_TRUE, 1000000000ULL);
+			waitResult = vkWaitForFences(vk_options.logicalDevice, 1, &vk_options.frame.imageInFlightFences[vk_options.frame.imageIndex], VK_TRUE, UINT64_MAX);
 			VK_ProfileAccumulate(&imageWaitAccum, "image-in-flight wait", Sys_DoubleTime() - t0);
 		}
 #else
-		waitResult = vkWaitForFences(vk_options.logicalDevice, 1, &vk_options.frame.imageInFlightFences[vk_options.frame.imageIndex], VK_TRUE, 1000000000ULL);
+		waitResult = vkWaitForFences(vk_options.logicalDevice, 1, &vk_options.frame.imageInFlightFences[vk_options.frame.imageIndex], VK_TRUE, UINT64_MAX);
 #endif
-		if (waitResult == VK_TIMEOUT) {
-			return;
+		if (waitResult != VK_SUCCESS) {
+			Sys_Error("vulkan: swapchain image fence wait failed: %d", waitResult);
 		}
 	}
 	vk_options.frame.imageInFlightFences[vk_options.frame.imageIndex] = frameFence;
 
 	commandBuffer = vk_options.frame.commandBuffers[vk_options.frame.imageIndex];
-	vkResetCommandBuffer(commandBuffer, 0);
+	result = vkResetCommandBuffer(commandBuffer, 0);
+	if (result != VK_SUCCESS) {
+		Sys_Error("vulkan: vkResetCommandBuffer failed: %d", result);
+	}
 
 	beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-	if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS) {
-		Con_DPrintf("vulkan: vkBeginCommandBuffer failed\n");
-		return;
+	result = vkBeginCommandBuffer(commandBuffer, &beginInfo);
+	if (result != VK_SUCCESS) {
+		Sys_Error("vulkan: vkBeginCommandBuffer failed: %d", result);
 	}
 
 	// Dynamic lightmaps queued by the previous frame are copied before the
@@ -747,10 +756,9 @@ void VK_EndFrame(void)
 
 	commandBuffer = vk_options.frame.commandBuffers[vk_options.frame.imageIndex];
 	vkCmdEndRenderPass(commandBuffer);
-	if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
-		vk_options.frame.active = false;
-		Con_DPrintf("vulkan: vkEndCommandBuffer failed\n");
-		return;
+	result = vkEndCommandBuffer(commandBuffer);
+	if (result != VK_SUCCESS) {
+		Sys_Error("vulkan: vkEndCommandBuffer failed: %d", result);
 	}
 #ifdef __ANDROID__
 	if (vk_profile_recording_start > 0) {
@@ -768,24 +776,24 @@ void VK_EndFrame(void)
 	submitInfo.signalSemaphoreCount = 1;
 	submitInfo.pSignalSemaphores = &vk_options.frame.renderFinishedSemaphores[frameIndex];
 
-	vkResetFences(vk_options.logicalDevice, 1, &frameFence);
+	result = vkResetFences(vk_options.logicalDevice, 1, &frameFence);
+	if (result != VK_SUCCESS) {
+		Sys_Error("vulkan: vkResetFences failed: %d", result);
+	}
 #ifdef __ANDROID__
 	{
 		static vk_profile_accum_t submitAccum;
 		double t0 = Sys_DoubleTime();
-		result = vkQueueSubmit(vk_options.graphicsQueue, 1, &submitInfo, frameFence) == VK_SUCCESS ? VK_SUCCESS : VK_ERROR_UNKNOWN;
+		result = vkQueueSubmit(vk_options.graphicsQueue, 1, &submitInfo, frameFence);
 		VK_ProfileAccumulate(&submitAccum, "vkQueueSubmit", Sys_DoubleTime() - t0);
 		if (result != VK_SUCCESS) {
-			vk_options.frame.active = false;
-			Con_DPrintf("vulkan: vkQueueSubmit failed\n");
-			return;
+			Sys_Error("vulkan: vkQueueSubmit failed: %d", result);
 		}
 	}
 #else
-	if (vkQueueSubmit(vk_options.graphicsQueue, 1, &submitInfo, frameFence) != VK_SUCCESS) {
-		vk_options.frame.active = false;
-		Con_DPrintf("vulkan: vkQueueSubmit failed\n");
-		return;
+	result = vkQueueSubmit(vk_options.graphicsQueue, 1, &submitInfo, frameFence);
+	if (result != VK_SUCCESS) {
+		Sys_Error("vulkan: vkQueueSubmit failed: %d", result);
 	}
 #endif
 
@@ -816,6 +824,9 @@ void VK_EndFrame(void)
 		// recreate trigger meant the swapchain (and a vkDeviceWaitIdle) was
 		// being torn down and rebuilt on every single frame.
 		VK_RequestSwapChainRecreate();
+	}
+	else if (result == VK_ERROR_SURFACE_LOST_KHR) {
+		VK_RequestSurfaceRecreate();
 	}
 	else if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
 		Con_DPrintf("vulkan: vkQueuePresentKHR failed: %d\n", result);

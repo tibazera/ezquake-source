@@ -21826,6 +21826,10 @@
         {
           "description": "OpenGL, GLSL-only (requires OpenGL 4.3 driver)",
           "name": "1"
+        },
+        {
+          "description": "Vulkan renderer (experimental). Requires vid_restart when changed.",
+          "name": "2"
         }
       ]
     },

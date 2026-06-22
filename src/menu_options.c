@@ -462,7 +462,7 @@ const char* vid_renderer_enum[] = {
 	"modern", "1",
 #endif
 #ifdef RENDERER_OPTION_VULKAN
-	"vulkan", "2",
+	"vulkan (experimental)", "2",
 #endif
 	NULL
 };
