@@ -51,6 +51,10 @@ public class SDLSurface extends SurfaceView implements SurfaceHolder.Callback,
     private static final int MAX_RENDER_WIDTH = 1920;
     private static final int MAX_RENDER_HEIGHT = 1080;
 
+    // Logged once so we can confirm on real hardware whether the captured mouse is
+    // actually handing us batched historical samples, without flooding logcat.
+    private boolean mLoggedMouseHistoryDrain = false;
+
     // Startup
     protected SDLSurface(Context context) {
         super(context);
@@ -427,11 +431,29 @@ public class SDLSurface extends SurfaceView implements SurfaceHolder.Callback,
                     return true;
 
                 case MotionEvent.ACTION_HOVER_MOVE:
-                case MotionEvent.ACTION_MOVE:
+                case MotionEvent.ACTION_MOVE: {
+                    // Android coalesces every raw HID sample that arrived since the
+                    // previous dispatched event into this MotionEvent's history,
+                    // keeping the final x/y as just the LAST raw sample's relative
+                    // delta. A gaming mouse polling at 500-1000Hz easily produces
+                    // several raw samples per display frame; without draining the
+                    // history here, all but the last one are silently dropped,
+                    // which the aim-precision-sensitive engine code (sensitivity,
+                    // m_accel, m_filter) would otherwise never see.
+                    int historySize = event.getHistorySize();
+                    if (historySize > 0 && !mLoggedMouseHistoryDrain) {
+                        mLoggedMouseHistoryDrain = true;
+                        Log.i("SDL", "Captured mouse motion carried " + historySize + " batched historical sample(s); draining them instead of dropping");
+                    }
+                    for (int h = 0; h < historySize; h++) {
+                        SDLActivity.onNativeMouse(0, action, event.getHistoricalX(i, h), event.getHistoricalY(i, h), true);
+                    }
+
                     x = event.getX(i);
                     y = event.getY(i);
                     SDLActivity.onNativeMouse(0, action, x, y, true);
                     return true;
+                }
 
                 case MotionEvent.ACTION_BUTTON_PRESS:
                 case MotionEvent.ACTION_BUTTON_RELEASE:

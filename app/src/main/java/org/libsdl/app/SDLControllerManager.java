@@ -727,13 +727,27 @@ class SDLGenericMotionListener_API14 implements View.OnGenericMotionListener {
                         consumed = true;
                         break;
 
-                    case MotionEvent.ACTION_HOVER_MOVE:
+                    case MotionEvent.ACTION_HOVER_MOVE: {
+                        boolean relative = checkRelativeEvent(event);
+                        int historySize = event.getHistorySize();
+
+                        // Android batches every raw sample that arrived since the last
+                        // dispatched event into this one MotionEvent's history, keeping
+                        // only the latest one as the "current" x/y. A high-polling-rate
+                        // mouse can produce several of these between two frames; replay
+                        // them all instead of just the last one, or we silently throw
+                        // away most of the mouse's actual movement.
+                        for (int h = 0; h < historySize; h++) {
+                            SDLActivity.onNativeMouse(0, action, getHistoricalEventX(event, i, h), getHistoricalEventY(event, i, h), relative);
+                        }
+
                         x = getEventX(event, i);
                         y = getEventY(event, i);
 
-                        SDLActivity.onNativeMouse(0, action, x, y, checkRelativeEvent(event));
+                        SDLActivity.onNativeMouse(0, action, x, y, relative);
                         consumed = true;
                         break;
+                    }
 
                     default:
                         break;
@@ -793,6 +807,14 @@ class SDLGenericMotionListener_API14 implements View.OnGenericMotionListener {
         return event.getY(pointerIndex);
     }
 
+    float getHistoricalEventX(MotionEvent event, int pointerIndex, int pos) {
+        return event.getHistoricalX(pointerIndex, pos);
+    }
+
+    float getHistoricalEventY(MotionEvent event, int pointerIndex, int pos) {
+        return event.getHistoricalY(pointerIndex, pos);
+    }
+
     int getPenDeviceType(InputDevice penDevice) {
         return SDL_PEN_DEVICE_TYPE_UNKNOWN;
     }
@@ -844,6 +866,34 @@ class SDLGenericMotionListener_API24 extends SDLGenericMotionListener_API14 {
             return event.getAxisValue(MotionEvent.AXIS_RELATIVE_Y, pointerIndex);
         } else {
             return event.getY(pointerIndex);
+        }
+    }
+
+    @Override
+    float getHistoricalEventX(MotionEvent event, int pointerIndex, int pos) {
+        if (Build.VERSION.SDK_INT < 24 /* Android 7.0 (N) */) {
+            /* Silence 'lint' warning */
+            return 0;
+        }
+
+        if (mRelativeModeEnabled && event.getToolType(pointerIndex) == MotionEvent.TOOL_TYPE_MOUSE) {
+            return event.getHistoricalAxisValue(MotionEvent.AXIS_RELATIVE_X, pointerIndex, pos);
+        } else {
+            return event.getHistoricalX(pointerIndex, pos);
+        }
+    }
+
+    @Override
+    float getHistoricalEventY(MotionEvent event, int pointerIndex, int pos) {
+        if (Build.VERSION.SDK_INT < 24 /* Android 7.0 (N) */) {
+            /* Silence 'lint' warning */
+            return 0;
+        }
+
+        if (mRelativeModeEnabled && event.getToolType(pointerIndex) == MotionEvent.TOOL_TYPE_MOUSE) {
+            return event.getHistoricalAxisValue(MotionEvent.AXIS_RELATIVE_Y, pointerIndex, pos);
+        } else {
+            return event.getHistoricalY(pointerIndex, pos);
         }
     }
 }
