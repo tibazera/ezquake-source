@@ -38,7 +38,13 @@ public:
 		const int32_t channels = stream ? stream->getChannelCount() : 2;
 		const int len = static_cast<int>(num_frames * channels * static_cast<int32_t>(sizeof(int16_t)));
 
-		S_MixOutput(static_cast<byte *>(audio_data), len, 0);
+		// Use a blocking lock acquire here, same as the SDL backend: the
+		// mixer's critical section is short, so waiting a few microseconds
+		// for it is inaudible. The previous non-blocking try-lock zeroed
+		// the entire callback buffer to silence on any contention with the
+		// main thread, which on a phone also driving the Vulkan renderer
+		// happened often enough to be heard as crackling/dropouts.
+		S_MixOutput(static_cast<byte *>(audio_data), len, true);
 		return oboe::DataCallbackResult::Continue;
 	}
 

@@ -147,6 +147,13 @@ qbool S_Backend_Init(void)
 			desired_samples <<= 1;
 	}
 
+	// SDL3 otherwise picks its own device buffer size, which on Android's
+	// AAudio backend tends to default to something that doesn't line up
+	// with this mixer's callback cadence -- audible as crackling under any
+	// load. This hint asks for the size we actually computed above (SDL
+	// may still clamp/ignore it on platforms that don't support it).
+	SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, va("%d", desired_samples));
+
 	/* Make audiodevice list start from index 1 so that 0 can be system default */
 	if (s_audiodevice.integer > 0) {
 		int numdevices = 0;
