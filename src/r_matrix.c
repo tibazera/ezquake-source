@@ -24,6 +24,13 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include "r_draw.h"
 #include "tr_types.h"
 
+#ifdef __ANDROID__
+// Defined in vk_swapchain.c; not worth a shared header for one function --
+// see the pre-rotation comment in VK_CreateSwapChain().
+extern int VK_AndroidPreRotationDegrees(void);
+static void R_ApplyAndroidPreRotation(float* matrix);
+#endif
+
 static float projectionMatrix[16];
 static float modelMatrix[16];
 static float identityMatrix[16] = {
@@ -74,6 +81,9 @@ void R_OrthographicProjection(float left, float right, float top, float bottom, 
 {
 	// Deliberately inverting top & bottom here...
 	R_SetMatrix(projectionMatrix, R_OrthoMatrix(left, right, bottom, top, zNear, zFar));
+#ifdef __ANDROID__
+	R_ApplyAndroidPreRotation(projectionMatrix);
+#endif
 	R_Cache2DMatrix();
 
 #ifdef RENDERER_OPTION_CLASSIC_OPENGL
@@ -115,6 +125,42 @@ void R_RotateMatrix(float* matrix, float angle, float x, float y, float z)
 	R_MultiplyMatrix(rotation, matrix, result);
 	R_SetMatrix(matrix, result);
 }
+
+#ifdef __ANDROID__
+// vk_swapchain.c picks `degrees` so the swapchain's preTransform makes the
+// hardware compositor do zero rotation work (confirmed via `dumpsys
+// SurfaceFlinger`, this is the real ~70fps -> 450fps+ win) -- our own
+// rotation must supply the full visual content correction alone.
+// currentTransform (and so `degrees`) flips between 90 and 270 depending on
+// which of the two physical landscape holds the app launches in; these need
+// genuinely different (180-degree-apart) compensation matrices. Both were
+// found by live trial (4 possible sign combinations per case, since a plain
+// rotation is composed with the vertex shaders' own fixed Y-flip downstream):
+// degrees==90 needs rotation=[[0,-1],[1,0]], degrees==270 needs its negation.
+static void R_ApplyAndroidPreRotation(float* matrix)
+{
+	int degrees = VK_AndroidPreRotationDegrees();
+	if (degrees != 0) {
+		float rotation[16];
+		float result[16];
+
+		R_SetIdentityMatrix(rotation);
+		if (degrees == 90) {
+			rotation[0] = 0; rotation[4] = -1;
+			rotation[1] = 1; rotation[5] = 0;
+		}
+		else if (degrees == 270) {
+			rotation[0] = 0; rotation[4] = 1;
+			rotation[1] = -1; rotation[5] = 0;
+		}
+		else {
+			R_RotateMatrix(rotation, (float)degrees, 0, 0, 1);
+		}
+		R_MultiplyMatrix(matrix, rotation, result);
+		R_SetMatrix(matrix, result);
+	}
+}
+#endif
 
 void R_RotateVector(vec3_t vector, float angle, float x, float y, float z)
 {
@@ -209,10 +255,21 @@ void R_MultiplyVector3f(const float* matrix, float x, float y, float z, float* r
 
 void R_MultiplyVector(const float* matrix, const float* vector, float* result)
 {
-	result[0] = matrix[0] * vector[0] + matrix[4] * vector[1] + matrix[8] * vector[2] + matrix[12] * vector[3];
-	result[1] = matrix[1] * vector[0] + matrix[5] * vector[1] + matrix[9] * vector[2] + matrix[13] * vector[3];
-	result[2] = matrix[2] * vector[0] + matrix[6] * vector[1] + matrix[10] * vector[2] + matrix[14] * vector[3];
-	result[3] = matrix[3] * vector[0] + matrix[7] * vector[1] + matrix[11] * vector[2] + matrix[15] * vector[3];
+	// Callers (e.g. vk_draw.c's VK_SetCoordinates) pass the same buffer for
+	// vector and result to transform in place. With any off-diagonal matrix
+	// term (matrix[1] or matrix[4] non-zero, e.g. a rotation) writing
+	// result[0] before computing result[1] would clobber vector[0] before
+	// it's read -- harmless for the axis-aligned scale/translate matrices
+	// this was always called with historically, but silently wrong the
+	// moment a rotated matrix is used. Compute into locals first.
+	float r0 = matrix[0] * vector[0] + matrix[4] * vector[1] + matrix[8] * vector[2] + matrix[12] * vector[3];
+	float r1 = matrix[1] * vector[0] + matrix[5] * vector[1] + matrix[9] * vector[2] + matrix[13] * vector[3];
+	float r2 = matrix[2] * vector[0] + matrix[6] * vector[1] + matrix[10] * vector[2] + matrix[14] * vector[3];
+	float r3 = matrix[3] * vector[0] + matrix[7] * vector[1] + matrix[11] * vector[2] + matrix[15] * vector[3];
+	result[0] = r0;
+	result[1] = r1;
+	result[2] = r2;
+	result[3] = r3;
 }
 
 void R_MultiplyVector3fv(const float* matrix, const vec3_t vector, float* result)
@@ -345,6 +402,9 @@ void R_Frustum(double left, double right, double bottom, double top, double zNea
 
 	R_MultiplyMatrix(perspective, R_ProjectionMatrix(), new_projection);
 	R_SetMatrix(R_ProjectionMatrix(), new_projection);
+#ifdef __ANDROID__
+	R_ApplyAndroidPreRotation(R_ProjectionMatrix());
+#endif
 
 #ifdef RENDERER_OPTION_CLASSIC_OPENGL
 	if (R_UseImmediateOpenGL()) {

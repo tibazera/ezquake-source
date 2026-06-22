@@ -64,20 +64,26 @@ static glm_image_t lineQuadData[MAX_LINES_PER_FRAME * 4];
 
 static void VK_SetCoordinates(glm_image_t* targ, float x1, float y1, float x2, float y2, float s, float s_width, float t, float t_height, int flags)
 {
-	float v1[4] = { x1, y1, 0, 1 };
-	float v2[4] = { x2, y2, 0, 1 };
+	// Transform all 4 corners independently rather than 2 diagonal corners
+	// (v1,v2) and mixing v1.x/v2.y to build the other two -- that mixing is
+	// only valid when cachedMatrix is axis-aligned (no x/y swap). Android's
+	// pre-rotation compensation matrix can swap x and y, which would
+	// otherwise map each glyph's texture onto the wrong pair of corners of
+	// the (correctly positioned) rotated quad, distorting every character.
+	float vTL[4] = { x1, y1, 0, 1 };
+	float vTR[4] = { x2, y1, 0, 1 };
+	float vBL[4] = { x1, y2, 0, 1 };
+	float vBR[4] = { x2, y2, 0, 1 };
 
-	R_MultiplyVector(cachedMatrix, v1, v1);
-	R_MultiplyVector(cachedMatrix, v2, v2);
+	R_MultiplyVector(cachedMatrix, vTL, vTL);
+	R_MultiplyVector(cachedMatrix, vTR, vTR);
+	R_MultiplyVector(cachedMatrix, vBL, vBL);
+	R_MultiplyVector(cachedMatrix, vBR, vBR);
 
-	targ[0].pos[0] = v1[0]; targ[0].tex[0] = s;
-	targ[1].pos[0] = v1[0]; targ[1].tex[0] = s;
-	targ[2].pos[0] = v2[0]; targ[2].tex[0] = s + s_width;
-	targ[3].pos[0] = v2[0]; targ[3].tex[0] = s + s_width;
-	targ[0].pos[1] = v1[1]; targ[0].tex[1] = t;
-	targ[1].pos[1] = v2[1]; targ[1].tex[1] = t + t_height;
-	targ[2].pos[1] = v1[1]; targ[2].tex[1] = t;
-	targ[3].pos[1] = v2[1]; targ[3].tex[1] = t + t_height;
+	targ[0].pos[0] = vTL[0]; targ[0].pos[1] = vTL[1]; targ[0].tex[0] = s;           targ[0].tex[1] = t;
+	targ[1].pos[0] = vBL[0]; targ[1].pos[1] = vBL[1]; targ[1].tex[0] = s;           targ[1].tex[1] = t + t_height;
+	targ[2].pos[0] = vTR[0]; targ[2].pos[1] = vTR[1]; targ[2].tex[0] = s + s_width; targ[2].tex[1] = t;
+	targ[3].pos[0] = vBR[0]; targ[3].pos[1] = vBR[1]; targ[3].tex[0] = s + s_width; targ[3].tex[1] = t + t_height;
 
 	targ[0].flags = targ[1].flags = targ[2].flags = targ[3].flags = flags;
 }

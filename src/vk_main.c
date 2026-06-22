@@ -31,6 +31,8 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include <jni.h>
 #include <SDL_system.h>
 #include <android/log.h>
+#include <android/native_window.h>
+#include <dlfcn.h>
 #endif
 
 #include "gl_model.h"
@@ -79,6 +81,107 @@ static void VK_AndroidHideStartupSplash(void)
 
 	(*env)->DeleteLocalRef(env, activity_class);
 	(*env)->DeleteLocalRef(env, activity);
+}
+
+// ANativeWindow_setFrameRate() needs API 30, but minSdk here is 29 -- the
+// android-29 stub libandroid.so used at link time doesn't export the symbol
+// at all, so it's resolved with dlsym() against the device's real libandroid.so
+// at runtime instead of being called directly (which would fail to link).
+//
+// Without this call, SurfaceFlinger has no declared frame-rate intent from
+// this app and falls back to inferring one from observed present timestamps,
+// which tends to converge on a conservative cadence well below what the
+// display and GPU can actually sustain (observed on a 120Hz-capable panel:
+// render stuck around 65-85fps with the GPU and CPU both >95% idle, plus a
+// stream of BLASTBufferQueue "NO_BUFFER_AVAILABLE" log spam consistent with
+// the compositor pacing buffer hand-back to that inferred rate rather than
+// our actual submission rate). Declaring a high target up front asks the
+// compositor to size its buffer-queue pacing for that rate instead of
+// guessing.
+static void VK_AndroidRequestHighFrameRate(SDL_Window* window)
+{
+	typedef int32_t (*SetFrameRateFn)(ANativeWindow*, float, int8_t);
+	static SetFrameRateFn setFrameRate;
+	static qbool resolved;
+	ANativeWindow* nativeWindow;
+	int32_t result;
+
+	if (!resolved) {
+		void* lib = dlopen("libandroid.so", RTLD_NOW);
+		resolved = true;
+		if (lib) {
+			setFrameRate = (SetFrameRateFn)dlsym(lib, "ANativeWindow_setFrameRate");
+		}
+	}
+	if (!setFrameRate) {
+		__android_log_print(ANDROID_LOG_INFO, "VK_PROFILE", "ANativeWindow_setFrameRate not available (dlsym failed)");
+		return;
+	}
+
+	nativeWindow = (ANativeWindow*)SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL);
+	if (!nativeWindow) {
+		__android_log_print(ANDROID_LOG_INFO, "VK_PROFILE", "ANativeWindow_setFrameRate skipped: no native window pointer yet");
+		return;
+	}
+
+	// Aspirational: higher than any current Android panel's refresh rate, so
+	// we're always asking for "as fast as the display/compositor allow" rather
+	// than accidentally requesting less than the hardware supports.
+	result = setFrameRate(nativeWindow, 240.0f, ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_DEFAULT);
+	__android_log_print(ANDROID_LOG_INFO, "VK_PROFILE", "ANativeWindow_setFrameRate(240) result=%d", result);
+}
+
+// Defined in vk_swapchain.c -- returns the same 0/90/180/270 used to build the
+// compensating rotation matrix in r_matrix.c.
+extern int VK_AndroidPreRotationDegrees(void);
+
+// Vulkan's VkSwapchainCreateInfoKHR::preTransform tells the WSI loader/driver
+// that our content is pre-rotated, but on several Android devices/drivers
+// (confirmed needed on this one) that alone does not get SurfaceFlinger's
+// hardware composer to actually apply the corresponding rotation during
+// scanout -- the buffer gets presented as-is, un-rotated, even though
+// everything upstream (matrix math, swapchain extent) is correct. The
+// ANativeWindow itself needs the same transform set via this separate NDK
+// call so the window's BufferQueue/HWC layer carries the hint through to the
+// actual display path, not just the Vulkan/SurfaceFlinger composition path
+// (which is what `adb shell screencap` reads, and which looked correct even
+// while the live panel did not -- that discrepancy is what pointed here).
+static void VK_AndroidSetBuffersTransform(SDL_Window* window)
+{
+	typedef int32_t (*SetBuffersTransformFn)(ANativeWindow*, int32_t);
+	static SetBuffersTransformFn setBuffersTransform;
+	static qbool resolved;
+	ANativeWindow* nativeWindow;
+	int32_t transform;
+	int32_t result;
+
+	if (!resolved) {
+		void* lib = dlopen("libandroid.so", RTLD_NOW);
+		resolved = true;
+		if (lib) {
+			setBuffersTransform = (SetBuffersTransformFn)dlsym(lib, "ANativeWindow_setBuffersTransform");
+		}
+	}
+	if (!setBuffersTransform) {
+		__android_log_print(ANDROID_LOG_INFO, "VK_PROFILE", "ANativeWindow_setBuffersTransform not available (dlsym failed)");
+		return;
+	}
+
+	nativeWindow = (ANativeWindow*)SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL);
+	if (!nativeWindow) {
+		__android_log_print(ANDROID_LOG_INFO, "VK_PROFILE", "ANativeWindow_setBuffersTransform skipped: no native window pointer yet");
+		return;
+	}
+
+	switch (VK_AndroidPreRotationDegrees()) {
+		case 90: transform = ANATIVEWINDOW_TRANSFORM_ROTATE_90; break;
+		case 180: transform = ANATIVEWINDOW_TRANSFORM_ROTATE_180; break;
+		case 270: transform = ANATIVEWINDOW_TRANSFORM_ROTATE_270; break;
+		default: transform = 0; break;
+	}
+
+	result = setBuffersTransform(nativeWindow, transform);
+	__android_log_print(ANDROID_LOG_INFO, "VK_PROFILE", "ANativeWindow_setBuffersTransform(%d) result=%d", transform, result);
 }
 #endif
 
@@ -450,6 +553,9 @@ static qbool VK_RecreateSwapChain(void)
 	if (!VK_CreateSwapChain(vk_options.window, vk_options.instance, vk_options.surface)) {
 		return false;
 	}
+#ifdef __ANDROID__
+	VK_AndroidSetBuffersTransform(vk_options.window);
+#endif
 	if (!VK_CreateSwapChainFramebuffers()) {
 		return false;
 	}
@@ -483,6 +589,9 @@ static qbool VK_RecreateSurfaceAndSwapChain(void)
 	if (!VK_CreateSwapChain(vk_options.window, vk_options.instance, vk_options.surface)) {
 		return false;
 	}
+#ifdef __ANDROID__
+	VK_AndroidSetBuffersTransform(vk_options.window);
+#endif
 	if (!VK_CreateSwapChainFramebuffers()) {
 		return false;
 	}
@@ -544,6 +653,28 @@ void VK_BeginFrame(void)
 	VkResult waitResult;
 
 #ifdef __ANDROID__
+	{
+		// One-shot, logged from the first real frame rather than from
+		// VK_Initialise(): VK_Initialise() runs as part of VID_Init(), which
+		// happens before CL_Init() registers cl_maxfps/cl_independentPhysics,
+		// so reading those cvars there would just read each cvar_t's
+		// zero-initialised .integer/.value (always 0) instead of the actual
+		// configured value -- a measurement artifact, not the real setting.
+		static qbool diagnostics_logged = false;
+		if (!diagnostics_logged) {
+			extern cvar_t r_swapInterval, cl_maxfps, cl_independentPhysics;
+			diagnostics_logged = true;
+#ifdef NDEBUG
+			const char* buildConfig = "optimized (NDEBUG defined)";
+#else
+			const char* buildConfig = "DEBUG/unoptimized (NDEBUG not defined)";
+#endif
+			__android_log_print(ANDROID_LOG_INFO, "VK_PROFILE",
+				"render resolution=%ux%u vid_vsync=%d cl_maxfps=%g cl_independentPhysics=%d build=%s",
+				vk_options.swapChain.imageSize.width, vk_options.swapChain.imageSize.height,
+				r_swapInterval.integer, cl_maxfps.value, cl_independentPhysics.integer, buildConfig);
+		}
+	}
 	{
 		static double profile_last_time;
 		static double profile_accum;
@@ -859,6 +990,10 @@ qbool VK_Initialise(SDL_Window* window)
 		return false;
 	}
 
+#ifdef __ANDROID__
+	VK_AndroidRequestHighFrameRate(window);
+#endif
+
 	if (!VK_SelectPhysicalDevice(vk_options.instance, vk_options.surface)) {
 		VK_Shutdown(r_shutdown_full);
 		return false;
@@ -873,6 +1008,9 @@ qbool VK_Initialise(SDL_Window* window)
 		VK_Shutdown(r_shutdown_full);
 		return false;
 	}
+#ifdef __ANDROID__
+	VK_AndroidSetBuffersTransform(window);
+#endif
 
 	if (!VK_RenderPassCreate()) {
 		VK_Shutdown(r_shutdown_full);

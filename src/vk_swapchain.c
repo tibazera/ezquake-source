@@ -33,6 +33,28 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #include "vk_local.h"
 
+#ifdef __ANDROID__
+// Pre-rotation (swapped swapchain extent + real preTransform + a compensating
+// rotation matrix in r_matrix.c) is a big performance win: ~70fps -> 450fps+
+// on a Xiaomi 14T Pro (Dimensity 9300+/Mali G720, portrait-native panel,
+// landscape-locked app), confirmed via `dumpsys SurfaceFlinger` showing zero
+// hardware compositor rotation work once preTransform is set correctly (see
+// the formula below). Both orientation correctness and the performance win
+// are confirmed live simultaneously as of 2026-06-22 -- see the
+// android-prerotation-orientation-debug memory file for the full derivation
+// and the dead ends ruled out along the way before changing this again.
+#define VK_ANDROID_PREROTATION_ENABLED 1
+
+// Set in VK_CreateSwapChain(), read back by VK_AndroidPreRotationDegrees()
+// (called from r_matrix.c). currentTransform is NOT a fixed property of the
+// device: android:screenOrientation="sensorLandscape" can settle into either
+// landscape orientation (normal or reverse, 180 degrees apart) depending on
+// how the phone was held at launch, and the surface reports a different
+// currentTransform (ROTATE_90 vs ROTATE_270, observed both) for each. See the
+// comment on the extent-swap block below for the formula this drives.
+static int s_androidPreRotationContentDegrees;
+#endif
+
 static void VK_DestroySwapChainDepthResources(void)
 {
 	if (vk_options.swapChain.depthImageView != VK_NULL_HANDLE) {
@@ -95,7 +117,16 @@ qbool VK_CreateSwapChain(SDL_Window* window, VkInstance instance, VkSurfaceKHR s
 	VkSwapchainCreateInfoKHR createInfo = { 0 };
 
 	requestedImageCount = vk_options.physicalDeviceSurfaceCapabilities.minImageCount;
-	if (vk_options.physicalDevicePresentationMode == VK_PRESENT_MODE_MAILBOX_KHR) {
+	// The "+1" is only needed to turn a tight (2-image) minimum into the 3
+	// images MAILBOX needs to be truly non-blocking. Some Android WSI
+	// drivers (observed: MTK/Mali) already report a generous minImageCount
+	// (5-6) for the surface; piling another image on top of that exceeds
+	// what the platform's BufferQueue/BLASTBufferQueue can actually keep
+	// acquired at once, surfacing as a constant stream of logcat
+	// "acquireNextBufferLocked: ... NO_BUFFER_AVAILABLE" and corresponding
+	// CPU stalls in the image-in-flight wait below.
+	if (vk_options.physicalDevicePresentationMode == VK_PRESENT_MODE_MAILBOX_KHR &&
+		vk_options.physicalDeviceSurfaceCapabilities.minImageCount < 3) {
 		requestedImageCount += 1;
 	}
 	if (vk_options.physicalDeviceSurfaceCapabilities.maxImageCount > 0) {
@@ -106,6 +137,19 @@ qbool VK_CreateSwapChain(SDL_Window* window, VkInstance instance, VkSurfaceKHR s
 		"swapchain present mode=%d (0=IMMEDIATE 1=MAILBOX 2=FIFO 3=FIFO_RELAXED) images requested=%u min=%u max=%u",
 		(int)vk_options.physicalDevicePresentationMode, requestedImageCount,
 		vk_options.physicalDeviceSurfaceCapabilities.minImageCount, vk_options.physicalDeviceSurfaceCapabilities.maxImageCount);
+	__android_log_print(ANDROID_LOG_INFO, "VK_PROFILE",
+		"surface transform currentTransform=%d supportedTransforms=0x%x (1=IDENTITY 2=ROTATE_90 4=ROTATE_180 8=ROTATE_270) currentExtent=%ux%u",
+		(int)vk_options.physicalDeviceSurfaceCapabilities.currentTransform,
+		(unsigned int)vk_options.physicalDeviceSurfaceCapabilities.supportedTransforms,
+		vk_options.physicalDeviceSurfaceCapabilities.currentExtent.width,
+		vk_options.physicalDeviceSurfaceCapabilities.currentExtent.height);
+	{
+		int sdlW = 0, sdlH = 0;
+		SDL_GetWindowSizeInPixels(window, &sdlW, &sdlH);
+		__android_log_print(ANDROID_LOG_INFO, "VK_PROFILE",
+			"SDL window size=%dx%d orientation hint=%s",
+			sdlW, sdlH, SDL_GetHint(SDL_HINT_ORIENTATIONS) ? SDL_GetHint(SDL_HINT_ORIENTATIONS) : "(unset)");
+	}
 #endif
 
 	createInfo.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
@@ -128,6 +172,39 @@ qbool VK_CreateSwapChain(SDL_Window* window, VkInstance instance, VkSurfaceKHR s
 		createInfo.imageExtent.width = width;
 		createInfo.imageExtent.height = height;
 	}
+#if defined(__ANDROID__) && VK_ANDROID_PREROTATION_ENABLED
+	// EXPERIMENT 3 (2026-06-22, see android-prerotation-orientation-debug memory):
+	// `dumpsys SurfaceFlinger` HWC layer dumps across declared preTransform
+	// values, RE-MEASURED after currentTransform itself was caught changing
+	// between launches (ROTATE_90 vs ROTATE_270 -- sensorLandscape can settle
+	// either way), showed the general rule:
+	//   HWC_actual_degrees = (360 - currentTransform_degrees - declared_degrees) mod 360
+	// Solving for HWC_actual=0 (zero-overhead fast path, confirmed via dumpsys):
+	//   declared_degrees = (360 - currentTransform_degrees) mod 360
+	// i.e. declare the NEGATION of currentTransform, not currentTransform
+	// itself (matching currentTransform, the official-docs recipe, does NOT
+	// reach HWC_actual=0 on this device's compositor). The content rotation
+	// needed in r_matrix.c to look correct then equals that same declared
+	// value (empirically: 180->180 confirmed correct live; 270->270 derived
+	// and consistent). Both 90 and 270 are in the "90-degree family" and need
+	// the width/height extent swap; 0 and 180 don't.
+	{
+		int currentTransformDegrees;
+		switch (vk_options.physicalDeviceSurfaceCapabilities.currentTransform) {
+			case VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR: currentTransformDegrees = 90; break;
+			case VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR: currentTransformDegrees = 180; break;
+			case VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR: currentTransformDegrees = 270; break;
+			default: currentTransformDegrees = 0; break;
+		}
+		s_androidPreRotationContentDegrees = (360 - currentTransformDegrees) % 360;
+
+		if (s_androidPreRotationContentDegrees == 90 || s_androidPreRotationContentDegrees == 270) {
+			uint32_t temp = createInfo.imageExtent.width;
+			createInfo.imageExtent.width = createInfo.imageExtent.height;
+			createInfo.imageExtent.height = temp;
+		}
+	}
+#endif
 	createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT; // VK_IMAGE_USAGE_TRANSFER_DST_BIT if pre-processing enabled
 	if (VK_PhysicalDeviceGraphicsQueueFamilyIndex() != VK_PhysicalDevicePresentQueueFamilyIndex()) {
 		queueFamilyIndices[0] = VK_PhysicalDeviceGraphicsQueueFamilyIndex();
@@ -142,15 +219,23 @@ qbool VK_CreateSwapChain(SDL_Window* window, VkInstance instance, VkSurfaceKHR s
 		createInfo.queueFamilyIndexCount = 0;
 		createInfo.pQueueFamilyIndices = NULL;
 	}
-#ifdef __ANDROID__
+#if defined(__ANDROID__) && VK_ANDROID_PREROTATION_ENABLED
+	// Declare the NEGATION of currentTransform -- see the comment on the
+	// extent swap above for why matching currentTransform doesn't work here.
+	switch (s_androidPreRotationContentDegrees) {
+		case 90: createInfo.preTransform = VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR; break;
+		case 180: createInfo.preTransform = VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR; break;
+		case 270: createInfo.preTransform = VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR; break;
+		default: createInfo.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR; break;
+	}
+#else
 	if (vk_options.physicalDeviceSurfaceCapabilities.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) {
 		createInfo.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
 	}
-	else
-#endif
-	{
+	else {
 		createInfo.preTransform = vk_options.physicalDeviceSurfaceCapabilities.currentTransform;
 	}
+#endif
 	createInfo.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
 	createInfo.presentMode = vk_options.physicalDevicePresentationMode;
 	createInfo.clipped = VK_FALSE; // meag: setting this to false so we can read-back for screenshots
@@ -172,6 +257,10 @@ qbool VK_CreateSwapChain(SDL_Window* window, VkInstance instance, VkSurfaceKHR s
 	}
 	vk_options.swapChain.imageCount = swapChainImageCount;
 	vk_options.swapChain.imageSize = createInfo.imageExtent;
+#ifdef __ANDROID__
+	__android_log_print(ANDROID_LOG_INFO, "VK_PROFILE", "swapchain final imageExtent=%ux%u preTransform=%d",
+		vk_options.swapChain.imageSize.width, vk_options.swapChain.imageSize.height, (int)createInfo.preTransform);
+#endif
 
 	// Create image views
 	vk_options.swapChain.imageViews = Q_malloc(swapChainImageCount * sizeof(vk_options.swapChain.imageViews[0]));
@@ -230,6 +319,11 @@ qbool VK_CreateSwapChainFramebuffers(void)
 		}
 	}
 
+#ifdef __ANDROID__
+	__android_log_print(ANDROID_LOG_INFO, "VK_PROFILE", "framebuffers created width=%u height=%u count=%u",
+		vk_options.swapChain.imageSize.width, vk_options.swapChain.imageSize.height, vk_options.swapChain.imageCount);
+#endif
+
 	return true;
 }
 
@@ -275,5 +369,24 @@ void VK_DestroySwapChain(void)
 	vk_options.swapChain.images = NULL;
 	vk_options.swapChain.imageCount = 0;
 }
+
+#ifdef __ANDROID__
+// Called from the shared (renderer-agnostic) r_matrix.c to compensate, in the
+// projection matrix, for the swapchain pre-rotation set up above -- see the
+// pre-rotation comment in VK_CreateSwapChain(). Not declared in a shared
+// header on purpose: r_matrix.c takes this as a plain extern so it doesn't
+// need to depend on any Vulkan-specific header.
+int VK_AndroidPreRotationDegrees(void)
+{
+#if !VK_ANDROID_PREROTATION_ENABLED
+	return 0;
+#else
+	// Computed once in VK_CreateSwapChain() from the surface's currentTransform
+	// at that moment -- see the comment on the extent-swap block there. Equals
+	// the same degrees value used for preTransform.
+	return s_androidPreRotationContentDegrees;
+#endif
+}
+#endif
 
 #endif // RENDERER_OPTION_VULKAN
