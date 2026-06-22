@@ -89,7 +89,8 @@ typedef struct vk_world_push_s {
 	float useSkyTexture;
 	float fastTurb;
 	float detailEnabled;
-	float padding[2];
+	float textureless;
+	float padding[1];
 } vk_world_push_t;
 
 static VkPipelineLayout worldFlatPipelineLayout;
@@ -1573,16 +1574,8 @@ void VK_ChainBrushModelSurfaces(model_t* clmodel, entity_t* ent)
 		return;
 	}
 
-	// gl_textureless has no Vulkan-specific shader path yet (unlike Modern
-	// OpenGL's DRAW_TEXTURELESS, which still lights an untextured surface);
-	// route it through the same drawflat chain already used by r_drawflat
-	// instead, since that's the closest existing "skip texture sampling"
-	// path and gives gl_textureless its intended performance effect on
-	// Vulkan rather than silently doing nothing.
-	drawFlatFloors = clmodel->isworldmodel && (gl_textureless.integer ||
-		(r_drawflat_mode.integer == 0 && (r_drawflat.integer == 2 || r_drawflat.integer == 1)));
-	drawFlatWalls = clmodel->isworldmodel && (gl_textureless.integer ||
-		(r_drawflat_mode.integer == 0 && (r_drawflat.integer == 3 || r_drawflat.integer == 1)));
+	drawFlatFloors = r_drawflat_mode.integer == 0 && (r_drawflat.integer == 2 || r_drawflat.integer == 1) && clmodel->isworldmodel;
+	drawFlatWalls = r_drawflat_mode.integer == 0 && (r_drawflat.integer == 3 || r_drawflat.integer == 1) && clmodel->isworldmodel;
 
 	psurf = &clmodel->surfaces[clmodel->firstmodelsurface];
 	for (i = 0; i < clmodel->nummodelsurfaces; i++, psurf++) {
@@ -1836,6 +1829,12 @@ void VK_RenderView(void)
 			push.useSkyTexture = VK_WORLD_SKY_MODE_NONE;
 			push.fastTurb = (worldDraws[i].surfaceType > 0.5f && worldDraws[i].surfaceType < 5.5f && r_fastturb.integer) ? 1.0f : 0.0f;
 			push.detailEnabled = (worldDraws[i].detail && VK_WorldDetailTextureReady()) ? 1.0f : 0.0f;
+			// Matches Modern OpenGL's DRAW_TEXTURELESS: keep the normal
+			// lit/lightmapped pipeline (so depth shading, outlines, detail
+			// textures etc. are unaffected), just force the diffuse texture
+			// sample to a single fixed texel in the fragment shader instead
+			// of the surface's real UVs.
+			push.textureless = gl_textureless.integer ? 1.0f : 0.0f;
 			if (worldDraws[i].surfaceType == TEXTURE_TURB_SKY) {
 				if (VK_WorldSkyboxTexturesReady()) {
 					push.useSkyTexture = VK_WORLD_SKY_MODE_SKYBOX;
