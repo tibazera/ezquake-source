@@ -497,7 +497,31 @@ int main(int argc, char **argv)
 	if (COM_CheckParm(cmdline_param_client_nostdoutput))
 		sys_nostdout.value = 1;
 
+#ifdef __ANDROID__
+	{
+		// Desktop Windows sizes its hunk dynamically from available RAM
+		// (sys_win.c: half of total physical memory, clamped to a sane
+		// range); this POSIX path instead used a flat 256MB for every
+		// platform, which is needlessly conservative on a modern phone
+		// with several GB of RAM and a real Quake install (custom maps,
+		// hi-res texture packs) to load. Mirror the same "half of total
+		// RAM, clamped" approach, just with a much higher ceiling than the
+		// desktop-era 256MB -- 1GB is still comfortably inside the engine's
+		// 32-bit hunk_size (int), so there's no overflow risk from going
+		// well past the old limit.
+		long pages = sysconf(_SC_PHYS_PAGES);
+		long page_size = sysconf(_SC_PAGE_SIZE);
+		int64_t android_memsize = 256 * 1024 * 1024;
+		if (pages > 0 && page_size > 0) {
+			int64_t total_ram = (int64_t) pages * (int64_t) page_size;
+			android_memsize = total_ram / 2;
+			android_memsize = bound(256 * 1024 * 1024, android_memsize, 1024 * 1024 * 1024);
+		}
+		Host_Init (argc, argv, (int) android_memsize);
+	}
+#else
 	Host_Init (argc, argv, 256 * 1024 * 1024);
+#endif
 
 	oldtime = Sys_DoubleTime ();
 	while (1) {
