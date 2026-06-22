@@ -172,7 +172,10 @@ static void vid_reload_callback(cvar_t* var, char* string, qbool* cancel)
 {
 	vid_reload_pending = false;
 
-	if (atoi(string) != 0) {
+	// Vulkan does not support the legacy soft texture reload safely yet.
+	// Re-enabling automatic reload after a graphics preset must not schedule a
+	// reload behind the menu's back; use a full vid_restart when needed.
+	if (atoi(string) != 0 && !R_UseVulkan()) {
 		vid_reload_pending = Cvar_AnyModified(CVAR_RELOAD_GFX);
 	}
 }
@@ -219,13 +222,23 @@ cvar_t vid_minimize_on_focus_loss = {"vid_minimize_on_focus_loss", CVAR_DEF1, CV
 cvar_t in_raw                     = {"in_raw",                     "1",       CVAR_ARCHIVE | CVAR_SILENT, in_raw_callback};
 cvar_t in_grab_windowed_mouse     = {"in_grab_windowed_mouse",     "1",       CVAR_ARCHIVE | CVAR_SILENT, in_grab_windowed_mouse_callback};
 cvar_t vid_grab_keyboard          = {"vid_grab_keyboard",          "0",       CVAR_LATCH_GFX }; /* Needs vid_restart thus vid_.... */
-#ifdef EZ_MULTIPLE_RENDERERS
 #if defined(RENDERER_OPTION_MODERN_OPENGL)
+#ifdef EZ_MULTIPLE_RENDERERS
 cvar_t vid_renderer               = {"vid_renderer",               "1",       CVAR_LATCH_GFX };
+#else
+cvar_t vid_renderer               = {"vid_renderer",               "1",       CVAR_ROM };
+#endif
 #elif defined(RENDERER_OPTION_CLASSIC_OPENGL)
+#ifdef EZ_MULTIPLE_RENDERERS
 cvar_t vid_renderer               = {"vid_renderer",               "0",       CVAR_LATCH_GFX };
 #else
+cvar_t vid_renderer               = {"vid_renderer",               "0",       CVAR_ROM };
+#endif
+#else
+#ifdef EZ_MULTIPLE_RENDERERS
 cvar_t vid_renderer               = {"vid_renderer",               "2",       CVAR_LATCH_GFX };
+#else
+cvar_t vid_renderer               = {"vid_renderer",               "2",       CVAR_ROM };
 #endif
 #endif
 cvar_t vid_gl_core_profile        = {"vid_gl_core_profile",        "0",       CVAR_LATCH_GFX };
@@ -944,13 +957,13 @@ static void keyb_event(SDL_KeyboardEvent *event)
 		int left_alt = (in_ignore_deadkeys.integer == 2 ? SDLK_LALT : SDLK_LGUI);
 		int right_alt = (in_ignore_deadkeys.integer == 2 ? SDLK_RALT : SDLK_RGUI);
 
-		if (event->keysym.sym == left_alt) {
+		if (event->key == left_alt) {
 			deadkey_modifiers_held_down ^= APPLE_LALT_HELD_DOWN;
-			deadkey_modifiers_held_down |= (event->state ? APPLE_LALT_HELD_DOWN : 0);
+			deadkey_modifiers_held_down |= (event->down ? APPLE_LALT_HELD_DOWN : 0);
 		}
-		else if (event->keysym.sym == right_alt) {
+		else if (event->key == right_alt) {
 			deadkey_modifiers_held_down ^= APPLE_RALT_HELD_DOWN;
-			deadkey_modifiers_held_down |= (event->state ? APPLE_RALT_HELD_DOWN : 0);
+			deadkey_modifiers_held_down |= (event->down ? APPLE_RALT_HELD_DOWN : 0);
 		}
 	}
 #endif
@@ -1089,7 +1102,7 @@ static void HandleEvents(void)
 		case SDL_KEYUP:
 #ifdef __APPLE__
 			if (developer.integer == 2) {
-				Con_Printf("key%s event, scan=%d, sym=%d, mod=%d\n", event.type == SDL_KEYDOWN ? "down" : "up", event.key.keysym.scancode, event.key.keysym.sym, event.key.keysym.mod);
+				Con_Printf("key%s event, scan=%d, sym=%d, mod=%d\n", event.type == SDL_KEYDOWN ? "down" : "up", event.key.scancode, event.key.key, event.key.mod);
 			}
 #endif
 #ifdef __ANDROID__
@@ -1316,9 +1329,7 @@ static void VID_RegisterLatchCvars(void)
 	Cvar_Register(&vid_displayNumber);
 	Cvar_Register(&vid_minimize_on_focus_loss);
 	Cvar_Register(&vid_grab_keyboard);
-#ifdef EZ_MULTIPLE_RENDERERS
 	Cvar_Register(&vid_renderer);
-#endif
 	Cvar_Register(&vid_gl_core_profile);
 	Cvar_Register(&vid_framebuffer);
 	Cvar_Register(&vid_software_palette);
@@ -1382,7 +1393,7 @@ int VID_DisplayNumber(qbool fullscreen)
 	return max(0, min(displays - 1, displayNumber));
 }
 
-static SDL_DisplayID VID_SDL_DisplayID(qbool fullscreen)
+SDL_DisplayID VID_SDL_DisplayID(qbool fullscreen)
 {
 	return VID_SDL_DisplayIDFromIndex(VID_DisplayNumber(fullscreen));
 }
@@ -1573,7 +1584,7 @@ static int VID_SetWindowIcon(SDL_Window *sdl_window)
 
 	if (icon_surface) {
 		SDL_SetWindowIcon(sdl_window, icon_surface);
-		SDL_FreeSurface(icon_surface);
+		SDL_DestroySurface(icon_surface);
 		return 0;
 	}
 
@@ -1850,7 +1861,6 @@ static void VID_SDL_Init(void)
 	R_Initialise();
 
 	//always get/set refresh rate
-	SDL_DisplayMode display_mode;
 	int display_nbr;
 
 	display_nbr = VID_DisplayNumber(true);
@@ -2140,6 +2150,11 @@ static void VID_Startup(void)
 
 void VID_ReloadCvarChanged(cvar_t* var)
 {
+	if (R_UseVulkan()) {
+		Con_Printf("%s needs vid_restart to take effect with the experimental Vulkan renderer.\n", var->name);
+		return;
+	}
+
 	if (!vid_reload_auto.integer) {
 		Con_Printf("%s needs %s to immediately take effect.\n", var->name, CVAR_RELOAD_GFX_COMMAND);
 	}
@@ -2152,6 +2167,12 @@ static void VID_Reload_f(void)
 {
 	if (!host_initialized) { // sanity
 		Com_Printf("Can't do %s yet\n", Cmd_Argv(0));
+		return;
+	}
+	if (R_UseVulkan()) {
+		Com_Printf("The experimental Vulkan renderer requires a full vid_restart.\n");
+		Cbuf_AddText("vid_restart\n");
+		vid_reload_pending = false;
 		return;
 	}
 
