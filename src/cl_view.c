@@ -1121,11 +1121,19 @@ qbool V_PreRenderView(void)
 
 		// time-savers
 		{
-			extern cvar_t r_drawflat_mode, r_drawflat, r_fastturb, gl_caustics;
+			extern cvar_t r_drawflat_mode, r_drawflat, r_fastturb, gl_caustics, gl_textureless;
 			extern texture_ref underwatertexture;
 
-			r_refdef2.drawFlatFloors = r_drawflat_mode.integer == 0 && (r_drawflat.integer == 2 || r_drawflat.integer == 1);
-			r_refdef2.drawFlatWalls = r_drawflat_mode.integer == 0 && (r_drawflat.integer == 3 || r_drawflat.integer == 1);
+			// Vulkan has no shader-level "lit but untextured" path the way
+			// Modern OpenGL's DRAW_TEXTURELESS does, so route gl_textureless
+			// through the same flat-chain mechanism as r_drawflat there --
+			// the closest existing way to skip texture sampling for
+			// performance on that renderer. GLC/GLM are unaffected: their
+			// own gl_textureless handling stays exactly as it was.
+			r_refdef2.drawFlatFloors = (r_drawflat_mode.integer == 0 && (r_drawflat.integer == 2 || r_drawflat.integer == 1)) ||
+				(gl_textureless.integer && R_UseVulkan());
+			r_refdef2.drawFlatWalls = (r_drawflat_mode.integer == 0 && (r_drawflat.integer == 3 || r_drawflat.integer == 1)) ||
+				(gl_textureless.integer && R_UseVulkan());
 			r_refdef2.solidTexTurb = (!r_fastturb.integer && r_refdef2.wateralpha == 1);
 
 			r_refdef2.drawCaustics = (R_TextureReferenceIsValid(underwatertexture) && gl_caustics.integer);

@@ -53,6 +53,7 @@ extern cvar_t r_drawflat;
 extern cvar_t r_drawflat_mode;
 extern cvar_t r_fastsky;
 extern cvar_t r_fastturb;
+extern cvar_t gl_textureless;
 extern cvar_t r_skycolor;
 extern cvar_t gl_fb_bmodels;
 extern cvar_t gl_lumatextures;
@@ -1572,8 +1573,16 @@ void VK_ChainBrushModelSurfaces(model_t* clmodel, entity_t* ent)
 		return;
 	}
 
-	drawFlatFloors = r_drawflat_mode.integer == 0 && (r_drawflat.integer == 2 || r_drawflat.integer == 1) && clmodel->isworldmodel;
-	drawFlatWalls = r_drawflat_mode.integer == 0 && (r_drawflat.integer == 3 || r_drawflat.integer == 1) && clmodel->isworldmodel;
+	// gl_textureless has no Vulkan-specific shader path yet (unlike Modern
+	// OpenGL's DRAW_TEXTURELESS, which still lights an untextured surface);
+	// route it through the same drawflat chain already used by r_drawflat
+	// instead, since that's the closest existing "skip texture sampling"
+	// path and gives gl_textureless its intended performance effect on
+	// Vulkan rather than silently doing nothing.
+	drawFlatFloors = clmodel->isworldmodel && (gl_textureless.integer ||
+		(r_drawflat_mode.integer == 0 && (r_drawflat.integer == 2 || r_drawflat.integer == 1)));
+	drawFlatWalls = clmodel->isworldmodel && (gl_textureless.integer ||
+		(r_drawflat_mode.integer == 0 && (r_drawflat.integer == 3 || r_drawflat.integer == 1)));
 
 	psurf = &clmodel->surfaces[clmodel->firstmodelsurface];
 	for (i = 0; i < clmodel->nummodelsurfaces; i++, psurf++) {
