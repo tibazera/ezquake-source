@@ -26,6 +26,7 @@ import android.os.Handler;
 import android.os.LocaleList;
 import android.os.Message;
 import android.os.ParcelFileDescriptor;
+import android.provider.Settings;
 import android.util.DisplayMetrics;
 import android.util.Log;
 import android.util.SparseArray;
@@ -422,6 +423,7 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
            return;
         }
 
+        warnIfNotUsingSystemKeyboard();
 
         /* Control activity re-creation */
         /* Robustness: check that the native code is run for the first time.
@@ -521,6 +523,49 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
         }
 
         SDLActivity.handleNativeState();
+    }
+
+    // Some third-party keyboard apps don't round-trip key/text events the same
+    // way the device's own pre-installed (system) keyboard does, which has been
+    // observed to cause typed characters/words to be duplicated in console/chat.
+    // We can't force the system's default IME -- that's a user choice Android
+    // doesn't let an app override -- so just warn if the currently selected one
+    // isn't a system app, with a shortcut straight to the picker to fix it.
+    private void warnIfNotUsingSystemKeyboard() {
+        try {
+            String defaultIme = Settings.Secure.getString(getContentResolver(), Settings.Secure.DEFAULT_INPUT_METHOD);
+            if (defaultIme == null || defaultIme.isEmpty()) {
+                return;
+            }
+
+            String imePackage = defaultIme.contains("/") ? defaultIme.substring(0, defaultIme.indexOf('/')) : defaultIme;
+            ApplicationInfo imeAppInfo = getPackageManager().getApplicationInfo(imePackage, 0);
+            boolean isSystemKeyboard = (imeAppInfo.flags & (ApplicationInfo.FLAG_SYSTEM | ApplicationInfo.FLAG_UPDATED_SYSTEM_APP)) != 0;
+
+            if (!isSystemKeyboard) {
+                AlertDialog.Builder dlgAlert = new AlertDialog.Builder(this);
+                dlgAlert.setTitle("Non-default keyboard detected");
+                dlgAlert.setMessage("Your active keyboard app isn't your phone's built-in one. "
+                        + "Some third-party keyboards have been seen to duplicate typed characters in console/chat. "
+                        + "If you run into that, switch to your device's default keyboard in Settings.");
+                dlgAlert.setPositiveButton("Open keyboard settings", new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int id) {
+                        try {
+                            startActivity(new Intent(Settings.ACTION_INPUT_METHOD_SETTINGS));
+                        } catch (ActivityNotFoundException e) {
+                            Log.v(TAG, "Could not open input method settings: " + e.toString());
+                        }
+                    }
+                });
+                dlgAlert.setNegativeButton("Continue anyway", null);
+                dlgAlert.setCancelable(true);
+                dlgAlert.create().show();
+            }
+        } catch (Exception e) {
+            // Best-effort check only -- never block startup over this.
+            Log.v(TAG, "warnIfNotUsingSystemKeyboard failed: " + e.toString());
+        }
     }
 
     // Events
