@@ -185,7 +185,15 @@ extern "C" void S_Backend_Shutdown(void)
 	oboe_callback.restart_requested.store(false, std::memory_order_release);
 
 	if (oboe_stream) {
-		oboe_stream->requestStop();
+		// requestStop() is asynchronous: it returns before the callback
+		// thread has actually drained. close() then tears down the stream
+		// (and we destroy the mixer mutex right after) while that last
+		// callback invocation can still be inside S_LockMixer()/S_UnlockMixer(),
+		// racing the mutex's destruction -- this is what caused the
+		// intermittent "SDL_UnlockMutex ... rc == 0" assertion. stop() is the
+		// blocking variant: it waits for the stream to actually reach the
+		// Stopped state before we touch anything else.
+		oboe_stream->stop();
 		oboe_stream->close();
 		oboe_stream.reset();
 	}
