@@ -37,7 +37,17 @@ android {
                     "-DRENDERER_CLASSIC_OPENGL=OFF",
                     "-DRENDERER_MODERN_OPENGL=OFF",
                     "-DRENDERER_VULKAN=ON",
-                    "-DENABLE_LTO=OFF"
+                    "-DENABLE_LTO=OFF",
+                    // AGP's externalNativeBuild only auto-maps CMAKE_BUILD_TYPE for
+                    // build types it considers "debuggable" vs not; without this, our
+                    // usual `assembleDebug` loop was silently compiling every .c/.cpp
+                    // file with no -O flag at all (confirmed via compile_commands.json:
+                    // no -O0/-O2/-O3, no -DNDEBUG) -- i.e. every perf number measured
+                    // on-device this session was against an unoptimized build. Forcing
+                    // RelWithDebInfo here matches the desktop Windows build's own
+                    // convention (-O2 -g -DNDEBUG) while keeping debug symbols and the
+                    // debuggable APK/manifest from the Gradle "debug" variant intact.
+                    "-DCMAKE_BUILD_TYPE=RelWithDebInfo"
                 )
             }
         }
