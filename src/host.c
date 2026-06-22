@@ -92,6 +92,8 @@ static int SYSINFO_ContainsStr(const char *haystack, const char *needle)
 
 // Returns f_system string with vendor color codes for chat display.
 // CPU: Intel=blue(&c06f) AMD/Ryzen=red(&cf00)
+// Phone brand (Android device string): Xiaomi=orange(&cf80) Samsung=blue(&c09f)
+//                                       Motorola=cyan(&c0ff) OPPO=green(&c5f5)
 // GPU: NVIDIA/GeForce/RTX/GTX=green(&c0f0) AMD/Radeon=red(&cf00) Intel=blue(&c06f)
 char * SYSINFO_GetString(void)
 {
@@ -106,6 +108,15 @@ char * SYSINFO_GetString(void)
 			snprintf(cpu_colored, sizeof(cpu_colored), "&c06f%s&r", cpu);
 		else if (SYSINFO_ContainsStr(cpu, "AMD") || SYSINFO_ContainsStr(cpu, "Ryzen"))
 			snprintf(cpu_colored, sizeof(cpu_colored), "&cf00%s&r", cpu);
+		else if (SYSINFO_ContainsStr(cpu, "Xiaomi") || SYSINFO_ContainsStr(cpu, "Redmi") ||
+		         SYSINFO_ContainsStr(cpu, "POCO"))
+			snprintf(cpu_colored, sizeof(cpu_colored), "&cf80%s&r", cpu);
+		else if (SYSINFO_ContainsStr(cpu, "Samsung") || SYSINFO_ContainsStr(cpu, "Galaxy"))
+			snprintf(cpu_colored, sizeof(cpu_colored), "&c09f%s&r", cpu);
+		else if (SYSINFO_ContainsStr(cpu, "Motorola") || SYSINFO_ContainsStr(cpu, "Moto "))
+			snprintf(cpu_colored, sizeof(cpu_colored), "&c0ff%s&r", cpu);
+		else if (SYSINFO_ContainsStr(cpu, "OPPO"))
+			snprintf(cpu_colored, sizeof(cpu_colored), "&c5f5%s&r", cpu);
 		else
 			strlcpy(cpu_colored, cpu, sizeof(cpu_colored));
 	}
