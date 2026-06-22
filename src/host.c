@@ -36,6 +36,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #ifdef __ANDROID__
 #include <sys/system_properties.h>
 #include <unistd.h>
+#include <strings.h>
 #endif
 #include <SDL.h>
 #include "quakedef.h"
@@ -250,6 +251,7 @@ void SYSINFO_Init(void)
 {
 	char model[PROP_VALUE_MAX] = {0};
 	char manufacturer[PROP_VALUE_MAX] = {0};
+	char marketname[PROP_VALUE_MAX] = {0};
 	char soc_manufacturer[PROP_VALUE_MAX] = {0};
 	char soc_model[PROP_VALUE_MAX] = {0};
 	char board_platform[PROP_VALUE_MAX] = {0};
@@ -271,7 +273,24 @@ void SYSINFO_Init(void)
 	__system_property_get("ro.soc.model", soc_model);
 	__system_property_get("ro.board.platform", board_platform);
 
-	if (manufacturer[0] && model[0]) {
+	// ro.product.model is an internal SKU code (e.g. "2407FPN8EG"), not the
+	// retail name. Several OEMs (Xiaomi/HyperOS among them) expose the
+	// actual marketing name separately -- prefer that when present, falling
+	// back to manufacturer+model for devices/ROMs that don't set it.
+	__system_property_get("ro.product.marketname", marketname);
+	if (!marketname[0]) {
+		__system_property_get("ro.product.odm.marketname", marketname);
+	}
+
+	if (marketname[0]) {
+		if (manufacturer[0] && strncasecmp(marketname, manufacturer, strlen(manufacturer)) != 0) {
+			snprintf(device, sizeof(device), "%s %s", manufacturer, marketname);
+		}
+		else {
+			strlcpy(device, marketname, sizeof(device));
+		}
+	}
+	else if (manufacturer[0] && model[0]) {
 		snprintf(device, sizeof(device), "%s %s", manufacturer, model);
 	}
 	else if (model[0]) {
