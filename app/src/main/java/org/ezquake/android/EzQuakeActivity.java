@@ -3,12 +3,14 @@ package org.ezquake.android;
 import android.os.Bundle;
 import android.view.ViewGroup;
 import android.widget.ImageView;
+import android.widget.ProgressBar;
 import android.widget.RelativeLayout;
 
 import org.libsdl.app.SDLActivity;
 
 public class EzQuakeActivity extends SDLActivity {
     private ImageView startupSplashView;
+    private ProgressBar startupProgressView;
 
     @Override
     protected String[] getLibraries() {
@@ -36,6 +38,19 @@ public class EzQuakeActivity extends SDLActivity {
         startupSplashView.setScaleType(ImageView.ScaleType.CENTER_CROP);
         ((ViewGroup) getContentView()).addView(startupSplashView, new RelativeLayout.LayoutParams(
                 RelativeLayout.LayoutParams.MATCH_PARENT, RelativeLayout.LayoutParams.MATCH_PARENT));
+
+        // Indeterminate, not a real percentage: native startup (filesystem,
+        // configs, Vulkan device/swapchain setup) has no progress checkpoints
+        // wired through yet, so a determinate bar would either sit at 0% for
+        // most of the wait or jump unconvincingly near the end. This is just
+        // "still working", not "frozen", until hideStartupSplash() fires.
+        startupProgressView = new ProgressBar(this, null, android.R.attr.progressBarStyleLarge);
+        RelativeLayout.LayoutParams progressParams = new RelativeLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        progressParams.addRule(RelativeLayout.CENTER_HORIZONTAL);
+        progressParams.addRule(RelativeLayout.ALIGN_PARENT_BOTTOM);
+        progressParams.bottomMargin = (int) (64 * getResources().getDisplayMetrics().density);
+        ((ViewGroup) getContentView()).addView(startupProgressView, progressParams);
     }
 
     // Called via JNI (GetMethodID "hideStartupSplash" "()V") from vk_main.c
@@ -53,6 +68,13 @@ public class EzQuakeActivity extends SDLActivity {
                         parent.removeView(startupSplashView);
                     }
                     startupSplashView = null;
+                }
+                if (startupProgressView != null) {
+                    ViewGroup parent = (ViewGroup) startupProgressView.getParent();
+                    if (parent != null) {
+                        parent.removeView(startupProgressView);
+                    }
+                    startupProgressView = null;
                 }
             }
         });
