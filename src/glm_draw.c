@@ -157,15 +157,15 @@ void GLM_DrawImage(float x, float y, float width, float height, float tex_s, flo
 	++imageData.imageCount;
 }
 
-void GLM_AdjustImages(int first, int last, float x_offset)
+void GLM_AdjustImages(int first, int last, float x_offset, float y_offset)
 {
 	int i;
 
 	for (i = first; i < last; ++i) {
-		imageData.images[i * 4 + 0].pos[0] += x_offset;
-		imageData.images[i * 4 + 1].pos[0] += x_offset;
-		imageData.images[i * 4 + 2].pos[0] += x_offset;
-		imageData.images[i * 4 + 3].pos[0] += x_offset;
+		imageData.images[i * 4 + 0].pos[0] += x_offset; imageData.images[i * 4 + 0].pos[1] += y_offset;
+		imageData.images[i * 4 + 1].pos[0] += x_offset; imageData.images[i * 4 + 1].pos[1] += y_offset;
+		imageData.images[i * 4 + 2].pos[0] += x_offset; imageData.images[i * 4 + 2].pos[1] += y_offset;
+		imageData.images[i * 4 + 3].pos[0] += x_offset; imageData.images[i * 4 + 3].pos[1] += y_offset;
 	}
 }
 

@@ -33,7 +33,7 @@ RENDERER_METHOD(void, DrawClassicParticles, int)
 // HUD
 RENDERER_METHOD(void, DrawImage, float x, float y, float width, float height, float tex_s, float tex_t, float tex_width, float tex_height, byte* color, int flags)
 RENDERER_METHOD(void, DrawRectangle, float x, float y, float width, float height, byte* color)
-RENDERER_METHOD(void, AdjustImages, int first, int last, float x_offset)
+RENDERER_METHOD(void, AdjustImages, int first, int last, float x_offset, float y_offset)
 RENDERER_METHOD(void, DrawDisc, void)
 
 // Lightmaps

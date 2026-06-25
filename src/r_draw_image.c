@@ -44,13 +44,19 @@ void Draw_AdjustImages(int first, int last, float x_offset)
 {
 	float v1[4] = { x_offset, 0, 0, 1 };
 	float v2[4] = { 0, 0, 0, 1 };
+	float dx, dy;
 
 	R_MultiplyVector(cachedMatrix, v1, v1);
 	R_MultiplyVector(cachedMatrix, v2, v2);
 
-	x_offset = v1[0] - v2[0];
+	// Android's pre-rotation compensation matrix can swap x and y (see
+	// VK_SetCoordinates), so a horizontal offset in authoring space doesn't
+	// necessarily land on pos[0] post-transform -- derive both components
+	// instead of assuming it's still purely a pos[0] delta.
+	dx = v1[0] - v2[0];
+	dy = v1[1] - v2[1];
 
-	renderer.AdjustImages(first, last, x_offset);
+	renderer.AdjustImages(first, last, dx, dy);
 }
 
 void R_DrawImage(float x, float y, float width, float height, float tex_s, float tex_t, float tex_width, float tex_height, byte* color, qbool alpha_test, texture_ref texnum, qbool isText, qbool isCrosshair)
