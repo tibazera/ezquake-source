@@ -38,6 +38,10 @@ $Id: gl_draw.c,v 1.104 2007-10-18 05:28:23 dkure Exp $
 
 void CachePics_Init(void);
 void Draw_InitCharset(void);
+
+#ifdef RENDERER_OPTION_VULKAN
+void VK_TextureForceImmediateUploads(qbool force);
+#endif
 void CachePics_LoadAmmoPics(mpic_t* ibar);
 void Draw_SetCrosshairTextMode(qbool enabled);
 
@@ -1070,11 +1074,26 @@ void Draw_ConsoleBackground(int lines)
 			mpic_t* old_levelshot = last_lvlshot;
 
 			snprintf(name, sizeof(name), "textures/levelshots/%s.xxx", host_mapname.string);
+#ifdef RENDERER_OPTION_VULKAN
+			// Loaded lazily from inside this frame's 2D draw phase and drawn
+			// further down in this same function: a queued/deferred GPU
+			// upload would leave it sampling VK_IMAGE_LAYOUT_UNDEFINED (black)
+			// for as long as the next map load blocks before another frame
+			// renders. See VK_UploadTexture for the full explanation.
+			if (R_UseVulkan()) {
+				VK_TextureForceImmediateUploads(true);
+			}
+#endif
 			if ((last_lvlshot = Draw_CachePicSafe(name, false, true))) {
 				// Resize.
 				last_lvlshot->width  = conback.width;
 				last_lvlshot->height = conback.height;
 			}
+#ifdef RENDERER_OPTION_VULKAN
+			if (R_UseVulkan()) {
+				VK_TextureForceImmediateUploads(false);
+			}
+#endif
 			if (last_lvlshot != old_levelshot) {
 				Draw_DeleteOldLevelshot(old_levelshot);
 			}

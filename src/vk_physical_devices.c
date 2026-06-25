@@ -363,6 +363,12 @@ qbool VK_CreateLogicalDevice(VkInstance instance)
 	float priorities[] = { 1.0f };
 	uint32_t queueCount = 0;
 
+	// Only request what VK_SelectPhysicalDevice already confirmed the chosen
+	// device reports in VkPhysicalDeviceFeatures; enabling a feature the
+	// device doesn't support is a validation error (and undefined behaviour
+	// without validation layers).
+	deviceFeatures.samplerAnisotropy = vk_options.physicalDeviceFeatures.samplerAnisotropy;
+
 	queueInfos[0].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
 	queueInfos[0].queueFamilyIndex = VK_PhysicalDeviceGraphicsQueueFamilyIndex();
 	queueInfos[0].queueCount = sizeof(priorities) / sizeof(priorities[0]);

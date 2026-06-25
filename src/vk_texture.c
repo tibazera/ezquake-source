@@ -35,6 +35,7 @@ typedef struct vk_texture_s {
 	qbool clamp;
 	texture_minification_id minFilter;
 	texture_magnification_id magFilter;
+	int anisotropy;
 } vk_texture_t;
 
 static vk_texture_t textureData[MAX_GLTEXTURES];
@@ -92,6 +93,17 @@ static void VK_TextureDestroyFrameUploadResources(void)
 static qbool VK_TextureReferenceInRange(texture_ref texture)
 {
 	return texture.index > 0 && texture.index < MAX_GLTEXTURES;
+}
+
+// See VK_UploadTexture's use of this flag for why it exists. Scoped narrowly
+// (caller sets/clears it around a single Draw_CachePicSafe call) rather than
+// derived from "are we mid-frame", since most mid-frame texture creation
+// (skins, sprites, HUD icons) is fine being queued for next frame's flush.
+static qbool forceImmediateTextureUpload = false;
+
+void VK_TextureForceImmediateUploads(qbool force)
+{
+	forceImmediateTextureUpload = force;
 }
 
 // Shared by VK_UploadTexture and VK_TextureReplaceSubImageRGBA: queues raw
@@ -229,8 +241,17 @@ static qbool VK_TextureCreateSampler(vk_texture_t* vktex, VkFilter filter, VkSam
 	samplerInfo.addressModeU = vktex->clamp ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_REPEAT;
 	samplerInfo.addressModeV = samplerInfo.addressModeU;
 	samplerInfo.addressModeW = samplerInfo.addressModeU;
-	samplerInfo.anisotropyEnable = VK_FALSE;
-	samplerInfo.maxAnisotropy = 1.0f;
+	// gl_anisotropy stores 1 for "off"; only request the feature if the
+	// device actually reported samplerAnisotropy support at device creation
+	// (VK_CreateLogicalDevice only enables it when the feature is present).
+	if (vk_options.physicalDeviceFeatures.samplerAnisotropy && vktex->anisotropy > 1) {
+		samplerInfo.anisotropyEnable = VK_TRUE;
+		samplerInfo.maxAnisotropy = min((float)vktex->anisotropy, vk_options.physicalDeviceProperties.limits.maxSamplerAnisotropy);
+	}
+	else {
+		samplerInfo.anisotropyEnable = VK_FALSE;
+		samplerInfo.maxAnisotropy = 1.0f;
+	}
 	samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
 	samplerInfo.unnormalizedCoordinates = VK_FALSE;
 	samplerInfo.compareEnable = VK_FALSE;
@@ -479,8 +500,21 @@ void VK_UploadTexture(texture_ref texture, int mode, int width, int height, byte
 	// dynamic lightmap path uses, instead of an immediate submit+wait per
 	// texture: bulk map loads create hundreds of world textures back to
 	// back, and that used to mean one full GPU drain each. Falls back to a
-	// single immediate upload only if the batch capacity is exhausted.
-	if (!VK_TextureQueuePendingUpload(texture, 0, 0, width, height, vktex->pixels)) {
+	// single immediate upload only if the batch capacity is exhausted, or if
+	// the caller explicitly opted out via VK_TextureForceImmediateUploads --
+	// used by Draw_ConsoleBackground for the conback/lvlshot UI pic, which is
+	// loaded lazily from inside the 2D draw phase and drawn in the very same
+	// frame: queueing it would defer the actual GPU copy to the *next*
+	// VK_BeginFrame's flush, but this frame's draw call samples the texture
+	// right now while it's still VK_IMAGE_LAYOUT_UNDEFINED, and if a blocking
+	// map load follows with no frame rendered in between, that undefined/
+	// black sample is what stays on screen for the whole load. Left as an
+	// opt-in (not a blanket "mid-frame implies immediate") because forcing
+	// every texture created during the draw phase through the immediate
+	// vkQueueWaitIdle path -- e.g. a player skin/face icon lazily loaded the
+	// first time the scoreboard is shown -- was found to stall/desync other
+	// HUD elements drawn later in the same frame.
+	if (forceImmediateTextureUpload || !VK_TextureQueuePendingUpload(texture, 0, 0, width, height, vktex->pixels)) {
 		VkBuffer stagingBuffer = VK_NULL_HANDLE;
 		VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
 		void* mapped;
@@ -882,8 +916,29 @@ void VK_TextureSetFiltering(texture_ref texture, texture_minification_id min_fil
 
 void VK_TextureSetAnisotropy(texture_ref texture, int anisotropy)
 {
-	(void)texture;
-	(void)anisotropy;
+	vk_texture_t* vktex;
+
+	if (!VK_TextureReferenceInRange(texture)) {
+		return;
+	}
+	vktex = &textureData[texture.index];
+	if (vktex->anisotropy == anisotropy) {
+		return;
+	}
+	vktex->anisotropy = anisotropy;
+	// Samplers are immutable once created, so a changed anisotropy level
+	// means destroying the cached ones and letting VK_TextureUpdateDescriptor
+	// recreate them lazily via VK_TextureEnsureSamplers, same as
+	// VK_TextureWrapModeClamp does for the clamp/repeat address mode.
+	if (vktex->linearSampler != VK_NULL_HANDLE) {
+		vkDestroySampler(vk_options.logicalDevice, vktex->linearSampler, NULL);
+		vktex->linearSampler = VK_NULL_HANDLE;
+	}
+	if (vktex->nearestSampler != VK_NULL_HANDLE) {
+		vkDestroySampler(vk_options.logicalDevice, vktex->nearestSampler, NULL);
+		vktex->nearestSampler = VK_NULL_HANDLE;
+	}
+	VK_TextureUpdateDescriptor(texture);
 }
 
 void VK_TextureLoadCubemapFace(texture_ref cubemap, r_cubemap_direction_id direction, const byte* data, int width, int height)
