@@ -73,7 +73,19 @@ void VK_DestroySwapChainFramebuffers(void);
 qbool VK_RenderPassCreate(void);
 void VK_RenderPassDelete(void);
 VkRenderPass VK_MainRenderPass(void);
+VkRenderPass VK_PostProcessRenderPass(void);
 VkFormat VK_DepthFormat(void);
+
+// vk_swapchain.c
+qbool VK_PostProcessActive(void);
+qbool VK_CreatePostProcessResources(void);
+void VK_DestroyPostProcessResources(void);
+VkFramebuffer VK_PostProcessFramebuffer(uint32_t imageIndex);
+VkFramebuffer VK_PostProcessCompositeFramebuffer(uint32_t imageIndex);
+
+// vk_draw.c
+void VK_PostProcessTransitionForSampling(VkCommandBuffer commandBuffer, uint32_t imageIndex);
+void VK_PostProcessComposite(VkCommandBuffer commandBuffer, uint32_t imageIndex);
 
 // vk_blending.c
 void VK_BlendingConfigure(VkPipelineColorBlendStateCreateInfo* info, VkPipelineColorBlendAttachmentState* blending, r_blendfunc_t func);
@@ -195,6 +207,24 @@ typedef struct vk_options_s {
 		VkImageView msaaColorImageView;
 		VkExtent2D imageSize;
 		int imageCount;
+		// Offscreen color target the main render pass draws into when
+		// VK_PostProcessActive() is true (real gamma/contrast curve and/or
+		// FXAA requested -- see VK_PostProcessActive). One per swapchain
+		// image, same lifetime/recreate rules as framebuffers[] above: each
+		// swapchain image needs its own offscreen target + framebuffer
+		// because the composite pass for image N may still be reading it
+		// while frame N+1 starts drawing into a different swapchain image's
+		// target (VK_MAX_FRAMES_IN_FLIGHT > 1). When inactive, none of this
+		// is allocated and the main render pass targets the swapchain image
+		// directly, identical to before this feature existed.
+		VkImage* postProcessColorImages;
+		VkDeviceMemory* postProcessColorImageMemory;
+		VkImageView* postProcessColorImageViews;
+		VkFramebuffer* postProcessFramebuffers;
+		VkFramebuffer* postProcessCompositeFramebuffers;
+		VkDescriptorPool postProcessDescriptorPool;
+		VkDescriptorSet* postProcessDescriptorSets;
+		qbool postProcessActive;
 	} swapChain;
 	struct {
 		VkCommandPool commandPool;
