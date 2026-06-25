@@ -413,12 +413,17 @@ static qbool VK_TextureUpdateDescriptor(texture_ref texture)
 	vk_texture_t* vktex;
 	VkDescriptorImageInfo imageInfos[2];
 	VkWriteDescriptorSet descriptorWrite;
+	qbool wasAlreadyAllocated;
 
 	if (!VK_TextureReferenceInRange(texture)) {
 		return false;
 	}
 	vktex = &textureData[texture.index];
-	if (vktex->imageView == VK_NULL_HANDLE || !VK_TextureEnsureSamplers(vktex) || !VK_TextureEnsureDescriptor(texture)) {
+	if (vktex->imageView == VK_NULL_HANDLE || !VK_TextureEnsureSamplers(vktex)) {
+		return false;
+	}
+	wasAlreadyAllocated = (vktex->descriptorSet != VK_NULL_HANDLE);
+	if (!VK_TextureEnsureDescriptor(texture)) {
 		return false;
 	}
 
@@ -440,6 +445,21 @@ static qbool VK_TextureUpdateDescriptor(texture_ref texture)
 	descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
 	descriptorWrite.descriptorCount = 2;
 	descriptorWrite.pImageInfo = imageInfos;
+
+	// A descriptor set that already existed may be bound into a command
+	// buffer still executing on the GPU (we run up to VK_MAX_FRAMES_IN_FLIGHT
+	// frames ahead of it) -- vkUpdateDescriptorSets on a set in that pending
+	// state is undefined per spec without UPDATE_AFTER_BIND, confirmed by
+	// validation layers corrupting unrelated in-flight draws (one texture's
+	// image showing up on a completely different surface). A set we just
+	// allocated above can't be bound to anything yet, so only the
+	// reconfigure-an-existing-texture path (filtering/anisotropy/clamp
+	// changes) needs to wait; VK_UploadTexture's own path already frees and
+	// reallocates the descriptor via VK_TextureDestroyObjects beforehand
+	// (which already waits), so this doesn't double up there.
+	if (wasAlreadyAllocated) {
+		vkDeviceWaitIdle(vk_options.logicalDevice);
+	}
 
 	vkUpdateDescriptorSets(vk_options.logicalDevice, 1, &descriptorWrite, 0, NULL);
 	return true;

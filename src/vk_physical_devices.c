@@ -29,7 +29,6 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #include "vk_local.h"
 
-static const char* validationLayers[] = { "VK_LAYER_KHRONOS_validation" };
 static const char* requiredDeviceExtensions[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
 
 static void VK_PhysicalDeviceQueryQueueFamilies(VkPhysicalDevice device, VkSurfaceKHR surface, int* graphics_queue_index, int* compute_queue_index, int* present_queue_index)
@@ -314,47 +313,6 @@ uint32_t VK_PhysicalDevicePresentQueueFamilyIndex(void)
 	return vk_options.physicalDevicePresentQueueFamilyIndex;
 }
 
-static qbool VK_AddDeviceValidationLayers(VkDeviceCreateInfo* createInfo)
-{
-	VkLayerProperties* availableLayers = NULL;
-
-	createInfo->enabledLayerCount = 0;
-	if (COM_CheckParm(cmdline_param_developer_mode)) {
-		unsigned int layerCount, j;
-		int i;
-		qbool available = true;
-		VkResult result;
-
-		result = vkEnumerateInstanceLayerProperties(&layerCount, NULL);
-		if (result != VK_SUCCESS) {
-			return false;
-		}
-
-		availableLayers = Q_malloc(sizeof(availableLayers[0]) * layerCount);
-		result = vkEnumerateInstanceLayerProperties(&layerCount, availableLayers);
-		if (result != VK_SUCCESS) {
-			Q_free(availableLayers);
-			return false;
-		}
-		for (i = 0; i < sizeof(validationLayers) / sizeof(validationLayers[0]); ++i) {
-			qbool found = false;
-			for (j = 0; j < layerCount && !found; ++j) {
-				found |= !strcmp(availableLayers[j].layerName, validationLayers[i]);
-			}
-			available &= found;
-		}
-		Q_free(availableLayers);
-
-		if (available) {
-			createInfo->ppEnabledLayerNames = validationLayers;
-			createInfo->enabledLayerCount = sizeof(validationLayers) / sizeof(validationLayers[0]);
-			return true;
-		}
-	}
-
-	return false;
-}
-
 qbool VK_CreateLogicalDevice(VkInstance instance)
 {
 	VkDeviceQueueCreateInfo queueInfos[2] = { { 0 } };
@@ -390,7 +348,11 @@ qbool VK_CreateLogicalDevice(VkInstance instance)
 
 	deviceInfo.enabledExtensionCount = sizeof(requiredDeviceExtensions) / sizeof(requiredDeviceExtensions[0]);
 	deviceInfo.ppEnabledExtensionNames = requiredDeviceExtensions;
-	VK_AddDeviceValidationLayers(&deviceInfo);
+	// Device-level layers are legacy/ignored since Vulkan 1.0 -- only
+	// instance layers (VK_CreateInstance/VK_AddValidationLayers) matter.
+	// Leaving enabledLayerCount non-zero here just trips validation:
+	// "vkCreateDevice(): pCreateInfo->enabledLayerCount is 1 (not zero)".
+	deviceInfo.enabledLayerCount = 0;
 
 	vk_options.logicalDevice = VK_NULL_HANDLE;
 	if (vkCreateDevice(vk_options.physicalDevice, &deviceInfo, NULL, &vk_options.logicalDevice) != VK_SUCCESS) {
