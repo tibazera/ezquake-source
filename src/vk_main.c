@@ -1001,6 +1001,8 @@ qbool VK_Initialise(SDL_Window* window)
 		return false;
 	}
 
+	VK_DetermineMSAASampleCount();
+
 	if (!VK_CreateLogicalDevice(vk_options.instance)) {
 		VK_Shutdown(r_shutdown_full);
 		return false;
