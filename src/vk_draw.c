@@ -476,7 +476,7 @@ static qbool VK_HudEnsureResources(void)
 			 1.0f, -1.0f,
 			 1.0f,  1.0f,
 		};
-		if (!buffers.Create(r_buffer_hud_brighten_vertex_data, buffertype_vertex, "vk-hud-brighten-vbo", sizeof(fullscreenQuad), fullscreenQuad, bufferusage_constant_data)) {
+		if (!buffers.Create(r_buffer_hud_brighten_vertex_data, buffertype_vertex, "vk-hud-brighten-vbo", sizeof(fullscreenQuad), (void*)fullscreenQuad, bufferusage_constant_data)) {
 			return false;
 		}
 	}

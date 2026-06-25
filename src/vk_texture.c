@@ -15,9 +15,14 @@ of the License, or (at your option) any later version.
 #include <android/log.h>
 #endif
 
+#include "image.h"
 #include "r_renderer.h"
 #include "r_texture_internal.h"
 #include "vk_local.h"
+
+// Matches vkQuake/FTEQW: log2 of the largest reasonable texture dimension is
+// well under this, so it's only a safety cap, never a real limit in practice.
+#define VK_TEXTURE_MAX_MIP_LEVELS 16
 
 typedef struct vk_texture_s {
 	VkImage image;
@@ -32,6 +37,7 @@ typedef struct vk_texture_s {
 	int width;
 	int height;
 	int mode;
+	int mipLevels;
 	qbool clamp;
 	texture_minification_id minFilter;
 	texture_magnification_id magFilter;
@@ -51,6 +57,14 @@ typedef struct vk_pending_texture_upload_s {
 	int offsety;
 	int width;
 	int height;
+	// mipCount > 1 means levels 1..mipCount-1 immediately follow level 0's
+	// data, contiguously, in the same upload buffer -- see
+	// VK_TextureQueuePendingMipmapUpload. Regular sub-image/lightmap updates
+	// (mipCount == 1) never touch these.
+	int mipCount;
+	int extraMipWidth[VK_TEXTURE_MAX_MIP_LEVELS];
+	int extraMipHeight[VK_TEXTURE_MAX_MIP_LEVELS];
+	VkDeviceSize extraMipOffset[VK_TEXTURE_MAX_MIP_LEVELS];
 } vk_pending_texture_upload_t;
 
 static vk_pending_texture_upload_t pendingTextureUploads[VK_MAX_PENDING_TEXTURE_UPLOADS];
@@ -133,8 +147,96 @@ static qbool VK_TextureQueuePendingUpload(texture_ref texture, int offsetx, int 
 	upload->offsety = offsety;
 	upload->width = width;
 	upload->height = height;
+	upload->mipCount = 1;
 	memcpy(pendingTextureUploadData + pendingTextureUploadDataSize, buffer, (size_t)imageSize);
 	pendingTextureUploadDataSize = requiredSize;
+	return true;
+}
+
+static int VK_TextureMipLevelCount(int width, int height)
+{
+	int levels = 1;
+
+	while ((width > 1 || height > 1) && levels < VK_TEXTURE_MAX_MIP_LEVELS) {
+		if (width > 1) width >>= 1;
+		if (height > 1) height >>= 1;
+		++levels;
+	}
+	return levels;
+}
+
+// Builds the full mip chain for a freshly-loaded texture on the CPU (same
+// technique vkQuake/FTEQW use: box-filter downsample each level from the
+// previous one, then upload the whole chain in one batch) and queues it
+// through the same per-frame batch VK_UploadTexture's single-level path
+// uses, so bulk map loads (hundreds of mipmapped world textures) still don't
+// pay a vkQueueWaitIdle per texture. Returns false if the batch is full so
+// the caller can fall back to an immediate upload of just level 0 (mips are
+// a quality improvement, not correctness-critical -- better to show an
+// unmipped texture than to stall the whole batch).
+static qbool VK_TextureQueuePendingMipmapUpload(texture_ref texture, int width, int height, const byte* baseData, int mipCount)
+{
+	vk_pending_texture_upload_t* upload;
+	byte* levelSrc;
+	byte* levelDst;
+	int levelWidth, levelHeight;
+	int level;
+	VkDeviceSize totalSize;
+	size_t requiredSize;
+
+	if (pendingTextureUploadCount >= VK_MAX_PENDING_TEXTURE_UPLOADS || mipCount <= 1 || mipCount > VK_TEXTURE_MAX_MIP_LEVELS) {
+		return false;
+	}
+
+	totalSize = 0;
+	levelWidth = width;
+	levelHeight = height;
+	for (level = 0; level < mipCount; ++level) {
+		totalSize += (VkDeviceSize)levelWidth * levelHeight * 4;
+		if (levelWidth > 1) levelWidth >>= 1;
+		if (levelHeight > 1) levelHeight >>= 1;
+	}
+
+	upload = &pendingTextureUploads[pendingTextureUploadCount++];
+	requiredSize = pendingTextureUploadDataSize + (size_t)totalSize;
+	if (requiredSize > pendingTextureUploadDataCapacity) {
+		size_t newCapacity = max((size_t)(4 * 1024 * 1024), requiredSize * 2);
+		pendingTextureUploadData = Q_realloc(pendingTextureUploadData, newCapacity);
+		pendingTextureUploadDataCapacity = newCapacity;
+	}
+
+	upload->texture = texture;
+	upload->dataOffset = pendingTextureUploadDataSize;
+	upload->offsetx = 0;
+	upload->offsety = 0;
+	upload->width = width;
+	upload->height = height;
+	upload->mipCount = mipCount;
+
+	levelDst = pendingTextureUploadData + pendingTextureUploadDataSize;
+	memcpy(levelDst, baseData, (size_t)width * height * 4);
+	pendingTextureUploadDataSize += (size_t)width * height * 4;
+
+	levelWidth = width;
+	levelHeight = height;
+	levelSrc = levelDst;
+	for (level = 1; level < mipCount; ++level) {
+		levelDst = pendingTextureUploadData + pendingTextureUploadDataSize;
+		// Image_MipReduce halves whichever of (levelWidth, levelHeight) is
+		// still > 1 and writes *levelWidth/*levelHeight back as the new,
+		// smaller dimensions -- reads from levelSrc (the previous level,
+		// already written into this same buffer) and writes the smaller
+		// level right after it.
+		Image_MipReduce(levelSrc, levelDst, &levelWidth, &levelHeight, 4);
+
+		upload->extraMipWidth[level] = levelWidth;
+		upload->extraMipHeight[level] = levelHeight;
+		upload->extraMipOffset[level] = pendingTextureUploadDataSize;
+
+		pendingTextureUploadDataSize += (size_t)levelWidth * levelHeight * 4;
+		levelSrc = levelDst;
+	}
+
 	return true;
 }
 
@@ -258,7 +360,11 @@ static qbool VK_TextureCreateSampler(vk_texture_t* vktex, VkFilter filter, VkSam
 	samplerInfo.compareOp = VK_COMPARE_OP_ALWAYS;
 	samplerInfo.mipmapMode = (filter == VK_FILTER_LINEAR) ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
 	samplerInfo.minLod = 0.0f;
-	samplerInfo.maxLod = 0.0f;
+	// vktex->mipLevels is 1 for textures with no generated mip chain (matches
+	// the old hardcoded 0.0f -- the image only has level 0 either way), and
+	// the real level count otherwise so the sampler can actually select
+	// between them instead of being pinned to level 0.
+	samplerInfo.maxLod = (float)(max(1, vktex->mipLevels) - 1);
 
 	return vkCreateSampler(vk_options.logicalDevice, &samplerInfo, NULL, sampler) == VK_SUCCESS;
 }
@@ -358,7 +464,11 @@ static void VK_TextureRecordTransitionBarrier(VkCommandBuffer commandBuffer, vk_
 	barrier.image = vktex->image;
 	barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 	barrier.subresourceRange.baseMipLevel = 0;
-	barrier.subresourceRange.levelCount = 1;
+	// Covers every mip level: vktex->layout tracks one layout for the whole
+	// image, and copies into individual mip levels (VK_TextureFlushPendingUploads,
+	// VK_TextureUploadMipChainImmediate) all happen between one pair of these
+	// transitions, not one pair per level.
+	barrier.subresourceRange.levelCount = max(1, vktex->mipLevels);
 	barrier.subresourceRange.baseArrayLayer = 0;
 	barrier.subresourceRange.layerCount = 1;
 
@@ -429,6 +539,86 @@ static void VK_TextureUploadBufferToImageImmediate(VkBuffer buffer, vk_texture_t
 	VK_EndImmediateCommands(commandBuffer);
 }
 
+// Fallback for when the per-frame mip-chain batch queue is full (see
+// VK_TextureQueuePendingMipmapUpload) -- rare, but the image was already
+// created with mipCount levels, so every level must end up with real data:
+// leaving levels 1..mipCount-1 in VK_IMAGE_LAYOUT_UNDEFINED while the sampler
+// is allowed to read from them (maxLod) is undefined behaviour, not just a
+// quality loss. One staging buffer holding the whole chain, one immediate
+// submit with one copy region per level.
+static void VK_TextureUploadMipChainImmediate(vk_texture_t* vktex, const byte* baseData, int width, int height, int mipCount)
+{
+	VkBuffer stagingBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+	VkBufferImageCopy regions[VK_TEXTURE_MAX_MIP_LEVELS];
+	VkCommandBuffer commandBuffer;
+	void* mapped;
+	VkDeviceSize totalSize;
+	VkDeviceSize levelOffsets[VK_TEXTURE_MAX_MIP_LEVELS];
+	int levelWidths[VK_TEXTURE_MAX_MIP_LEVELS];
+	int levelHeights[VK_TEXTURE_MAX_MIP_LEVELS];
+	int levelWidth, levelHeight;
+	int level;
+
+	mipCount = bound(1, mipCount, VK_TEXTURE_MAX_MIP_LEVELS);
+
+	totalSize = 0;
+	levelWidth = width;
+	levelHeight = height;
+	for (level = 0; level < mipCount; ++level) {
+		levelOffsets[level] = totalSize;
+		levelWidths[level] = levelWidth;
+		levelHeights[level] = levelHeight;
+		totalSize += (VkDeviceSize)levelWidth * levelHeight * 4;
+		if (levelWidth > 1) levelWidth >>= 1;
+		if (levelHeight > 1) levelHeight >>= 1;
+	}
+
+	if (!VK_CreateBufferResource(totalSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &stagingBuffer, &stagingMemory)) {
+		return;
+	}
+	if (vkMapMemory(vk_options.logicalDevice, stagingMemory, 0, totalSize, 0, &mapped) != VK_SUCCESS) {
+		vkDestroyBuffer(vk_options.logicalDevice, stagingBuffer, NULL);
+		vkFreeMemory(vk_options.logicalDevice, stagingMemory, NULL);
+		return;
+	}
+
+	memcpy(mapped, baseData, (size_t)levelWidths[0] * levelHeights[0] * 4);
+	levelWidth = width;
+	levelHeight = height;
+	for (level = 1; level < mipCount; ++level) {
+		Image_MipReduce((byte*)mapped + levelOffsets[level - 1], (byte*)mapped + levelOffsets[level], &levelWidth, &levelHeight, 4);
+	}
+	vkUnmapMemory(vk_options.logicalDevice, stagingMemory);
+
+	commandBuffer = VK_BeginImmediateCommands();
+	if (commandBuffer == VK_NULL_HANDLE) {
+		vkDestroyBuffer(vk_options.logicalDevice, stagingBuffer, NULL);
+		vkFreeMemory(vk_options.logicalDevice, stagingMemory, NULL);
+		return;
+	}
+
+	VK_TextureRecordTransitionBarrier(commandBuffer, vktex, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+	for (level = 0; level < mipCount; ++level) {
+		VK_InitialiseStructure(regions[level]);
+		regions[level].bufferOffset = levelOffsets[level];
+		regions[level].imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		regions[level].imageSubresource.mipLevel = level;
+		regions[level].imageSubresource.baseArrayLayer = 0;
+		regions[level].imageSubresource.layerCount = 1;
+		regions[level].imageExtent.width = levelWidths[level];
+		regions[level].imageExtent.height = levelHeights[level];
+		regions[level].imageExtent.depth = 1;
+	}
+	vkCmdCopyBufferToImage(commandBuffer, stagingBuffer, vktex->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, mipCount, regions);
+	VK_TextureRecordTransitionBarrier(commandBuffer, vktex, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+	VK_EndImmediateCommands(commandBuffer);
+
+	vkDestroyBuffer(vk_options.logicalDevice, stagingBuffer, NULL);
+	vkFreeMemory(vk_options.logicalDevice, stagingMemory, NULL);
+}
+
 static qbool VK_TextureCreateImageView(texture_ref texture)
 {
 	vk_texture_t* vktex;
@@ -442,7 +632,7 @@ static qbool VK_TextureCreateImageView(texture_ref texture)
 	viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
 	viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 	viewInfo.subresourceRange.baseMipLevel = 0;
-	viewInfo.subresourceRange.levelCount = 1;
+	viewInfo.subresourceRange.levelCount = max(1, vktex->mipLevels);
 	viewInfo.subresourceRange.baseArrayLayer = 0;
 	viewInfo.subresourceRange.layerCount = 1;
 
@@ -460,10 +650,18 @@ void VK_UploadTexture(texture_ref texture, int mode, int width, int height, byte
 {
 	vk_texture_t* vktex;
 	VkDeviceSize imageSize;
+	int mipLevels;
 
 	if (!VK_TextureReferenceInRange(texture) || vk_options.logicalDevice == VK_NULL_HANDLE || width <= 0 || height <= 0) {
 		return;
 	}
+
+	// Real mip chain, CPU box-filtered like vkQuake/FTEQW (see
+	// VK_TextureQueuePendingMipmapUpload) -- only for textures that actually
+	// asked for mipmap filtering (world surfaces, models, ...). 2D/HUD/font
+	// textures never set TEX_MIPMAP and stay at the previous single-level
+	// behaviour.
+	mipLevels = (mode & TEX_MIPMAP) ? VK_TextureMipLevelCount(width, height) : 1;
 
 	imageSize = (VkDeviceSize)width * height * 4;
 	VK_TextureDestroyObjects(texture);
@@ -471,6 +669,7 @@ void VK_UploadTexture(texture_ref texture, int mode, int width, int height, byte
 	vktex->width = width;
 	vktex->height = height;
 	vktex->mode = mode;
+	vktex->mipLevels = mipLevels;
 	vktex->layout = VK_IMAGE_LAYOUT_UNDEFINED;
 	vktex->minFilter = texture_minification_linear;
 	vktex->magFilter = texture_magnification_linear;
@@ -483,7 +682,7 @@ void VK_UploadTexture(texture_ref texture, int mode, int width, int height, byte
 		memset(vktex->pixels, 0, vktex->pixelsSize);
 	}
 
-	if (!VK_CreateImageResource(width, height, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &vktex->image, &vktex->memory)) {
+	if (!VK_CreateImageResource(width, height, mipLevels, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &vktex->image, &vktex->memory)) {
 		VK_TextureDestroyObjects(texture);
 		return;
 	}
@@ -514,7 +713,12 @@ void VK_UploadTexture(texture_ref texture, int mode, int width, int height, byte
 	// vkQueueWaitIdle path -- e.g. a player skin/face icon lazily loaded the
 	// first time the scoreboard is shown -- was found to stall/desync other
 	// HUD elements drawn later in the same frame.
-	if (forceImmediateTextureUpload || !VK_TextureQueuePendingUpload(texture, 0, 0, width, height, vktex->pixels)) {
+	if (mipLevels > 1) {
+		if (forceImmediateTextureUpload || !VK_TextureQueuePendingMipmapUpload(texture, width, height, vktex->pixels, mipLevels)) {
+			VK_TextureUploadMipChainImmediate(vktex, vktex->pixels, width, height, mipLevels);
+		}
+	}
+	else if (forceImmediateTextureUpload || !VK_TextureQueuePendingUpload(texture, 0, 0, width, height, vktex->pixels)) {
 		VkBuffer stagingBuffer = VK_NULL_HANDLE;
 		VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
 		void* mapped;
@@ -831,7 +1035,9 @@ void VK_TextureFlushPendingUploads(VkCommandBuffer commandBuffer, uint32_t frame
 	for (i = 0; i < pendingTextureUploadCount; ++i) {
 		vk_pending_texture_upload_t* upload = &pendingTextureUploads[i];
 		vk_texture_t* vktex;
-		VkBufferImageCopy region;
+		VkBufferImageCopy regions[VK_TEXTURE_MAX_MIP_LEVELS];
+		int mipCount = max(1, upload->mipCount);
+		int level;
 
 		if (!VK_TextureReady(upload->texture)) continue;
 		vktex = &textureData[upload->texture.index];
@@ -841,16 +1047,31 @@ void VK_TextureFlushPendingUploads(VkCommandBuffer commandBuffer, uint32_t frame
 		// "read" barrier on contents that were never written.
 		VK_TextureRecordTransitionBarrier(commandBuffer, vktex, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 
-		VK_InitialiseStructure(region);
-		region.bufferOffset = upload->dataOffset;
-		region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-		region.imageSubresource.layerCount = 1;
-		region.imageOffset.x = upload->offsetx;
-		region.imageOffset.y = upload->offsety;
-		region.imageExtent.width = upload->width;
-		region.imageExtent.height = upload->height;
-		region.imageExtent.depth = 1;
-		vkCmdCopyBufferToImage(commandBuffer, frameUploadBuffers[frameIndex], vktex->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+		VK_InitialiseStructure(regions[0]);
+		regions[0].bufferOffset = upload->dataOffset;
+		regions[0].imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		regions[0].imageSubresource.mipLevel = 0;
+		regions[0].imageSubresource.layerCount = 1;
+		regions[0].imageOffset.x = upload->offsetx;
+		regions[0].imageOffset.y = upload->offsety;
+		regions[0].imageExtent.width = upload->width;
+		regions[0].imageExtent.height = upload->height;
+		regions[0].imageExtent.depth = 1;
+		// mipCount > 1 only happens via VK_TextureQueuePendingMipmapUpload,
+		// which always queues the whole image at offset (0,0) -- sub-image/
+		// lightmap updates (mipCount == 1) are the only callers that use a
+		// non-zero offsetx/offsety.
+		for (level = 1; level < mipCount; ++level) {
+			VK_InitialiseStructure(regions[level]);
+			regions[level].bufferOffset = upload->extraMipOffset[level];
+			regions[level].imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+			regions[level].imageSubresource.mipLevel = level;
+			regions[level].imageSubresource.layerCount = 1;
+			regions[level].imageExtent.width = upload->extraMipWidth[level];
+			regions[level].imageExtent.height = upload->extraMipHeight[level];
+			regions[level].imageExtent.depth = 1;
+		}
+		vkCmdCopyBufferToImage(commandBuffer, frameUploadBuffers[frameIndex], vktex->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, mipCount, regions);
 		VK_TextureRecordTransitionBarrier(commandBuffer, vktex, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 	}
 
