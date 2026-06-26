@@ -275,6 +275,7 @@ cvar_t vid_framebuffer_smooth      = {"vid_framebuffer_smooth",        "1",     
 cvar_t vid_framebuffer_sshotmode   = {"vid_framebuffer_sshotmode",     "0" };
 cvar_t vid_framebuffer_multisample = {"vid_framebuffer_multisample",   "0" };
 cvar_t vid_framebuffer_fxaa        = {"vid_framebuffer_fxaa",          "0" };
+cvar_t vid_vulkan_antilag          = {"vid_vulkan_antilag",            "0" };
 
 #ifdef __ANDROID__
 static void VID_SDL_NormalizeLandscapeSize(int *width, int *height)
@@ -1283,6 +1284,7 @@ void VID_RegisterCvars(void)
 	Cvar_Register(&vid_framebuffer_sshotmode);
 	Cvar_Register(&vid_framebuffer_multisample);
 	Cvar_Register(&vid_framebuffer_fxaa);
+	Cvar_Register(&vid_vulkan_antilag);
 
 	Cvar_Register(&vid_reload_auto);
 

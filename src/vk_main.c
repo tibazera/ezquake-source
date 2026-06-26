@@ -822,6 +822,73 @@ void VK_BeginFrame(void)
 	}
 	vk_options.frame.imageInFlightFences[vk_options.frame.imageIndex] = frameFence;
 
+	// Anti-lag / low-latency input marker: as close to the start of the
+	// frame's CPU work as we can get it, before any of the (potentially
+	// expensive) command-buffer recording below. vid_vulkan_antilag is
+	// re-checked every frame rather than latched -- toggling it only
+	// gates whether these calls happen, nothing about pipeline/swapchain
+	// state depends on it, so no vid_restart is needed.
+	{
+		extern cvar_t vid_vulkan_antilag;
+
+		if (vid_vulkan_antilag.integer && vk_options.supportsAmdAntiLag) {
+			VkAntiLagPresentationInfoAMD presentationInfo = { 0 };
+			VkAntiLagDataAMD antiLagData = { 0 };
+
+			presentationInfo.sType = VK_STRUCTURE_TYPE_ANTI_LAG_PRESENTATION_INFO_AMD;
+			presentationInfo.stage = VK_ANTI_LAG_STAGE_INPUT_AMD;
+			presentationInfo.frameIndex = vk_options.antiLagFrameIndex;
+
+			antiLagData.sType = VK_STRUCTURE_TYPE_ANTI_LAG_DATA_AMD;
+			antiLagData.mode = VK_ANTI_LAG_MODE_ON_AMD;
+			antiLagData.pPresentationInfo = &presentationInfo;
+
+			vk_options.antiLagUpdateAMD(vk_options.logicalDevice, &antiLagData);
+		}
+		else if (vid_vulkan_antilag.integer && vk_options.supportsNvLowLatency2) {
+			VkLatencySleepModeInfoNV sleepModeInfo = { 0 };
+			VkLatencySleepInfoNV sleepInfo = { 0 };
+			VkSetLatencyMarkerInfoNV markerInfo = { 0 };
+
+			if (!vk_options.latencySleepModeSet) {
+				sleepModeInfo.sType = VK_STRUCTURE_TYPE_LATENCY_SLEEP_MODE_INFO_NV;
+				sleepModeInfo.lowLatencyMode = VK_TRUE;
+				sleepModeInfo.lowLatencyBoost = VK_TRUE;
+				vk_options.setLatencySleepModeNV(vk_options.logicalDevice, vk_options.swapChain.handle, &sleepModeInfo);
+				vk_options.latencySleepModeSet = true;
+			}
+
+			markerInfo.sType = VK_STRUCTURE_TYPE_SET_LATENCY_MARKER_INFO_NV;
+			markerInfo.presentID = vk_options.antiLagFrameIndex;
+			markerInfo.marker = VK_LATENCY_MARKER_INPUT_SAMPLE_NV;
+			vk_options.setLatencyMarkerNV(vk_options.logicalDevice, vk_options.swapChain.handle, &markerInfo);
+
+			markerInfo.marker = VK_LATENCY_MARKER_SIMULATION_START_NV;
+			vk_options.setLatencyMarkerNV(vk_options.logicalDevice, vk_options.swapChain.handle, &markerInfo);
+
+			// vkLatencySleepNV does not block by itself -- it schedules the
+			// driver to signal latencySleepSemaphore once it's time to let
+			// the CPU proceed, so we wait on that semaphore right after.
+			sleepInfo.sType = VK_STRUCTURE_TYPE_LATENCY_SLEEP_INFO_NV;
+			sleepInfo.signalSemaphore = vk_options.latencySleepSemaphore;
+			sleepInfo.value = vk_options.antiLagFrameIndex + 1;
+			if (vk_options.latencySleepNV(vk_options.logicalDevice, vk_options.swapChain.handle, &sleepInfo) == VK_SUCCESS) {
+				VkSemaphoreWaitInfo waitInfo = { 0 };
+				VkSemaphore waitSemaphore = vk_options.latencySleepSemaphore;
+				uint64_t waitValue = vk_options.antiLagFrameIndex + 1;
+
+				waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+				waitInfo.semaphoreCount = 1;
+				waitInfo.pSemaphores = &waitSemaphore;
+				waitInfo.pValues = &waitValue;
+				vkWaitSemaphores(vk_options.logicalDevice, &waitInfo, 1000000000ULL);
+			}
+
+			markerInfo.marker = VK_LATENCY_MARKER_SIMULATION_END_NV;
+			vk_options.setLatencyMarkerNV(vk_options.logicalDevice, vk_options.swapChain.handle, &markerInfo);
+		}
+	}
+
 	commandBuffer = vk_options.frame.commandBuffers[vk_options.frame.imageIndex];
 	result = vkResetCommandBuffer(commandBuffer, 0);
 	if (result != VK_SUCCESS) {
@@ -883,6 +950,7 @@ VkCommandBuffer VK_CurrentCommandBuffer(void)
 
 void VK_EndFrame(void)
 {
+	extern cvar_t vid_vulkan_antilag;
 	VkCommandBuffer commandBuffer;
 	VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
 	VkSubmitInfo submitInfo = { 0 };
@@ -970,6 +1038,38 @@ void VK_EndFrame(void)
 	presentInfo.pSwapchains = &vk_options.swapChain.handle;
 	presentInfo.pImageIndices = &vk_options.frame.imageIndex;
 
+	// Present-stage anti-lag marker, immediately before the real present
+	// call below -- mirrors the input-stage marker placed near the start
+	// of VK_BeginFrame, correlated by the same antiLagFrameIndex.
+	{
+		if (vid_vulkan_antilag.integer && vk_options.supportsAmdAntiLag) {
+			VkAntiLagPresentationInfoAMD presentationInfo = { 0 };
+			VkAntiLagDataAMD antiLagData = { 0 };
+
+			presentationInfo.sType = VK_STRUCTURE_TYPE_ANTI_LAG_PRESENTATION_INFO_AMD;
+			presentationInfo.stage = VK_ANTI_LAG_STAGE_PRESENT_AMD;
+			presentationInfo.frameIndex = vk_options.antiLagFrameIndex;
+
+			antiLagData.sType = VK_STRUCTURE_TYPE_ANTI_LAG_DATA_AMD;
+			antiLagData.mode = VK_ANTI_LAG_MODE_ON_AMD;
+			antiLagData.pPresentationInfo = &presentationInfo;
+
+			vk_options.antiLagUpdateAMD(vk_options.logicalDevice, &antiLagData);
+		}
+		else if (vid_vulkan_antilag.integer && vk_options.supportsNvLowLatency2) {
+			VkSetLatencyMarkerInfoNV markerInfo = { 0 };
+
+			markerInfo.sType = VK_STRUCTURE_TYPE_SET_LATENCY_MARKER_INFO_NV;
+			markerInfo.presentID = vk_options.antiLagFrameIndex;
+			markerInfo.marker = VK_LATENCY_MARKER_PRESENT_START_NV;
+			vk_options.setLatencyMarkerNV(vk_options.logicalDevice, vk_options.swapChain.handle, &markerInfo);
+		}
+
+		if (vid_vulkan_antilag.integer && (vk_options.supportsAmdAntiLag || vk_options.supportsNvLowLatency2)) {
+			++vk_options.antiLagFrameIndex;
+		}
+	}
+
 #ifdef __ANDROID__
 	{
 		static vk_profile_accum_t presentAccum;
@@ -999,6 +1099,15 @@ void VK_EndFrame(void)
 	}
 	else {
 		presented = true;
+	}
+
+	if (vid_vulkan_antilag.integer && vk_options.supportsNvLowLatency2) {
+		VkSetLatencyMarkerInfoNV markerInfo = { 0 };
+
+		markerInfo.sType = VK_STRUCTURE_TYPE_SET_LATENCY_MARKER_INFO_NV;
+		markerInfo.presentID = vk_options.antiLagFrameIndex;
+		markerInfo.marker = VK_LATENCY_MARKER_PRESENT_END_NV;
+		vk_options.setLatencyMarkerNV(vk_options.logicalDevice, vk_options.swapChain.handle, &markerInfo);
 	}
 #ifdef __ANDROID__
 	if (presented) {
@@ -1127,6 +1236,11 @@ void VK_Shutdown(r_shutdown_mode_t mode)
 		if (vk_options.pipelineCache != VK_NULL_HANDLE) {
 			vkDestroyPipelineCache(vk_options.logicalDevice, vk_options.pipelineCache, NULL);
 			vk_options.pipelineCache = VK_NULL_HANDLE;
+		}
+
+		if (vk_options.latencySleepSemaphore != VK_NULL_HANDLE) {
+			vkDestroySemaphore(vk_options.logicalDevice, vk_options.latencySleepSemaphore, NULL);
+			vk_options.latencySleepSemaphore = VK_NULL_HANDLE;
 		}
 
 		if (vk_options.logicalDevice != VK_NULL_HANDLE) {
