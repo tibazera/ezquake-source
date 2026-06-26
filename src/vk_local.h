@@ -58,6 +58,8 @@ qbool VK_RefreshPresentationMode(void);
 uint32_t VK_PhysicalDevicePresentQueueFamilyIndex(void);
 qbool VK_CreateLogicalDevice(VkInstance instance);
 void VK_DetermineMSAASampleCount(void);
+void VK_LoadPipelineCache(void);
+void VK_SavePipelineCache(void);
 
 // vk_window_surface.c
 qbool VK_CreateWindowSurface(SDL_Window* window, VkInstance instance, VkSurfaceKHR* surface);
@@ -179,6 +181,11 @@ typedef struct vk_options_s {
 	VkDevice logicalDevice;
 	VkQueue graphicsQueue;
 	VkQueue presentQueue;
+	// Loaded from disk in VK_CreateLogicalDevice, saved back on shutdown
+	// (VK_SavePipelineCache). Purely a compile-time hint to the driver --
+	// an empty/missing/stale cache file just means cold compiles, never
+	// an error (see VK_LoadPipelineCache).
+	VkPipelineCache pipelineCache;
 	// Determined once in VK_Initialise from vid_framebuffer_multisample,
 	// clamped against the physical device's actual limits (see
 	// VK_DetermineMSAASampleCount). VK_SAMPLE_COUNT_1_BIT (the default,

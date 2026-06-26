@@ -413,7 +413,62 @@ qbool VK_CreateLogicalDevice(VkInstance instance)
 		vk_options.presentQueue = vk_options.graphicsQueue;
 	}
 
+	VK_LoadPipelineCache();
+
 	return true;
+}
+
+#define VK_PIPELINE_CACHE_FILE "vulkan/pipeline_cache.bin"
+
+// Loads a previously saved driver pipeline cache blob, if any, so
+// vkCreateGraphicsPipelines() at the various call sites can skip re-compiling
+// shaders/pipelines it has already seen on this GPU+driver. A missing, empty,
+// or driver-rejected (stale/foreign) blob is not an error: VkPipelineCache is
+// purely an optimization hint, and vkCreatePipelineCache() with no/garbage
+// initial data still returns a valid, usable (just initially empty) cache.
+void VK_LoadPipelineCache(void)
+{
+	VkPipelineCacheCreateInfo cacheInfo = { 0 };
+	int cacheLen = 0;
+	byte* cacheData = FS_LoadHeapFile(VK_PIPELINE_CACHE_FILE, &cacheLen);
+
+	cacheInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+	if (cacheData && cacheLen > 0) {
+		cacheInfo.initialDataSize = (size_t)cacheLen;
+		cacheInfo.pInitialData = cacheData;
+	}
+
+	vk_options.pipelineCache = VK_NULL_HANDLE;
+	if (vkCreatePipelineCache(vk_options.logicalDevice, &cacheInfo, NULL, &vk_options.pipelineCache) != VK_SUCCESS) {
+		vk_options.pipelineCache = VK_NULL_HANDLE;
+	}
+
+	if (cacheData) {
+		Q_free(cacheData);
+	}
+}
+
+// Persists the (possibly now-larger) pipeline cache so the next run starts
+// warm. Called once on shutdown, after every pipeline that might be created
+// this session already has been -- see VK_Shutdown.
+void VK_SavePipelineCache(void)
+{
+	size_t dataSize = 0;
+	void* data;
+
+	if (vk_options.pipelineCache == VK_NULL_HANDLE || vk_options.logicalDevice == VK_NULL_HANDLE) {
+		return;
+	}
+
+	if (vkGetPipelineCacheData(vk_options.logicalDevice, vk_options.pipelineCache, &dataSize, NULL) != VK_SUCCESS || dataSize == 0) {
+		return;
+	}
+
+	data = Q_malloc(dataSize);
+	if (vkGetPipelineCacheData(vk_options.logicalDevice, vk_options.pipelineCache, &dataSize, data) == VK_SUCCESS) {
+		FS_WriteFile(VK_PIPELINE_CACHE_FILE, data, (int)dataSize);
+	}
+	Q_free(data);
 }
 
 #endif // RENDERER_OPTION_VULKAN

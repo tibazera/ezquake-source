@@ -1123,6 +1123,12 @@ void VK_Shutdown(r_shutdown_mode_t mode)
 
 		VK_RenderPassDelete();
 
+		VK_SavePipelineCache();
+		if (vk_options.pipelineCache != VK_NULL_HANDLE) {
+			vkDestroyPipelineCache(vk_options.logicalDevice, vk_options.pipelineCache, NULL);
+			vk_options.pipelineCache = VK_NULL_HANDLE;
+		}
+
 		if (vk_options.logicalDevice != VK_NULL_HANDLE) {
 			vkDestroyDevice(vk_options.logicalDevice, NULL);
 			vk_options.logicalDevice = VK_NULL_HANDLE;
