@@ -420,7 +420,21 @@ qbool VK_CreateLogicalDevice(VkInstance instance)
 		enabledExtensions[enabledExtensionCount++] = requiredDeviceExtensions[i];
 	}
 
-	VK_PhysicalDeviceSupportsOptionalExtensions(vk_options.physicalDevice, &amdAntiLagExtPresent, &nvLowLatency2Present);
+	// Only probe/enable the vendor low-latency extensions when the user has
+	// actually opted in via vid_vulkan_antilag. Enabling either extension on
+	// the device unconditionally (regardless of whether anything ever calls
+	// its functions) was found to cause VK_ERROR_DEVICE_LOST on NVIDIA during
+	// normal Vulkan init, even with the cvar left at its default of 0 -- the
+	// AMD path never exercises this since the AMD driver used for testing
+	// didn't report support, but better to not enable either string unless
+	// requested.
+	{
+		extern cvar_t vid_vulkan_antilag;
+
+		if (vid_vulkan_antilag.integer) {
+			VK_PhysicalDeviceSupportsOptionalExtensions(vk_options.physicalDevice, &amdAntiLagExtPresent, &nvLowLatency2Present);
+		}
+	}
 
 	vk_options.supportsAmdAntiLag = false;
 	if (amdAntiLagExtPresent) {
