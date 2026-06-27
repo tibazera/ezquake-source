@@ -22,6 +22,15 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #include <vulkan/vulkan.h>
 
+// VK_AMD_anti_lag is newer than the vulkan_core.h shipped with the Android
+// NDK (header version 275) -- guard all of its usage so Android/older-SDK
+// builds simply compile it out and only get the NV_low_latency2 path.
+#if defined(VK_AMD_ANTI_LAG_EXTENSION_NAME)
+#define EZQ_HAS_AMD_ANTI_LAG 1
+#else
+#define EZQ_HAS_AMD_ANTI_LAG 0
+#endif
+
 #include "r_local.h"
 #include "r_state.h"
 
@@ -205,10 +214,16 @@ typedef struct vk_options_s {
 	qbool supportsAmdAntiLag;
 	qbool supportsNvLowLatency2;
 	uint64_t antiLagFrameIndex;
+#if EZQ_HAS_AMD_ANTI_LAG
 	PFN_vkAntiLagUpdateAMD antiLagUpdateAMD;
+#endif
 	PFN_vkSetLatencySleepModeNV setLatencySleepModeNV;
 	PFN_vkLatencySleepNV latencySleepNV;
 	PFN_vkSetLatencyMarkerNV setLatencyMarkerNV;
+	// vkWaitSemaphores is core Vulkan 1.2, but the Android NDK's stub
+	// libvulkan.so doesn't export it for our target API level -- load it
+	// dynamically like the extension functions instead of linking statically.
+	PFN_vkWaitSemaphores waitSemaphores;
 	// Dedicated binary semaphore signalled by the driver from vkLatencySleepNV
 	// once it's time to let the CPU proceed -- vkLatencySleepNV itself only
 	// schedules that signal, it does not block, so VK_BeginFrame must wait on

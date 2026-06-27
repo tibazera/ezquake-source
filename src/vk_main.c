@@ -766,7 +766,12 @@ void VK_BeginFrame(void)
 		}
 	}
 #else
-	waitResult = vkWaitForFences(vk_options.logicalDevice, 1, &frameFence, VK_TRUE, UINT64_MAX);
+	{
+		static int diagFrameCount = 0;
+		if (diagFrameCount < 10) Con_Printf("VK_BeginFrame: frame fence wait...\n");
+		waitResult = vkWaitForFences(vk_options.logicalDevice, 1, &frameFence, VK_TRUE, UINT64_MAX);
+		if (diagFrameCount < 10) { Con_Printf("VK_BeginFrame: frame fence wait done (result=%d)\n", waitResult); ++diagFrameCount; }
+	}
 #endif
 	if (waitResult != VK_SUCCESS) {
 		Sys_Error("vulkan: frame fence wait failed: %d", waitResult);
@@ -789,7 +794,12 @@ void VK_BeginFrame(void)
 		VK_ProfileAccumulate(&acquireAccum, "vkAcquireNextImageKHR", Sys_DoubleTime() - t0);
 	}
 #else
-	result = vkAcquireNextImageKHR(vk_options.logicalDevice, vk_options.swapChain.handle, 1000000000ULL, vk_options.frame.imageAvailableSemaphores[frameIndex], VK_NULL_HANDLE, &vk_options.frame.imageIndex);
+	{
+		static int diagAcquireCount = 0;
+		if (diagAcquireCount < 10) Con_Printf("VK_BeginFrame: vkAcquireNextImageKHR...\n");
+		result = vkAcquireNextImageKHR(vk_options.logicalDevice, vk_options.swapChain.handle, 1000000000ULL, vk_options.frame.imageAvailableSemaphores[frameIndex], VK_NULL_HANDLE, &vk_options.frame.imageIndex);
+		if (diagAcquireCount < 10) { Con_Printf("VK_BeginFrame: vkAcquireNextImageKHR done (result=%d, imageIndex=%u)\n", result, vk_options.frame.imageIndex); ++diagAcquireCount; }
+	}
 #endif
 	if (result == VK_TIMEOUT || result == VK_NOT_READY) {
 		return;
@@ -814,7 +824,12 @@ void VK_BeginFrame(void)
 			VK_ProfileAccumulate(&imageWaitAccum, "image-in-flight wait", Sys_DoubleTime() - t0);
 		}
 #else
-		waitResult = vkWaitForFences(vk_options.logicalDevice, 1, &vk_options.frame.imageInFlightFences[vk_options.frame.imageIndex], VK_TRUE, UINT64_MAX);
+		{
+			static int diagImgWaitCount = 0;
+			if (diagImgWaitCount < 10) Con_Printf("VK_BeginFrame: image-in-flight fence wait...\n");
+			waitResult = vkWaitForFences(vk_options.logicalDevice, 1, &vk_options.frame.imageInFlightFences[vk_options.frame.imageIndex], VK_TRUE, UINT64_MAX);
+			if (diagImgWaitCount < 10) { Con_Printf("VK_BeginFrame: image-in-flight fence wait done (result=%d)\n", waitResult); ++diagImgWaitCount; }
+		}
 #endif
 		if (waitResult != VK_SUCCESS) {
 			Sys_Error("vulkan: swapchain image fence wait failed: %d", waitResult);
@@ -831,6 +846,7 @@ void VK_BeginFrame(void)
 	{
 		extern cvar_t vid_vulkan_antilag;
 
+#if EZQ_HAS_AMD_ANTI_LAG
 		if (vid_vulkan_antilag.integer && vk_options.supportsAmdAntiLag) {
 			VkAntiLagPresentationInfoAMD presentationInfo = { 0 };
 			VkAntiLagDataAMD antiLagData = { 0 };
@@ -846,6 +862,9 @@ void VK_BeginFrame(void)
 			vk_options.antiLagUpdateAMD(vk_options.logicalDevice, &antiLagData);
 		}
 		else if (vid_vulkan_antilag.integer && vk_options.supportsNvLowLatency2) {
+#else
+		if (vid_vulkan_antilag.integer && vk_options.supportsNvLowLatency2) {
+#endif
 			VkLatencySleepModeInfoNV sleepModeInfo = { 0 };
 			VkLatencySleepInfoNV sleepInfo = { 0 };
 			VkSetLatencyMarkerInfoNV markerInfo = { 0 };
@@ -881,7 +900,7 @@ void VK_BeginFrame(void)
 				waitInfo.semaphoreCount = 1;
 				waitInfo.pSemaphores = &waitSemaphore;
 				waitInfo.pValues = &waitValue;
-				vkWaitSemaphores(vk_options.logicalDevice, &waitInfo, 1000000000ULL);
+				vk_options.waitSemaphores(vk_options.logicalDevice, &waitInfo, 1000000000ULL);
 			}
 
 			markerInfo.marker = VK_LATENCY_MARKER_SIMULATION_END_NV;
@@ -889,16 +908,21 @@ void VK_BeginFrame(void)
 		}
 	}
 
-	commandBuffer = vk_options.frame.commandBuffers[vk_options.frame.imageIndex];
-	result = vkResetCommandBuffer(commandBuffer, 0);
-	if (result != VK_SUCCESS) {
-		Sys_Error("vulkan: vkResetCommandBuffer failed: %d", result);
-	}
+	{
+		static int diagCmdCount = 0;
+		if (diagCmdCount < 10) Con_Printf("VK_BeginFrame: command buffer reset/begin...\n");
+		commandBuffer = vk_options.frame.commandBuffers[vk_options.frame.imageIndex];
+		result = vkResetCommandBuffer(commandBuffer, 0);
+		if (result != VK_SUCCESS) {
+			Sys_Error("vulkan: vkResetCommandBuffer failed: %d", result);
+		}
 
-	beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-	result = vkBeginCommandBuffer(commandBuffer, &beginInfo);
-	if (result != VK_SUCCESS) {
-		Sys_Error("vulkan: vkBeginCommandBuffer failed: %d", result);
+		beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+		result = vkBeginCommandBuffer(commandBuffer, &beginInfo);
+		if (result != VK_SUCCESS) {
+			Sys_Error("vulkan: vkBeginCommandBuffer failed: %d", result);
+		}
+		if (diagCmdCount < 10) { Con_Printf("VK_BeginFrame: command buffer reset/begin done\n"); ++diagCmdCount; }
 	}
 
 	// Dynamic lightmaps queued by the previous frame are copied before the
@@ -933,6 +957,10 @@ void VK_BeginFrame(void)
 	renderPassInfo.clearValueCount = sizeof(clearValues) / sizeof(clearValues[0]);
 	renderPassInfo.pClearValues = clearValues;
 
+	{
+		static int diagRpCount = 0;
+		if (diagRpCount < 10) { Con_Printf("VK_BeginFrame: vkCmdBeginRenderPass...\n"); ++diagRpCount; }
+	}
 	vkCmdBeginRenderPass(commandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
 	vk_options.frame.active = true;
 #ifdef __ANDROID__
@@ -990,9 +1018,14 @@ void VK_EndFrame(void)
 		}
 	}
 
-	result = vkEndCommandBuffer(commandBuffer);
-	if (result != VK_SUCCESS) {
-		Sys_Error("vulkan: vkEndCommandBuffer failed: %d", result);
+	{
+		static int diagEndCmdCount = 0;
+		if (diagEndCmdCount < 10) Con_Printf("VK_EndFrame: vkEndCommandBuffer...\n");
+		result = vkEndCommandBuffer(commandBuffer);
+		if (result != VK_SUCCESS) {
+			Sys_Error("vulkan: vkEndCommandBuffer failed: %d", result);
+		}
+		if (diagEndCmdCount < 10) { Con_Printf("VK_EndFrame: vkEndCommandBuffer done\n"); ++diagEndCmdCount; }
 	}
 #ifdef __ANDROID__
 	if (vk_profile_recording_start > 0) {
@@ -1025,9 +1058,14 @@ void VK_EndFrame(void)
 		}
 	}
 #else
-	result = vkQueueSubmit(vk_options.graphicsQueue, 1, &submitInfo, frameFence);
-	if (result != VK_SUCCESS) {
-		Sys_Error("vulkan: vkQueueSubmit failed: %d", result);
+	{
+		static int diagSubmitCount = 0;
+		if (diagSubmitCount < 10) Con_Printf("VK_EndFrame: vkQueueSubmit...\n");
+		result = vkQueueSubmit(vk_options.graphicsQueue, 1, &submitInfo, frameFence);
+		if (result != VK_SUCCESS) {
+			Sys_Error("vulkan: vkQueueSubmit failed: %d", result);
+		}
+		if (diagSubmitCount < 10) { Con_Printf("VK_EndFrame: vkQueueSubmit done\n"); ++diagSubmitCount; }
 	}
 #endif
 
@@ -1042,6 +1080,7 @@ void VK_EndFrame(void)
 	// call below -- mirrors the input-stage marker placed near the start
 	// of VK_BeginFrame, correlated by the same antiLagFrameIndex.
 	{
+#if EZQ_HAS_AMD_ANTI_LAG
 		if (vid_vulkan_antilag.integer && vk_options.supportsAmdAntiLag) {
 			VkAntiLagPresentationInfoAMD presentationInfo = { 0 };
 			VkAntiLagDataAMD antiLagData = { 0 };
@@ -1057,6 +1096,9 @@ void VK_EndFrame(void)
 			vk_options.antiLagUpdateAMD(vk_options.logicalDevice, &antiLagData);
 		}
 		else if (vid_vulkan_antilag.integer && vk_options.supportsNvLowLatency2) {
+#else
+		if (vid_vulkan_antilag.integer && vk_options.supportsNvLowLatency2) {
+#endif
 			VkSetLatencyMarkerInfoNV markerInfo = { 0 };
 
 			markerInfo.sType = VK_STRUCTURE_TYPE_SET_LATENCY_MARKER_INFO_NV;
@@ -1078,7 +1120,12 @@ void VK_EndFrame(void)
 		VK_ProfileAccumulate(&presentAccum, "vkQueuePresentKHR", Sys_DoubleTime() - t0);
 	}
 #else
-	result = vkQueuePresentKHR(vk_options.presentQueue, &presentInfo);
+	{
+		static int diagPresentCount = 0;
+		if (diagPresentCount < 10) Con_Printf("VK_EndFrame: vkQueuePresentKHR...\n");
+		result = vkQueuePresentKHR(vk_options.presentQueue, &presentInfo);
+		if (diagPresentCount < 10) { Con_Printf("VK_EndFrame: vkQueuePresentKHR done (result=%d)\n", result); ++diagPresentCount; }
+	}
 #endif
 	if (result == VK_ERROR_OUT_OF_DATE_KHR) {
 		// Only a real error requires recreating the swapchain. SUBOPTIMAL is
@@ -1216,8 +1263,28 @@ qbool VK_Initialise(SDL_Window* window)
 void VK_Shutdown(r_shutdown_mode_t mode)
 {
 	if (mode != r_shutdown_reload) {
+		Con_Printf("vk_shutdown: begin\n");
+#if EZQ_HAS_AMD_ANTI_LAG
+		// VK_AMD_anti_lag requires a final OFF update before the device is
+		// idled/destroyed -- otherwise the driver is left waiting on the next
+		// half of an input/present marker pair that will never arrive, which
+		// was observed to hang vkDeviceWaitIdle below into an AMD driver TDR
+		// (timeout detection/recovery) on vid_restart while antilag was on.
+		if (vk_options.supportsAmdAntiLag && vk_options.logicalDevice != VK_NULL_HANDLE) {
+			VkAntiLagDataAMD antiLagData = { 0 };
+
+			Con_Printf("vk_shutdown: sending AMD anti-lag OFF\n");
+			antiLagData.sType = VK_STRUCTURE_TYPE_ANTI_LAG_DATA_AMD;
+			antiLagData.mode = VK_ANTI_LAG_MODE_OFF_AMD;
+			vk_options.antiLagUpdateAMD(vk_options.logicalDevice, &antiLagData);
+			Con_Printf("vk_shutdown: AMD anti-lag OFF sent\n");
+		}
+#endif
+
 		if (vk_options.logicalDevice != VK_NULL_HANDLE) {
+			Con_Printf("vk_shutdown: vkDeviceWaitIdle...\n");
 			vkDeviceWaitIdle(vk_options.logicalDevice);
+			Con_Printf("vk_shutdown: vkDeviceWaitIdle done\n");
 		}
 
 		VK_HudResourcesShutdown();
@@ -1227,8 +1294,10 @@ void VK_Shutdown(r_shutdown_mode_t mode)
 		VK_TextureShutdown();
 		VK_DestroyImmediateCommandPool();
 		VK_DestroyFrameResources();
+		Con_Printf("vk_shutdown: resources destroyed\n");
 
 		VK_DestroySwapChain();
+		Con_Printf("vk_shutdown: swapchain destroyed\n");
 
 		VK_RenderPassDelete();
 
@@ -1247,6 +1316,7 @@ void VK_Shutdown(r_shutdown_mode_t mode)
 			vkDestroyDevice(vk_options.logicalDevice, NULL);
 			vk_options.logicalDevice = VK_NULL_HANDLE;
 		}
+		Con_Printf("vk_shutdown: device destroyed\n");
 
 		if (vk_options.instance) {
 			VK_DestroyWindowSurface(vk_options.instance, vk_options.surface);
@@ -1255,6 +1325,7 @@ void VK_Shutdown(r_shutdown_mode_t mode)
 		}
 
 		memset(&vk_options, 0, sizeof(vk_options));
+		Con_Printf("vk_shutdown: complete\n");
 	}
 
 	// FIXME

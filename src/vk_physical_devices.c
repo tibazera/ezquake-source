@@ -34,7 +34,12 @@ static const char* requiredDeviceExtensions[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAM
 // Anti-lag / low-latency extensions are optional, vendor-specific, and never
 // disqualify a device when missing -- unlike requiredDeviceExtensions above,
 // where any miss rules the device out entirely.
-static const char* optionalAntiLagExtensions[] = { VK_AMD_ANTI_LAG_EXTENSION_NAME, VK_NV_LOW_LATENCY_2_EXTENSION_NAME };
+static const char* optionalAntiLagExtensions[] = {
+#if EZQ_HAS_AMD_ANTI_LAG
+	VK_AMD_ANTI_LAG_EXTENSION_NAME,
+#endif
+	VK_NV_LOW_LATENCY_2_EXTENSION_NAME
+};
 
 static void VK_PhysicalDeviceQueryQueueFamilies(VkPhysicalDevice device, VkSurfaceKHR surface, int* graphics_queue_index, int* compute_queue_index, int* present_queue_index)
 {
@@ -117,10 +122,13 @@ static void VK_PhysicalDeviceSupportsOptionalExtensions(VkPhysicalDevice device,
 	vkEnumerateDeviceExtensionProperties(device, NULL, &count, properties);
 
 	for (i = 0; i < count; ++i) {
+#if EZQ_HAS_AMD_ANTI_LAG
 		if (!strcmp(properties[i].extensionName, VK_AMD_ANTI_LAG_EXTENSION_NAME)) {
 			*supportsAmdAntiLagExt = true;
 		}
-		else if (!strcmp(properties[i].extensionName, VK_NV_LOW_LATENCY_2_EXTENSION_NAME)) {
+		else
+#endif
+		if (!strcmp(properties[i].extensionName, VK_NV_LOW_LATENCY_2_EXTENSION_NAME)) {
 			*supportsNvLowLatency2 = true;
 		}
 	}
@@ -400,8 +408,10 @@ qbool VK_CreateLogicalDevice(VkInstance instance)
 	VkDeviceQueueCreateInfo queueInfos[2] = { { 0 } };
 	VkDeviceCreateInfo deviceInfo = { 0 };
 	VkPhysicalDeviceFeatures deviceFeatures = { 0 };
+#if EZQ_HAS_AMD_ANTI_LAG
 	VkPhysicalDeviceAntiLagFeaturesAMD antiLagFeatures = { 0 };
 	VkPhysicalDeviceFeatures2 features2 = { 0 };
+#endif
 	float priorities[] = { 1.0f };
 	uint32_t queueCount = 0;
 	const char* enabledExtensions[4];
@@ -437,6 +447,7 @@ qbool VK_CreateLogicalDevice(VkInstance instance)
 	}
 
 	vk_options.supportsAmdAntiLag = false;
+#if EZQ_HAS_AMD_ANTI_LAG
 	if (amdAntiLagExtPresent) {
 		// VK_AMD_anti_lag also gates itself behind a pNext feature bit --
 		// the extension being present in vkEnumerateDeviceExtensionProperties
@@ -452,6 +463,9 @@ qbool VK_CreateLogicalDevice(VkInstance instance)
 			enabledExtensions[enabledExtensionCount++] = VK_AMD_ANTI_LAG_EXTENSION_NAME;
 		}
 	}
+#else
+	(void)amdAntiLagExtPresent;
+#endif
 
 	vk_options.supportsNvLowLatency2 = nvLowLatency2Present;
 	if (nvLowLatency2Present) {
@@ -477,6 +491,7 @@ qbool VK_CreateLogicalDevice(VkInstance instance)
 	deviceInfo.queueCreateInfoCount = queueCount;
 	deviceInfo.pEnabledFeatures = &deviceFeatures;
 
+#if EZQ_HAS_AMD_ANTI_LAG
 	if (vk_options.supportsAmdAntiLag) {
 		// Re-using antiLagFeatures (already populated above) to actually
 		// request the feature be enabled on the logical device, same struct
@@ -484,6 +499,7 @@ qbool VK_CreateLogicalDevice(VkInstance instance)
 		antiLagFeatures.pNext = NULL;
 		deviceInfo.pNext = &antiLagFeatures;
 	}
+#endif
 
 	deviceInfo.enabledExtensionCount = enabledExtensionCount;
 	deviceInfo.ppEnabledExtensionNames = enabledExtensions;
@@ -507,16 +523,19 @@ qbool VK_CreateLogicalDevice(VkInstance instance)
 		vk_options.presentQueue = vk_options.graphicsQueue;
 	}
 
+#if EZQ_HAS_AMD_ANTI_LAG
 	if (vk_options.supportsAmdAntiLag) {
 		vk_options.antiLagUpdateAMD = (PFN_vkAntiLagUpdateAMD)vkGetDeviceProcAddr(vk_options.logicalDevice, "vkAntiLagUpdateAMD");
 		vk_options.supportsAmdAntiLag = (vk_options.antiLagUpdateAMD != NULL);
 	}
+#endif
 
 	if (vk_options.supportsNvLowLatency2) {
 		vk_options.setLatencySleepModeNV = (PFN_vkSetLatencySleepModeNV)vkGetDeviceProcAddr(vk_options.logicalDevice, "vkSetLatencySleepModeNV");
 		vk_options.latencySleepNV = (PFN_vkLatencySleepNV)vkGetDeviceProcAddr(vk_options.logicalDevice, "vkLatencySleepNV");
 		vk_options.setLatencyMarkerNV = (PFN_vkSetLatencyMarkerNV)vkGetDeviceProcAddr(vk_options.logicalDevice, "vkSetLatencyMarkerNV");
-		vk_options.supportsNvLowLatency2 = (vk_options.setLatencySleepModeNV && vk_options.latencySleepNV && vk_options.setLatencyMarkerNV);
+		vk_options.waitSemaphores = (PFN_vkWaitSemaphores)vkGetDeviceProcAddr(vk_options.logicalDevice, "vkWaitSemaphores");
+		vk_options.supportsNvLowLatency2 = (vk_options.setLatencySleepModeNV && vk_options.latencySleepNV && vk_options.setLatencyMarkerNV && vk_options.waitSemaphores);
 
 		if (vk_options.supportsNvLowLatency2) {
 			// vkLatencySleepNV signals via signalSemaphore/value, which the

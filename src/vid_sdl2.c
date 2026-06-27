@@ -2042,16 +2042,21 @@ static void VID_Restart_f(void)
 		return;
 	}
 
+	Con_Printf("vid_restart: VID_Shutdown...\n");
 	VID_Shutdown(true);
+	Con_Printf("vid_restart: VID_Shutdown done\n");
 
 	ReloadPaletteAndColormap();
 
 	// keys can get stuck because SDL2 doesn't send keyup event when the video system is down
 	Key_ClearStates();
 
+	Con_Printf("vid_restart: VID_Init...\n");
 	VID_Init(host_basepal);
+	Con_Printf("vid_restart: VID_Init done, VID_Startup...\n");
 
 	VID_Startup();
+	Con_Printf("vid_restart: VID_Startup done\n");
 }
 
 static void VID_DisplayList_f(void)

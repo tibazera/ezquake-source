@@ -676,6 +676,11 @@ void VK_UploadTexture(texture_ref texture, int mode, int width, int height, byte
 		return;
 	}
 
+	if (width <= 4 && height <= 4) {
+		Con_Printf("VK_UploadTexture: slot=%d tiny %dx%d mode=%d name=%s\n", texture.index, width, height, mode,
+			(texture.index >= 0 && texture.index < MAX_GLTEXTURES) ? gltextures[texture.index].identifier : "?");
+	}
+
 	// Real mip chain, CPU box-filtered like vkQuake/FTEQW (see
 	// VK_TextureQueuePendingMipmapUpload) -- only for textures that actually
 	// asked for mipmap filtering (world surfaces, models, ...). 2D/HUD/font
