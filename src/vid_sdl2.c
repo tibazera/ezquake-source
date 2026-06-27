@@ -1309,6 +1309,14 @@ SDL_DisplayID VID_SDL_DisplayID(qbool fullscreen)
 
 static void VID_SetupModeList(void)
 {
+#ifdef __ANDROID__
+	// The Android activity surface has no concept of selectable fullscreen
+	// display modes -- it's always exactly one size, set by the system. Skip
+	// the desktop multi-mode-list query entirely instead of letting it fail
+	// with a harmless but noisy "error getting display modes" every restart.
+	Q_free(modelist);
+	modelist_count = 0;
+#else
 	int i;
 	SDL_DisplayMode **modes = SDL_GetFullscreenDisplayModes(VID_SDL_DisplayID(r_fullscreen.integer == 1), &modelist_count);
 
@@ -1323,6 +1331,7 @@ static void VID_SetupModeList(void)
 		modelist[i] = *modes[i];
 	}
 	SDL_free(modes);
+#endif
 }
 
 static void VID_SetupResolution(void)
@@ -1540,6 +1549,14 @@ static SDL_Window *VID_SDL_CreateWindow(int flags)
 
 static void VID_SetWindowResolution(void)
 {
+#ifdef __ANDROID__
+	// The Android activity window is always fullscreen at the system's native
+	// surface size -- there's no separate "switch to fullscreen" step like on
+	// desktop, and calling SDL_SetWindowFullscreen here was observed to fail
+	// with a harmless "Invalid window" SDL error during vid_restart.
+	SDL_SetWindowMinimumSize(sdl_window, 320, 240);
+	return;
+#endif
 	if (r_fullscreen.integer > 0 && vid_usedesktopres.integer != 1) {
 		int index = VID_GetCurrentModeIndex();
 
@@ -2042,21 +2059,15 @@ static void VID_Restart_f(void)
 		return;
 	}
 
-	Con_Printf("vid_restart: VID_Shutdown...\n");
 	VID_Shutdown(true);
-	Con_Printf("vid_restart: VID_Shutdown done\n");
 
 	ReloadPaletteAndColormap();
 
 	// keys can get stuck because SDL2 doesn't send keyup event when the video system is down
 	Key_ClearStates();
 
-	Con_Printf("vid_restart: VID_Init...\n");
 	VID_Init(host_basepal);
-	Con_Printf("vid_restart: VID_Init done, VID_Startup...\n");
-
 	VID_Startup();
-	Con_Printf("vid_restart: VID_Startup done\n");
 }
 
 static void VID_DisplayList_f(void)
