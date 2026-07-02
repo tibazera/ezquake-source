@@ -1177,6 +1177,10 @@ void VK_HudResourcesShutdown(void)
 		vkDestroyPipeline(vk_options.logicalDevice, hudCircleLinePipeline, NULL);
 		hudCircleLinePipeline = VK_NULL_HANDLE;
 	}
+	if (hudBrightenPipeline != VK_NULL_HANDLE) {
+		vkDestroyPipeline(vk_options.logicalDevice, hudBrightenPipeline, NULL);
+		hudBrightenPipeline = VK_NULL_HANDLE;
+	}
 	if (hudImagePipelineLayout != VK_NULL_HANDLE) {
 		vkDestroyPipelineLayout(vk_options.logicalDevice, hudImagePipelineLayout, NULL);
 		hudImagePipelineLayout = VK_NULL_HANDLE;
