@@ -48,6 +48,7 @@ struct model_s;
 // vk_main.c
 qbool VK_Initialise(SDL_Window* window);
 void VK_Shutdown(r_shutdown_mode_t mode);
+void VK_AbandonActiveFrame(void);
 void VK_PopulateConfig(void);
 void VK_RequestSwapChainRecreate(void);
 void VK_RequestSurfaceRecreate(void);

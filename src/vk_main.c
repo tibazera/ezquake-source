@@ -1235,8 +1235,36 @@ qbool VK_Initialise(SDL_Window* window)
 	return true;
 }
 
+// vid_restart can run mid-frame: the console command is processed from
+// Cbuf_Execute() inside the same Host_Frame() that already called
+// VK_BeginFrame() for this frame (world/HUD draw calls recorded commands
+// into it), with VK_EndFrame() not reached yet because the restart itself
+// is what's running right now. That leaves the frame's command buffer in
+// the "recording" state, still referencing this frame's descriptor
+// sets/pipeline, when VK_Shutdown() goes on to destroy exactly those
+// resources. Nothing was ever submitted to the GPU, so vkDeviceWaitIdle
+// has nothing to wait for and doesn't protect this -- validation layers
+// (VK_LAYER_KHRONOS_validation) confirmed this exact sequence on desktop:
+// repeated "commandBuffer must be in the recording state" / "VkDescriptorSet
+// was destroyed" errors immediately after a vid_restart, then an invalid
+// VkPipeline handle on the next vkCmdBindPipeline. Ending the command
+// buffer (without submitting it -- there's nothing valid left to present)
+// before any of that teardown starts takes it out of the recording state
+// cleanly, so the pool/device/instance destruction below has nothing left
+// referencing torn-down objects.
+void VK_AbandonActiveFrame(void)
+{
+	if (vk_options.frame.active && vk_options.frame.commandBuffers) {
+		VkCommandBuffer commandBuffer = vk_options.frame.commandBuffers[vk_options.frame.imageIndex];
+
+		vkEndCommandBuffer(commandBuffer);
+		vk_options.frame.active = false;
+	}
+}
+
 void VK_Shutdown(r_shutdown_mode_t mode)
 {
+	VK_AbandonActiveFrame();
 	if (mode != r_shutdown_reload) {
 #if EZQ_HAS_AMD_ANTI_LAG
 		// VK_AMD_anti_lag requires a final OFF update before the device is
