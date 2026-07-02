@@ -259,6 +259,7 @@ qbool VK_SelectPhysicalDevice(VkInstance instance, VkSurfaceKHR surface)
 	physicalDevices = Q_malloc(deviceCount * sizeof(VkPhysicalDevice));
 	result = vkEnumeratePhysicalDevices(instance, &deviceCount, physicalDevices);
 	if (result != VK_SUCCESS) {
+		Con_Printf("vulkan: enumerating physical devices failed: %d\n", result);
 		Q_free(physicalDevices);
 		return false;
 	}
@@ -280,26 +281,31 @@ qbool VK_SelectPhysicalDevice(VkInstance instance, VkSurfaceKHR surface)
 		Con_Printf("Device %d: %s\n", i, properties.deviceName);
 
 		if (!VK_PhysicalDeviceSupportsRequiredExtensions(physicalDevices[i])) {
+			Com_Printf("Device %d: %s - rejected, missing required extension(s) (VK_KHR_swapchain)\n", i, properties.deviceName);
 			continue;
 		}
 
 		// Must support graphics queues
 		VK_PhysicalDeviceQueryQueueFamilies(physicalDevices[i], surface, &graphics_queue_index, &compute_queue_index, &present_queue_index);
 		if (graphics_queue_index < 0) {
+			Com_Printf("Device %d: %s - rejected, no graphics-capable queue family\n", i, properties.deviceName);
 			continue;
 		}
 		if (compute_queue_index < 0) {
 			compute_queue_index = graphics_queue_index;
 		}
 		if (present_queue_index < 0) {
+			Com_Printf("Device %d: %s - rejected, no queue family can present to this surface\n", i, properties.deviceName);
 			continue;
 		}
 
 		if (!VK_PhysicalDeviceSwapChainCompatible(physicalDevices[i], surface, &preferred_format, &capabilities)) {
+			Com_Printf("Device %d: %s - rejected, incompatible swapchain/surface (capabilities or formats query failed)\n", i, properties.deviceName);
 			continue;
 		}
 
 		if (!VK_PhysicalDeviceBestPresentationMode(physicalDevices[i], surface, &best_presentation_mode)) {
+			Com_Printf("Device %d: %s - rejected, failed to query present modes\n", i, properties.deviceName);
 			continue;
 		}
 
@@ -572,20 +578,53 @@ qbool VK_CreateLogicalDevice(VkInstance instance)
 
 #define VK_PIPELINE_CACHE_FILE "vulkan/pipeline_cache.bin"
 
+// VkPipelineCacheHeaderVersionOne, the layout of the first bytes of any
+// pipeline cache blob (Vulkan spec 10.9, "Pipeline Cache"). Not exposed as a
+// struct by the headers this project builds against, so laid out by hand
+// here purely to validate a blob before ever handing it to the driver.
+#pragma pack(push, 1)
+typedef struct {
+	uint32_t headerSize;
+	uint32_t headerVersion;
+	uint32_t vendorID;
+	uint32_t deviceID;
+	uint8_t  pipelineCacheUUID[VK_UUID_SIZE];
+} vk_pipeline_cache_header_t;
+#pragma pack(pop)
+
 // Loads a previously saved driver pipeline cache blob, if any, so
 // vkCreateGraphicsPipelines() at the various call sites can skip re-compiling
 // shaders/pipelines it has already seen on this GPU+driver. A missing, empty,
 // or driver-rejected (stale/foreign) blob is not an error: VkPipelineCache is
 // purely an optimization hint, and vkCreatePipelineCache() with no/garbage
 // initial data still returns a valid, usable (just initially empty) cache.
+//
+// The header is still checked by hand before that, rather than trusting the
+// driver to reject a mismatched blob cleanly: this file's on-disk cache can
+// span multiple ezquake builds/driver updates/GPU swaps over its lifetime,
+// and hasn't been proven safe to hand a blob from a different GPU/driver to
+// vkCreatePipelineCache() on every driver this project supports -- cheaper to
+// just not pass it through at all when the header doesn't match this device.
 void VK_LoadPipelineCache(void)
 {
 	VkPipelineCacheCreateInfo cacheInfo = { 0 };
 	int cacheLen = 0;
 	byte* cacheData = FS_LoadHeapFile(VK_PIPELINE_CACHE_FILE, &cacheLen);
+	qbool headerValid = false;
+
+	if (cacheData && (size_t)cacheLen >= sizeof(vk_pipeline_cache_header_t)) {
+		vk_pipeline_cache_header_t* header = (vk_pipeline_cache_header_t*)cacheData;
+
+		headerValid = (
+			header->headerVersion == VK_PIPELINE_CACHE_HEADER_VERSION_ONE &&
+			header->vendorID == vk_options.physicalDeviceProperties.vendorID &&
+			header->deviceID == vk_options.physicalDeviceProperties.deviceID &&
+			memcmp(header->pipelineCacheUUID, vk_options.physicalDeviceProperties.pipelineCacheUUID, VK_UUID_SIZE) == 0
+		);
+	}
 
 	cacheInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
-	if (cacheData && cacheLen > 0) {
+	if (headerValid) {
 		cacheInfo.initialDataSize = (size_t)cacheLen;
 		cacheInfo.pInitialData = cacheData;
 	}
