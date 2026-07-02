@@ -92,8 +92,42 @@ static cvar_t in_ignore_deadkeys = { "in_ignore_deadkeys", "1", CVAR_SILENT };
 
 #define	WINDOW_CLASS_NAME	"ezQuake"
 
-#define VID_RENDERER_MIN 0
-#define VID_RENDERER_MAX 2
+// Membership check, not a min/max range: the compiled-in renderer ids are not
+// necessarily contiguous (e.g. classic + vulkan without modern), so a simple
+// range like "0 <= x <= 2" would wrongly accept an id whose renderer isn't
+// actually compiled into this build. On this Android build only Vulkan (id 2)
+// is ever compiled in.
+static qbool VID_RendererValid(int value)
+{
+	switch (value) {
+#ifdef RENDERER_OPTION_CLASSIC_OPENGL
+		case 0: return true;
+#endif
+#ifdef RENDERER_OPTION_MODERN_OPENGL
+		case 1: return true;
+#endif
+#ifdef RENDERER_OPTION_VULKAN
+		case 2: return true;
+#endif
+		default: return false;
+	}
+}
+
+// Default renderer id to fall back to when nothing has ever worked yet
+// (s_lastWorkingRenderer == -1) and the current vid_renderer value is
+// invalid. Picks whichever renderer is actually compiled into this build,
+// preferring classic > modern > vulkan to match the desktop build's
+// historical default; on this Android build only Vulkan is compiled in, so
+// this always resolves to 2.
+#ifdef RENDERER_OPTION_CLASSIC_OPENGL
+#define VID_RENDERER_DEFAULT 0
+#elif defined(RENDERER_OPTION_MODERN_OPENGL)
+#define VID_RENDERER_DEFAULT 1
+#elif defined(RENDERER_OPTION_VULKAN)
+#define VID_RENDERER_DEFAULT 2
+#else
+#define VID_RENDERER_DEFAULT 0
+#endif
 
 #define VID_MULTISAMPLED   1
 #define VID_ACCELERATED    2
@@ -149,6 +183,14 @@ static int last_working_height;
 static int last_working_hz;
 static int last_working_display;
 static qbool last_working_values = false;
+
+// Renderer that last completed VID_SDL_Init() successfully, so a failed
+// vid_renderer switch can fall back to what actually worked before instead of
+// forcing a fixed index. -1 means "not known yet". This build only compiles
+// Vulkan in, so in practice this only ever holds 2 or -1, but the mechanism
+// is kept generic (matches the desktop build, which can have classic/modern
+// GL too) rather than hardcoding assumptions about which renderers exist.
+static int s_lastWorkingRenderer = -1;
 
 // deferred events (Sys_SendDeferredKeyEvents)
 static qbool wheelup_deferred = false;
@@ -1459,16 +1501,21 @@ static void VID_SDL_GL_SetupWindowAttributes(int options)
 
 static SDL_GLContext VID_SDL_GL_SetupContextAttributes(void)
 {
-#ifdef EZ_MULTIPLE_RENDERERS
-	if (vid_renderer.integer < VID_RENDERER_MIN || vid_renderer.integer > VID_RENDERER_MAX) {
-#ifdef RENDERER_OPTION_CLASSIC_OPENGL
-		Con_Printf("Invalid vid_renderer value detected, falling back to default.\n");
-		Cvar_LatchedSetValue(&vid_renderer, VID_RENDERER_MIN);
-#else
-		Sys_Error("Invalid vid_renderer value detected");
-#endif
+	if (!VID_RendererValid(vid_renderer.integer)) {
+		// Prefer falling back to whatever renderer last actually worked on this
+		// device/build rather than a fixed index -- on this Android build the
+		// only renderer ever compiled in is Vulkan (id 2), so s_lastWorkingRenderer
+		// will either be 2 or still -1 (never initialised yet).
+		int fallback_renderer = (s_lastWorkingRenderer >= 0) ? s_lastWorkingRenderer : VID_RENDERER_DEFAULT;
+
+		if (VID_RendererValid(fallback_renderer)) {
+			Con_Printf("Invalid vid_renderer value detected, falling back to renderer %d.\n", fallback_renderer);
+			Cvar_LatchedSetValue(&vid_renderer, fallback_renderer);
+		}
+		else {
+			Sys_Error("Invalid vid_renderer value detected");
+		}
 	}
-#endif
 
 #ifdef RENDERER_OPTION_MODERN_OPENGL
 	if (R_UseModernOpenGL()) {
@@ -1696,15 +1743,17 @@ static void VID_SDL_Init(void)
 				}
 			}
 
-#if defined(RENDERER_OPTION_CLASSIC_OPENGL) && defined(EZ_MULTIPLE_RENDERERS)
-			// FIXME: Implement falling back from Vulkan too
-			if (!sdl_window && !R_UseImmediateOpenGL()) {
-				Con_Printf("&cf00Error&r: failed to create rendering context, trying classic OpenGL...\n");
+			// Prefer falling back to whatever renderer last actually worked on
+			// this device rather than a fixed index -- on this Android build
+			// the only renderer ever compiled in is Vulkan, so there is
+			// nothing else to retry with once s_lastWorkingRenderer is either
+			// unset or equal to the renderer that just failed.
+			if (!sdl_window && s_lastWorkingRenderer >= 0 && s_lastWorkingRenderer != vid_renderer.integer) {
+				Con_Printf("&cf00Error&r: failed to create rendering context, trying renderer %d...\n", s_lastWorkingRenderer);
 
-				Cvar_LatchedSetValue(&vid_renderer, 0);
+				Cvar_LatchedSetValue(&vid_renderer, s_lastWorkingRenderer);
 				continue;
 			}
-#endif
 
 			break;
 		}
@@ -1712,6 +1761,8 @@ static void VID_SDL_Init(void)
 		if (!sdl_window) {
 			Sys_Error("Failed to create SDL window/context: %s\n", SDL_GetError());
 		}
+
+		s_lastWorkingRenderer = vid_renderer.integer;
 
 		// Alert user if our mode doesn't match what they requested
 		if (!(vid_options[i] & VID_MULTISAMPLED) && gl_multisamples.integer > 0) {
