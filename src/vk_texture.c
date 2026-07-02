@@ -28,8 +28,8 @@ typedef struct vk_texture_s {
 	VkImage image;
 	VkDeviceMemory memory;
 	VkImageView imageView;
-	VkSampler linearSampler;
-	VkSampler nearestSampler;
+	VkSampler modeSampler;
+	VkSampler forcedNearestSampler;
 	VkDescriptorSet descriptorSet;
 	VkImageLayout layout;
 	byte* pixels;
@@ -283,12 +283,11 @@ static void VK_TextureDestroyObjects(texture_ref texture)
 	if (vktex->descriptorSet != VK_NULL_HANDLE && textureDescriptorPool != VK_NULL_HANDLE) {
 		vkFreeDescriptorSets(vk_options.logicalDevice, textureDescriptorPool, 1, &vktex->descriptorSet);
 	}
-	if (vktex->linearSampler != VK_NULL_HANDLE) {
-		vkDestroySampler(vk_options.logicalDevice, vktex->linearSampler, NULL);
-	}
-	if (vktex->nearestSampler != VK_NULL_HANDLE) {
-		vkDestroySampler(vk_options.logicalDevice, vktex->nearestSampler, NULL);
-	}
+	// modeSampler/forcedNearestSampler are borrowed references into the shared
+	// samplerCache (see VK_TextureCachedSampler) -- the cache owns them, not
+	// this texture, so they're cleared (by the memset below) but not
+	// destroyed here. Destroyed once at full shutdown by
+	// VK_TextureSamplerCacheShutdown instead.
 	if (vktex->imageView != VK_NULL_HANDLE) {
 		vkDestroyImageView(vk_options.logicalDevice, vktex->imageView, NULL);
 	}
@@ -351,49 +350,150 @@ static qbool VK_TextureEnsureInfrastructure(void)
 	return true;
 }
 
-static qbool VK_TextureCreateSampler(vk_texture_t* vktex, VkFilter filter, VkSampler* sampler)
+// Samplers bake filter/clamp/anisotropy in at creation time (can't be edited
+// in place), but nearly every texture shares one of a handful of
+// combinations -- the same global gl_anisotropy level, one of the 6 GL
+// min-filter/mipmap combos, linear or nearest magnification, clamped or
+// repeat. Caching by that combination instead of giving every texture its
+// own sampler objects means switching anisotropy, gl_texturemode or wrap
+// mode is just a lookup, not a destroy+recreate+vkDeviceWaitIdle -- which
+// matters because filtering and anisotropy are both applied right after
+// every single texture load (R_TextureUtil_SetFiltering), so a per-texture
+// recreate would mean a full GPU drain per texture during map load, the
+// same class of stall VK_TextureQueuePendingUpload's batching elsewhere was
+// written to avoid. On top of that, destroying a texture's own sampler
+// immediately (the old per-texture approach) while frames-in-flight may
+// still reference it via a bound descriptor set is a use-after-free on the
+// GPU -- sharing via this cache and only destroying it all at once in
+// VK_TextureSamplerCacheShutdown removes that hazard entirely.
+#define VK_SAMPLER_CACHE_ANISOTROPY_LEVELS 17 /* 0-16 */
+#define VK_SAMPLER_CACHE_SIZE (2 /* minFilter */ * 2 /* magFilter */ * 2 /* mipmapMode */ * 2 /* clamp */ * VK_SAMPLER_CACHE_ANISOTROPY_LEVELS)
+static VkSampler samplerCache[VK_SAMPLER_CACHE_SIZE];
+static qbool samplerCacheValid[VK_SAMPLER_CACHE_SIZE];
+
+static int VK_SamplerCacheIndex(VkFilter minFilter, VkFilter magFilter, VkSamplerMipmapMode mipmapMode, qbool clamp, int anisotropy)
 {
-	VkSamplerCreateInfo samplerInfo;
+	int minIdx = (minFilter == VK_FILTER_LINEAR) ? 0 : 1;
+	int magIdx = (magFilter == VK_FILTER_LINEAR) ? 0 : 1;
+	int mipIdx = (mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR) ? 0 : 1;
+	int clampIdx = clamp ? 1 : 0;
+	int anisoIdx = bound(0, anisotropy, VK_SAMPLER_CACHE_ANISOTROPY_LEVELS - 1);
 
-	VK_InitialiseStructure(samplerInfo);
-	samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-	samplerInfo.magFilter = filter;
-	samplerInfo.minFilter = filter;
-	samplerInfo.addressModeU = vktex->clamp ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_REPEAT;
-	samplerInfo.addressModeV = samplerInfo.addressModeU;
-	samplerInfo.addressModeW = samplerInfo.addressModeU;
-	// gl_anisotropy stores 1 for "off"; only request the feature if the
-	// device actually reported samplerAnisotropy support at device creation
-	// (VK_CreateLogicalDevice only enables it when the feature is present).
-	if (vk_options.physicalDeviceFeatures.samplerAnisotropy && vktex->anisotropy > 1) {
-		samplerInfo.anisotropyEnable = VK_TRUE;
-		samplerInfo.maxAnisotropy = min((float)vktex->anisotropy, vk_options.physicalDeviceProperties.limits.maxSamplerAnisotropy);
-	}
-	else {
-		samplerInfo.anisotropyEnable = VK_FALSE;
-		samplerInfo.maxAnisotropy = 1.0f;
-	}
-	samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
-	samplerInfo.unnormalizedCoordinates = VK_FALSE;
-	samplerInfo.compareEnable = VK_FALSE;
-	samplerInfo.compareOp = VK_COMPARE_OP_ALWAYS;
-	samplerInfo.mipmapMode = (filter == VK_FILTER_LINEAR) ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
-	samplerInfo.minLod = 0.0f;
-	// vktex->mipLevels is 1 for textures with no generated mip chain (matches
-	// the old hardcoded 0.0f -- the image only has level 0 either way), and
-	// the real level count otherwise so the sampler can actually select
-	// between them instead of being pinned to level 0.
-	samplerInfo.maxLod = (float)(max(1, vktex->mipLevels) - 1);
+	return (((minIdx * 2 + magIdx) * 2 + mipIdx) * 2 + clampIdx) * VK_SAMPLER_CACHE_ANISOTROPY_LEVELS + anisoIdx;
+}
 
-	return vkCreateSampler(vk_options.logicalDevice, &samplerInfo, NULL, sampler) == VK_SUCCESS;
+static VkSampler VK_TextureCachedSampler(VkFilter minFilter, VkFilter magFilter, VkSamplerMipmapMode mipmapMode, qbool clamp, int anisotropy)
+{
+	int index = VK_SamplerCacheIndex(minFilter, magFilter, mipmapMode, clamp, anisotropy);
+
+	if (!samplerCacheValid[index]) {
+		VkSamplerCreateInfo samplerInfo;
+
+		VK_InitialiseStructure(samplerInfo);
+		samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+		samplerInfo.magFilter = magFilter;
+		samplerInfo.minFilter = minFilter;
+		samplerInfo.addressModeU = clamp ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_REPEAT;
+		samplerInfo.addressModeV = samplerInfo.addressModeU;
+		samplerInfo.addressModeW = samplerInfo.addressModeU;
+		// gl_anisotropy stores 1 for "off"; only request the feature if the
+		// device actually reported samplerAnisotropy support at device creation
+		// (VK_CreateLogicalDevice only enables it when the feature is present).
+		samplerInfo.anisotropyEnable = (anisotropy > 1 && vk_options.physicalDeviceFeatures.samplerAnisotropy) ? VK_TRUE : VK_FALSE;
+		samplerInfo.maxAnisotropy = samplerInfo.anisotropyEnable
+			? min((float)anisotropy, vk_options.physicalDeviceProperties.limits.maxSamplerAnisotropy)
+			: 1.0f;
+		samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+		samplerInfo.unnormalizedCoordinates = VK_FALSE;
+		samplerInfo.compareEnable = VK_FALSE;
+		samplerInfo.compareOp = VK_COMPARE_OP_ALWAYS;
+		samplerInfo.mipmapMode = mipmapMode;
+		samplerInfo.minLod = 0.0f;
+		// VK_LOD_CLAMP_NONE instead of a fixed value: this sampler is shared
+		// across every texture with this (filter, clamp, anisotropy) combo,
+		// and they don't all have the same mip count. Each texture's own
+		// image view subresourceRange.levelCount (set from vktex->mipLevels)
+		// is what actually limits which levels are sampled; the sampler just
+		// needs to not clamp below that.
+		samplerInfo.maxLod = VK_LOD_CLAMP_NONE;
+
+		if (vkCreateSampler(vk_options.logicalDevice, &samplerInfo, NULL, &samplerCache[index]) != VK_SUCCESS) {
+			return VK_NULL_HANDLE;
+		}
+		samplerCacheValid[index] = true;
+	}
+	return samplerCache[index];
+}
+
+// texture_minification_id packs both the base filter and the inter-mip blend
+// mode (GL_*_MIPMAP_* has no Vulkan equivalent enum, hence the split out
+// param); texture_magnification_id only ever carries NEAREST or LINEAR, GL
+// has no magnification-mipmap combination.
+static void VK_FilterFromMinification(texture_minification_id id, VkFilter* filter, VkSamplerMipmapMode* mipmapMode)
+{
+	switch (id) {
+		case texture_minification_nearest:
+			*filter = VK_FILTER_NEAREST;
+			*mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+			break;
+		case texture_minification_nearest_mipmap_nearest:
+			*filter = VK_FILTER_NEAREST;
+			*mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+			break;
+		case texture_minification_nearest_mipmap_linear:
+			*filter = VK_FILTER_NEAREST;
+			*mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+			break;
+		case texture_minification_linear_mipmap_nearest:
+			*filter = VK_FILTER_LINEAR;
+			*mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+			break;
+		case texture_minification_linear_mipmap_linear:
+			*filter = VK_FILTER_LINEAR;
+			*mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+			break;
+		case texture_minification_linear:
+		default:
+			*filter = VK_FILTER_LINEAR;
+			*mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+			break;
+	}
+}
+
+static VkFilter VK_FilterFromMagnification(texture_magnification_id id)
+{
+	return (id == texture_magnification_nearest) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
+}
+
+static void VK_TextureSamplerCacheShutdown(void)
+{
+	int i;
+
+	for (i = 0; i < VK_SAMPLER_CACHE_SIZE; ++i) {
+		if (samplerCacheValid[i]) {
+			vkDestroySampler(vk_options.logicalDevice, samplerCache[i], NULL);
+			samplerCache[i] = VK_NULL_HANDLE;
+			samplerCacheValid[i] = false;
+		}
+	}
 }
 
 static qbool VK_TextureEnsureSamplers(vk_texture_t* vktex)
 {
-	if (vktex->linearSampler == VK_NULL_HANDLE && !VK_TextureCreateSampler(vktex, VK_FILTER_LINEAR, &vktex->linearSampler)) {
-		return false;
-	}
-	if (vktex->nearestSampler == VK_NULL_HANDLE && !VK_TextureCreateSampler(vktex, VK_FILTER_NEAREST, &vktex->nearestSampler)) {
+	VkFilter minFilter, magFilter;
+	VkSamplerMipmapMode mipmapMode;
+
+	VK_FilterFromMinification(vktex->minFilter, &minFilter, &mipmapMode);
+	magFilter = VK_FilterFromMagnification(vktex->magFilter);
+
+	// modeSampler actually reflects this texture's gl_texturemode-driven
+	// filter/mipmap settings; forcedNearestSampler is a fixed pixel-perfect
+	// override slot some draws (HUD icons, crosshair) explicitly opt into via
+	// VK_TextureDescriptorImageInfo's nearest param, independent of
+	// gl_texturemode.
+	vktex->modeSampler = VK_TextureCachedSampler(minFilter, magFilter, mipmapMode, vktex->clamp, vktex->anisotropy);
+	vktex->forcedNearestSampler = VK_TextureCachedSampler(VK_FILTER_NEAREST, VK_FILTER_NEAREST, VK_SAMPLER_MIPMAP_MODE_NEAREST, vktex->clamp, 1);
+	if (vktex->modeSampler == VK_NULL_HANDLE || vktex->forcedNearestSampler == VK_NULL_HANDLE) {
 		return false;
 	}
 	return true;
@@ -449,12 +549,12 @@ static qbool VK_TextureUpdateDescriptor(texture_ref texture)
 	VK_InitialiseStructure(imageInfos[0]);
 	imageInfos[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 	imageInfos[0].imageView = vktex->imageView;
-	imageInfos[0].sampler = vktex->linearSampler;
+	imageInfos[0].sampler = vktex->modeSampler;
 
 	VK_InitialiseStructure(imageInfos[1]);
 	imageInfos[1].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 	imageInfos[1].imageView = vktex->imageView;
-	imageInfos[1].sampler = vktex->nearestSampler;
+	imageInfos[1].sampler = vktex->forcedNearestSampler;
 
 	VK_InitialiseStructure(descriptorWrite);
 	descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -811,7 +911,7 @@ qbool VK_TextureDescriptorImageInfo(texture_ref texture, qbool nearest, VkDescri
 	VK_InitialiseStructure(*info);
 	info->imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 	info->imageView = vktex->imageView;
-	info->sampler = nearest ? vktex->nearestSampler : vktex->linearSampler;
+	info->sampler = nearest ? vktex->forcedNearestSampler : vktex->modeSampler;
 	return info->sampler != VK_NULL_HANDLE;
 }
 
@@ -866,6 +966,8 @@ void VK_TextureShutdown(void)
 		VK_TextureDestroyObjects(ref);
 	}
 
+	VK_TextureSamplerCacheShutdown();
+
 	if (textureDescriptorPool != VK_NULL_HANDLE) {
 		vkDestroyDescriptorPool(vk_options.logicalDevice, textureDescriptorPool, NULL);
 		textureDescriptorPool = VK_NULL_HANDLE;
@@ -899,14 +1001,10 @@ void VK_TextureWrapModeClamp(texture_ref texture)
 	}
 	vktex = &textureData[texture.index];
 	vktex->clamp = true;
-	if (vktex->linearSampler != VK_NULL_HANDLE) {
-		vkDestroySampler(vk_options.logicalDevice, vktex->linearSampler, NULL);
-		vktex->linearSampler = VK_NULL_HANDLE;
-	}
-	if (vktex->nearestSampler != VK_NULL_HANDLE) {
-		vkDestroySampler(vk_options.logicalDevice, vktex->nearestSampler, NULL);
-		vktex->nearestSampler = VK_NULL_HANDLE;
-	}
+	// No destroy needed: VK_TextureEnsureSamplers re-resolves both samplers
+	// from samplerCache on every call, including picking up the new clamp
+	// mode, since it's keyed by (filter, clamp, anisotropy) rather than
+	// owning a sampler outright.
 	VK_TextureUpdateDescriptor(texture);
 }
 
@@ -1191,18 +1289,10 @@ void VK_TextureSetAnisotropy(texture_ref texture, int anisotropy)
 		return;
 	}
 	vktex->anisotropy = anisotropy;
-	// Samplers are immutable once created, so a changed anisotropy level
-	// means destroying the cached ones and letting VK_TextureUpdateDescriptor
-	// recreate them lazily via VK_TextureEnsureSamplers, same as
-	// VK_TextureWrapModeClamp does for the clamp/repeat address mode.
-	if (vktex->linearSampler != VK_NULL_HANDLE) {
-		vkDestroySampler(vk_options.logicalDevice, vktex->linearSampler, NULL);
-		vktex->linearSampler = VK_NULL_HANDLE;
-	}
-	if (vktex->nearestSampler != VK_NULL_HANDLE) {
-		vkDestroySampler(vk_options.logicalDevice, vktex->nearestSampler, NULL);
-		vktex->nearestSampler = VK_NULL_HANDLE;
-	}
+
+	// No destroy/recreate (and no vkDeviceWaitIdle) needed here: see
+	// VK_TextureCachedSampler -- this just switches which cached sampler
+	// VK_TextureEnsureSamplers resolves to next.
 	VK_TextureUpdateDescriptor(texture);
 }
 
