@@ -150,7 +150,7 @@ static void GFXPresetExec(const char *cfg)
 {
 	cvar_t *vid_reload_auto = Cvar_Find("vid_reload_auto");
 	int restore_vid_reload_auto = vid_reload_auto ? vid_reload_auto->integer : 1;
-	qbool reload_after_preset = !R_UseVulkan();
+	qbool use_vulkan = R_UseVulkan();
 
 	/*
 	 * The gfx preset cfgs touch several CVAR_RELOAD_GFX variables. If
@@ -160,16 +160,19 @@ static void GFXPresetExec(const char *cfg)
 	 * and crash when cycling away from eyecandy. Batch the changes and perform
 	 * one reload after the cfg has fully executed.
 	 *
-	 * Vulkan on Android currently does not survive the texture reload path
-	 * reliably: it can keep the process alive but stop presenting frames while
-	 * memory grows rapidly. Skip the explicit reload there; immediate cvars
-	 * still apply, and reload-only texture changes can wait for a restart.
+	 * Vulkan does not survive the GL-only soft-reload path reliably (it can
+	 * keep the process alive but stop presenting frames correctly, e.g. walls
+	 * rendering wrong after switching away from eyecandy) -- and the reload
+	 * never actually fires anyway, since VID_ReloadCvarChanged never sets
+	 * vid_reload_pending while R_UseVulkan() is true. Explicitly request a
+	 * full vid_restart instead so the preset's cvar changes actually reach
+	 * the renderer's resources.
 	 */
 	if (vid_reload_auto) {
 		Cvar_Set(vid_reload_auto, "0");
 	}
 
-	Cbuf_AddText(va("exec %s\nvid_reload_auto %d\n%s", cfg, restore_vid_reload_auto, reload_after_preset ? "vid_reload\n" : ""));
+	Cbuf_AddText(va("exec %s\nvid_reload_auto %d\n%s", cfg, restore_vid_reload_auto, use_vulkan ? "vid_restart\n" : "vid_reload\n"));
 }
 
 void GFXPresetToggle(qbool back) {
