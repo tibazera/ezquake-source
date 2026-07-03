@@ -1953,27 +1953,6 @@ void VK_RenderView(void)
 		worldIndexCount,
 		worldDraws[0].firstIndex,
 		worldDraws[0].indexCount);
-
-#ifdef __ANDROID__
-	{
-		static unsigned int profile_frames;
-		static unsigned int profile_draws_accum;
-		static unsigned int profile_indices_accum;
-
-		profile_draws_accum += worldDrawCount;
-		profile_indices_accum += worldIndexCount;
-		if (++profile_frames >= 60) {
-			__android_log_print(ANDROID_LOG_INFO, "VK_PROFILE",
-				"world avg draws=%.1f avg indices=%.0f (last textured=%d lightmapped=%d blended=%d luma=%d fullbright=%d)",
-				profile_draws_accum / (float)profile_frames,
-				profile_indices_accum / (float)profile_frames,
-				texturedDraws, lightmappedDraws, blendedDraws, lumaDraws, fullbrightDraws);
-			profile_frames = 0;
-			profile_draws_accum = 0;
-			profile_indices_accum = 0;
-		}
-	}
-#endif
 }
 
 #endif // RENDERER_OPTION_VULKAN

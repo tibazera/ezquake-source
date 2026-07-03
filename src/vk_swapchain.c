@@ -441,11 +441,11 @@ qbool VK_CreateSwapChain(SDL_Window* window, VkInstance instance, VkSurfaceKHR s
 		requestedImageCount = min(requestedImageCount, vk_options.physicalDeviceSurfaceCapabilities.maxImageCount);
 	}
 #ifdef __ANDROID__
-	__android_log_print(ANDROID_LOG_INFO, "VK_PROFILE",
+	__android_log_print(ANDROID_LOG_INFO, "VK_Swapchain",
 		"swapchain present mode=%d (0=IMMEDIATE 1=MAILBOX 2=FIFO 3=FIFO_RELAXED) images requested=%u min=%u max=%u",
 		(int)vk_options.physicalDevicePresentationMode, requestedImageCount,
 		vk_options.physicalDeviceSurfaceCapabilities.minImageCount, vk_options.physicalDeviceSurfaceCapabilities.maxImageCount);
-	__android_log_print(ANDROID_LOG_INFO, "VK_PROFILE",
+	__android_log_print(ANDROID_LOG_INFO, "VK_Swapchain",
 		"surface transform currentTransform=%d supportedTransforms=0x%x (1=IDENTITY 2=ROTATE_90 4=ROTATE_180 8=ROTATE_270) currentExtent=%ux%u",
 		(int)vk_options.physicalDeviceSurfaceCapabilities.currentTransform,
 		(unsigned int)vk_options.physicalDeviceSurfaceCapabilities.supportedTransforms,
@@ -454,7 +454,7 @@ qbool VK_CreateSwapChain(SDL_Window* window, VkInstance instance, VkSurfaceKHR s
 	{
 		int sdlW = 0, sdlH = 0;
 		SDL_GetWindowSizeInPixels(window, &sdlW, &sdlH);
-		__android_log_print(ANDROID_LOG_INFO, "VK_PROFILE",
+		__android_log_print(ANDROID_LOG_INFO, "VK_Swapchain",
 			"SDL window size=%dx%d orientation hint=%s",
 			sdlW, sdlH, SDL_GetHint(SDL_HINT_ORIENTATIONS) ? SDL_GetHint(SDL_HINT_ORIENTATIONS) : "(unset)");
 	}
@@ -572,7 +572,7 @@ qbool VK_CreateSwapChain(SDL_Window* window, VkInstance instance, VkSurfaceKHR s
 	vk_options.swapChain.imageCount = swapChainImageCount;
 	vk_options.swapChain.imageSize = createInfo.imageExtent;
 #ifdef __ANDROID__
-	__android_log_print(ANDROID_LOG_INFO, "VK_PROFILE", "swapchain final imageExtent=%ux%u preTransform=%d",
+	__android_log_print(ANDROID_LOG_INFO, "VK_Swapchain", "swapchain final imageExtent=%ux%u preTransform=%d",
 		vk_options.swapChain.imageSize.width, vk_options.swapChain.imageSize.height, (int)createInfo.preTransform);
 #endif
 
@@ -658,7 +658,7 @@ qbool VK_CreateSwapChainFramebuffers(void)
 	}
 
 #ifdef __ANDROID__
-	__android_log_print(ANDROID_LOG_INFO, "VK_PROFILE", "framebuffers created width=%u height=%u count=%u",
+	__android_log_print(ANDROID_LOG_INFO, "VK_Swapchain", "framebuffers created width=%u height=%u count=%u",
 		vk_options.swapChain.imageSize.width, vk_options.swapChain.imageSize.height, vk_options.swapChain.imageCount);
 #endif
 

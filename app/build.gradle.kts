@@ -37,6 +37,14 @@ android {
                     "-DRENDERER_CLASSIC_OPENGL=OFF",
                     "-DRENDERER_MODERN_OPENGL=OFF",
                     "-DRENDERER_VULKAN=ON",
+                    // check_ipo_supported() fails for this NDK/Clang toolchain under
+                    // AGP's externalNativeBuild (CMakeLists.txt's ENABLE_LTO default is
+                    // ON and turns that failure into a hard configure-time
+                    // FATAL_ERROR): confirmed by removing this line and rebuilding --
+                    // "Link Time Optimization requested, but not available." before a
+                    // single .c file compiles. Needs a real toolchain/CMake-version fix
+                    // to use IPO here, not a one-line flag flip; leaving LTO off for
+                    // Android until that's investigated separately.
                     "-DENABLE_LTO=OFF",
                     // AGP's externalNativeBuild only auto-maps CMAKE_BUILD_TYPE for
                     // build types it considers "debuggable" vs not; without this, our

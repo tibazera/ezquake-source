@@ -1137,26 +1137,6 @@ void VK_TextureFlushPendingUploads(VkCommandBuffer commandBuffer, uint32_t frame
 	VkDeviceSize requiredCapacity;
 	int i;
 
-#ifdef __ANDROID__
-	{
-		static unsigned int profile_frames;
-		static unsigned int profile_uploads_accum;
-		static VkDeviceSize profile_bytes_accum;
-
-		profile_uploads_accum += (unsigned int)pendingTextureUploadCount;
-		profile_bytes_accum += pendingTextureUploadDataSize;
-		if (++profile_frames >= 60) {
-			__android_log_print(ANDROID_LOG_INFO, "VK_PROFILE",
-				"lightmap uploads avg count=%.1f avg bytes=%.0f per frame",
-				profile_uploads_accum / (float)profile_frames,
-				profile_bytes_accum / (float)profile_frames);
-			profile_frames = 0;
-			profile_uploads_accum = 0;
-			profile_bytes_accum = 0;
-		}
-	}
-#endif
-
 	if (commandBuffer == VK_NULL_HANDLE || frameIndex >= VK_MAX_FRAMES_IN_FLIGHT || pendingTextureUploadCount == 0 || pendingTextureUploadDataSize == 0) return;
 
 	requiredCapacity = pendingTextureUploadDataSize;
