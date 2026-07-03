@@ -2,16 +2,26 @@ package org.ezquake.android;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.ActivityNotFoundException;
+import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.StatFs;
 import android.provider.Settings;
+import android.widget.ProgressBar;
+import android.widget.TextView;
 
 import java.io.File;
+import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class EzQuakeLauncherActivity extends Activity {
     // Must match ANDROID_EZQUAKE_BASEDIR in src/sys_posix.c.
@@ -19,10 +29,32 @@ public class EzQuakeLauncherActivity extends Activity {
     private static final int REQUEST_LEGACY_STORAGE = 1001;
     private static final int REQUEST_MANAGE_STORAGE = 1002;
 
+    private static final String PREFS_NAME = "game_data_prefs";
+    private static final String PREF_HD_TEXTURES_PROMPTED = "hd_textures_prompted";
+    private static final String PREF_HD_TEXTURES_INSTALLED = "hd_textures_installed";
+
+    // Rough safety margin added on top of a manifest's own approxSize sum
+    // when checking free disk space -- covers filesystem overhead and any
+    // .part files briefly coexisting with their final renamed counterpart.
+    private static final double DISK_SPACE_SAFETY_MARGIN = 1.2;
+
+    private final ExecutorService downloadExecutor = Executors.newSingleThreadExecutor();
+    private final AtomicBoolean downloadCancelled = new AtomicBoolean(false);
+
+    private TextView downloadStatusText;
+    private ProgressBar downloadProgressBar;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         requestStorageAccessThenLaunch();
+    }
+
+    @Override
+    protected void onDestroy() {
+        downloadCancelled.set(true);
+        downloadExecutor.shutdownNow();
+        super.onDestroy();
     }
 
     private void requestStorageAccessThenLaunch() {
@@ -71,7 +103,173 @@ public class EzQuakeLauncherActivity extends Activity {
     }
 
     private void launchGame() {
-        new File(BASEDIR).mkdirs();
+        File baseDir = new File(BASEDIR);
+        baseDir.mkdirs();
+
+        if (GameDataInstaller.isEssentialDataPresent(baseDir)) {
+            checkHdTexturesPromptThenStartGame(baseDir);
+            return;
+        }
+
+        startEssentialDownload(baseDir);
+    }
+
+    private void startEssentialDownload(File baseDir) {
+        setContentView(R.layout.activity_launcher_progress);
+        downloadStatusText = findViewById(R.id.download_status_text);
+        downloadProgressBar = findViewById(R.id.download_progress_bar);
+
+        List<GameDataManifest.Entry> manifest = GameDataManifest.essential();
+        runManifestDownload(baseDir, manifest, new Runnable() {
+            @Override
+            public void run() {
+                checkHdTexturesPromptThenStartGame(baseDir);
+            }
+        });
+    }
+
+    private void runManifestDownload(File baseDir, List<GameDataManifest.Entry> manifest, Runnable onSuccess) {
+        long requiredBytes = (long) (GameDataInstaller.totalSize(manifest) * DISK_SPACE_SAFETY_MARGIN);
+        if (getAvailableBytes(baseDir) < requiredBytes) {
+            showRetryDialog("Not enough free storage space to download game data.", baseDir, manifest, onSuccess);
+            return;
+        }
+
+        downloadCancelled.set(false);
+        downloadExecutor.execute(new Runnable() {
+            @Override
+            public void run() {
+                new GameDataInstaller().downloadManifest(baseDir, manifest, new GameDataInstaller.ProgressListener() {
+                    private long lastUiUpdateBytes = -1;
+
+                    @Override
+                    public void onFileStarted(int fileIndex, int totalFiles, String relativePath) {
+                        runOnUiThread(new Runnable() {
+                            @Override
+                            public void run() {
+                                if (downloadStatusText != null) {
+                                    downloadStatusText.setText(
+                                            "Downloading: " + relativePath + " (" + (fileIndex + 1) + "/" + totalFiles + ")");
+                                }
+                            }
+                        });
+                    }
+
+                    @Override
+                    public void onFileProgress(final long bytesDownloadedTotal, final long bytesEstimatedTotal) {
+                        // Throttle UI updates so thousands of small texture
+                        // files don't flood the UI thread with posts.
+                        if (lastUiUpdateBytes >= 0 && bytesDownloadedTotal - lastUiUpdateBytes < 64 * 1024) {
+                            return;
+                        }
+                        lastUiUpdateBytes = bytesDownloadedTotal;
+                        runOnUiThread(new Runnable() {
+                            @Override
+                            public void run() {
+                                if (downloadProgressBar != null && bytesEstimatedTotal > 0) {
+                                    int progress = (int) Math.min(10000,
+                                            (bytesDownloadedTotal * 10000L) / bytesEstimatedTotal);
+                                    downloadProgressBar.setProgress(progress);
+                                }
+                            }
+                        });
+                    }
+
+                    @Override
+                    public void onCompleted() {
+                        runOnUiThread(onSuccess);
+                    }
+
+                    @Override
+                    public void onFailed(String relativePath, Exception cause) {
+                        runOnUiThread(new Runnable() {
+                            @Override
+                            public void run() {
+                                showRetryDialog("Failed to download " + relativePath + ": " + cause.getMessage(),
+                                        baseDir, manifest, onSuccess);
+                            }
+                        });
+                    }
+                }, downloadCancelled);
+            }
+        });
+    }
+
+    private long getAvailableBytes(File baseDir) {
+        StatFs stat = new StatFs(baseDir.getAbsolutePath());
+        return stat.getAvailableBytes();
+    }
+
+    private void showRetryDialog(String message, File baseDir, List<GameDataManifest.Entry> manifest, Runnable onSuccess) {
+        if (isFinishing()) {
+            return;
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("Download failed")
+                .setMessage(message)
+                .setCancelable(false)
+                .setPositiveButton("Try again", new android.content.DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(android.content.DialogInterface dialog, int which) {
+                        runManifestDownload(baseDir, manifest, onSuccess);
+                    }
+                })
+                .setNegativeButton("Exit", new android.content.DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(android.content.DialogInterface dialog, int which) {
+                        finish();
+                    }
+                })
+                .show();
+    }
+
+    private void checkHdTexturesPromptThenStartGame(File baseDir) {
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        boolean alreadyPrompted = prefs.getBoolean(PREF_HD_TEXTURES_PROMPTED, false);
+        boolean alreadyInstalled = prefs.getBoolean(PREF_HD_TEXTURES_INSTALLED, false);
+
+        if (alreadyPrompted || alreadyInstalled) {
+            startGameActivity();
+            return;
+        }
+
+        if (isFinishing()) {
+            startGameActivity();
+            return;
+        }
+
+        new AlertDialog.Builder(this)
+                .setTitle("Optional HD textures")
+                .setMessage("Download the high-resolution texture pack (~385MB)? "
+                        + "You can play without it -- this only affects visual quality.")
+                .setCancelable(false)
+                .setPositiveButton("Download now", new android.content.DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(android.content.DialogInterface dialog, int which) {
+                        prefs.edit().putBoolean(PREF_HD_TEXTURES_PROMPTED, true).apply();
+                        setContentView(R.layout.activity_launcher_progress);
+                        downloadStatusText = findViewById(R.id.download_status_text);
+                        downloadProgressBar = findViewById(R.id.download_progress_bar);
+                        runManifestDownload(baseDir, GameDataManifest.hdTextures(), new Runnable() {
+                            @Override
+                            public void run() {
+                                prefs.edit().putBoolean(PREF_HD_TEXTURES_INSTALLED, true).apply();
+                                startGameActivity();
+                            }
+                        });
+                    }
+                })
+                .setNegativeButton("Not now", new android.content.DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(android.content.DialogInterface dialog, int which) {
+                        prefs.edit().putBoolean(PREF_HD_TEXTURES_PROMPTED, true).apply();
+                        startGameActivity();
+                    }
+                })
+                .show();
+    }
+
+    private void startGameActivity() {
         startActivity(new Intent(this, EzQuakeActivity.class));
         finish();
     }
