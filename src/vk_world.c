@@ -1738,23 +1738,25 @@ void VK_DrawWaterSurfaces(void)
 	waterchain = NULL;
 }
 
-static void VK_WorldDrawOverlay(VkCommandBuffer commandBuffer, const vk_world_draw_t* draw, const vk_world_push_t* push, qbool lumaPipelineReady, qbool fullbrightPipelineReady)
+// Returns true if it issued its own pipeline/descriptor-set binds (unconditional,
+// not cached), so the caller's world bind cache can be invalidated accordingly.
+static qbool VK_WorldDrawOverlay(VkCommandBuffer commandBuffer, const vk_world_draw_t* draw, const vk_world_push_t* push, qbool lumaPipelineReady, qbool fullbrightPipelineReady)
 {
 	VkDescriptorSet descriptorSets[2];
 	VkPipeline pipeline;
 
 	if (!draw || draw->overlayMode == VK_WORLD_OVERLAY_NONE || !VK_TextureReady(draw->overlayTexture)) {
-		return;
+		return false;
 	}
 	if (draw->overlayMode == VK_WORLD_OVERLAY_LUMA) {
 		if (!lumaPipelineReady) {
-			return;
+			return false;
 		}
 		pipeline = worldLumaPipeline;
 	}
 	else {
 		if (!fullbrightPipelineReady) {
-			return;
+			return false;
 		}
 		pipeline = worldFullbrightPipeline;
 	}
@@ -1762,13 +1764,39 @@ static void VK_WorldDrawOverlay(VkCommandBuffer commandBuffer, const vk_world_dr
 	descriptorSets[0] = VK_TextureDescriptorSet(draw->overlayTexture);
 	descriptorSets[1] = VK_WorldDetailDescriptorSet();
 	if (descriptorSets[0] == VK_NULL_HANDLE || descriptorSets[1] == VK_NULL_HANDLE) {
-		return;
+		return false;
 	}
 
 	vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 	vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, worldOverlayPipelineLayout, 0, 2, descriptorSets, 0, NULL);
 	vkCmdPushConstants(commandBuffer, worldOverlayPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(*push), push);
 	vkCmdDrawIndexed(commandBuffer, draw->indexCount, 1, draw->firstIndex, 0, 0);
+	return true;
+}
+
+// Returns true (and binds) only when the requested pipeline/descriptor-set
+// state differs from what's already bound on commandBuffer; skips the redundant
+// vkCmdBind* calls otherwise. *lastPipeline/lastSets/*lastSetCount are the
+// caller's running "currently bound" cache, updated in place.
+static void VK_WorldBindIfChanged(VkCommandBuffer commandBuffer, VkPipeline pipeline, VkPipelineLayout layout,
+	const VkDescriptorSet* descriptorSets, int descriptorSetCount,
+	VkPipeline* lastPipeline, VkDescriptorSet* lastSets, int* lastSetCount)
+{
+	qbool pipelineChanged = (pipeline != *lastPipeline);
+	qbool setsChanged = (descriptorSetCount != *lastSetCount) ||
+		(memcmp(lastSets, descriptorSets, descriptorSetCount * sizeof(VkDescriptorSet)) != 0);
+
+	if (pipelineChanged) {
+		vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+		*lastPipeline = pipeline;
+	}
+	// A pipeline change invalidates descriptor-set compatibility guarantees even
+	// when the sets themselves are unchanged, so force a rebind in that case too.
+	if (pipelineChanged || setsChanged) {
+		vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, descriptorSetCount, descriptorSets, 0, NULL);
+		memcpy(lastSets, descriptorSets, descriptorSetCount * sizeof(VkDescriptorSet));
+		*lastSetCount = descriptorSetCount;
+	}
 }
 
 void VK_RenderView(void)
@@ -1790,6 +1818,25 @@ void VK_RenderView(void)
 	qbool lumaPipelineReady = false;
 	qbool fullbrightPipelineReady = false;
 	qbool depthBiasActive = false;
+	// The overwhelming majority of draws are static world geometry sharing
+	// the same view matrix (only brush-model entities like doors/plats have
+	// their own); caching the last modelView this multiplied against skips
+	// R_MultiplyMatrix's 4x4 multiply-add for every draw that repeats it,
+	// without changing what's drawn or how -- purely a redundant-recompute
+	// skip, not a batching/merging change.
+	float lastMultipliedModelView[16];
+	float lastMvp[16];
+	qbool haveLastMvp = false;
+	// Consecutive draws are usually pre-sorted by material (same texture/
+	// lightmap/pipeline), so re-issuing vkCmdBindPipeline/vkCmdBindDescriptorSets
+	// for a state that's already bound is pure redundant driver overhead --
+	// same "skip the recompute/rebind when nothing changed" idea as the MVP
+	// cache above, just applied to bind state instead of the push constant.
+	// Only tracks what each branch below actually binds (pipeline + its
+	// descriptor sets); doesn't touch draw ordering, geometry, or call count.
+	VkPipeline lastBoundPipeline = VK_NULL_HANDLE;
+	VkDescriptorSet lastBoundDescriptorSets[3] = { VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE };
+	int lastBoundDescriptorSetCount = 0;
 
 	if (!worldDrawCount || !worldIndexCount) {
 		VK_WorldDebugLog("render skipped: draws=%d indices=%u", worldDrawCount, worldIndexCount);
@@ -1881,6 +1928,11 @@ void VK_RenderView(void)
 			VK_WorldSetViewportScissor(commandBuffer);
 			vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffer, &vertexOffset);
 			vkCmdBindIndexBuffer(commandBuffer, indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+			// Alias models/sprites above issued their own pipeline/descriptor-set
+			// binds on this same command buffer; the world's bind cache no longer
+			// reflects reality, so drop it rather than risk a stale skip.
+			lastBoundPipeline = VK_NULL_HANDLE;
+			lastBoundDescriptorSetCount = 0;
 		}
 
 		for (i = 0; i < worldDrawCount; ++i) {
@@ -1896,7 +1948,15 @@ void VK_RenderView(void)
 			}
 
 			memset(&push, 0, sizeof(push));
-			R_MultiplyMatrix(worldDraws[i].modelView, R_ProjectionMatrix(), push.mvp);
+			if (haveLastMvp && memcmp(lastMultipliedModelView, worldDraws[i].modelView, sizeof(lastMultipliedModelView)) == 0) {
+				memcpy(push.mvp, lastMvp, sizeof(push.mvp));
+			}
+			else {
+				R_MultiplyMatrix(worldDraws[i].modelView, R_ProjectionMatrix(), push.mvp);
+				memcpy(lastMultipliedModelView, worldDraws[i].modelView, sizeof(lastMultipliedModelView));
+				memcpy(lastMvp, push.mvp, sizeof(lastMvp));
+				haveLastMvp = true;
+			}
 			memcpy(push.color, worldDraws[i].flatColor, sizeof(push.color));
 			push.cameraPosition[0] = r_refdef.vieworg[0];
 			push.cameraPosition[1] = r_refdef.vieworg[1];
@@ -1932,8 +1992,8 @@ void VK_RenderView(void)
 					float blendConstants[4] = { 0.0f, 0.0f, 0.0f, worldDraws[i].alpha };
 
 					layout = worldAlphaTexturedPipelineLayout;
-					vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, worldAlphaTexturedPipeline);
-					vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 2, descriptorSets, 0, NULL);
+					VK_WorldBindIfChanged(commandBuffer, worldAlphaTexturedPipeline, layout, descriptorSets, 2,
+						&lastBoundPipeline, lastBoundDescriptorSets, &lastBoundDescriptorSetCount);
 					vkCmdSetBlendConstants(commandBuffer, blendConstants);
 					drawTextured = false;
 				}
@@ -1949,8 +2009,8 @@ void VK_RenderView(void)
 				descriptorSets[2] = VK_WorldDetailDescriptorSet();
 				if (descriptorSets[0] != VK_NULL_HANDLE && descriptorSets[1] != VK_NULL_HANDLE && descriptorSets[2] != VK_NULL_HANDLE) {
 					layout = worldLightmappedPipelineLayout;
-					vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, worldLightmappedPipeline);
-					vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 3, descriptorSets, 0, NULL);
+					VK_WorldBindIfChanged(commandBuffer, worldLightmappedPipeline, layout, descriptorSets, 3,
+						&lastBoundPipeline, lastBoundDescriptorSets, &lastBoundDescriptorSetCount);
 					drawTextured = false;
 				}
 				else {
@@ -1964,8 +2024,8 @@ void VK_RenderView(void)
 				descriptorSets[1] = VK_WorldDetailDescriptorSet();
 				if (descriptorSets[0] != VK_NULL_HANDLE && descriptorSets[1] != VK_NULL_HANDLE) {
 					layout = worldTexturedPipelineLayout;
-					vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, worldTexturedPipeline);
-					vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 2, descriptorSets, 0, NULL);
+					VK_WorldBindIfChanged(commandBuffer, worldTexturedPipeline, layout, descriptorSets, 2,
+						&lastBoundPipeline, lastBoundDescriptorSets, &lastBoundDescriptorSetCount);
 				}
 				else {
 					drawTextured = false;
@@ -1976,10 +2036,15 @@ void VK_RenderView(void)
 				texture_ref lightmapTex = VK_TextureReady(worldDraws[i].lightmap) ? worldDraws[i].lightmap : solidwhite_texture;
 
 				push.drawflatColor = worldDraws[i].drawflatCvar ? 1.0f : 0.0f;
-				vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, worldFlatPipeline);
 				descriptorSets[1] = VK_TextureDescriptorSet(lightmapTex);
 				if (VK_WorldFlatSkyDescriptorSet(&descriptorSets[0]) && descriptorSets[1] != VK_NULL_HANDLE) {
-					vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, worldFlatPipelineLayout, 0, 2, descriptorSets, 0, NULL);
+					VK_WorldBindIfChanged(commandBuffer, worldFlatPipeline, worldFlatPipelineLayout, descriptorSets, 2,
+						&lastBoundPipeline, lastBoundDescriptorSets, &lastBoundDescriptorSetCount);
+				}
+				else if (worldFlatPipeline != lastBoundPipeline) {
+					vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, worldFlatPipeline);
+					lastBoundPipeline = worldFlatPipeline;
+					lastBoundDescriptorSetCount = 0;
 				}
 			}
 
@@ -1995,7 +2060,10 @@ void VK_RenderView(void)
 
 			vkCmdPushConstants(commandBuffer, layout, pushStages, 0, sizeof(push), &push);
 			vkCmdDrawIndexed(commandBuffer, worldDraws[i].indexCount, 1, worldDraws[i].firstIndex, 0, 0);
-			VK_WorldDrawOverlay(commandBuffer, &worldDraws[i], &push, lumaPipelineReady, fullbrightPipelineReady);
+			if (VK_WorldDrawOverlay(commandBuffer, &worldDraws[i], &push, lumaPipelineReady, fullbrightPipelineReady)) {
+				lastBoundPipeline = VK_NULL_HANDLE;
+				lastBoundDescriptorSetCount = 0;
+			}
 		}
 	}
 
