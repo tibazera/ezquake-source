@@ -539,6 +539,7 @@ void Serverinfo_Rules_Key(int key);
 void Serverinfo_Sources_Key(int key);
 void Serverinfo_Route_Key(int key);
 void Serverinfo_Route_Invalidate(void);
+static void Serverinfo_Route_Reset(void);
 
 //
 // serverinfo
@@ -629,6 +630,7 @@ static netadr_t serverinfo_routes_addr;
 static double serverinfo_routes_built_at; // 0 means "never queried yet", even if the query found zero routes
 static qbool serverinfo_route_hop_enabled[SERVERINFO_ROUTE_MAX_HOPS];
 static int serverinfo_route_hop_enabled_for; // serverinfo_route_pos the array above belongs to, -1 if stale
+static double serverinfo_route_last_build_attempt; // Sys_DoubleTime() of the last SB_PingTree_Build() we triggered, 0 if none yet
 
 void Serverinfo_Stop(void)
 {
@@ -644,7 +646,7 @@ void Serverinfo_Start (server_data *s)
 
 	serverinfo_players_pos = 0;
 	serverinfo_sources_pos = 0;
-	Serverinfo_Route_Invalidate();
+	Serverinfo_Route_Reset();
 
 	autoupdate_serverinfo = 1;
 	show_serverinfo = s;
@@ -675,7 +677,7 @@ void Serverinfo_Change (server_data *s)
 {
 	Alter_Autoupdate(s);
 	show_serverinfo = s;
-	Serverinfo_Route_Invalidate();
+	Serverinfo_Route_Reset();
 
 	// testing connection
 	if (testing_connection)
@@ -1616,6 +1618,16 @@ void Serverinfo_Route_Invalidate(void)
 	serverinfo_route_hop_enabled_for = -1;
 }
 
+// Only called when the server the popup is showing actually changes
+// (Serverinfo_Start/Serverinfo_Change) - unlike Invalidate() this also drops
+// the SB_PingTree_Build() retry cooldown, since a genuinely different server
+// deserves an immediate fresh attempt.
+static void Serverinfo_Route_Reset(void)
+{
+	Serverinfo_Route_Invalidate();
+	serverinfo_route_last_build_attempt = 0;
+}
+
 // Rebuilds the cached route list for show_serverinfo if it is missing, for
 // the wrong server, or older than the same TTL connectbr/connectnext use
 // (CONNECTBR_ROUTE_TTL in cl_connectbr.c). Called by both Draw and Key so
@@ -1636,7 +1648,16 @@ static void Serverinfo_Route_EnsureFresh(void)
 	// an aged graph is rebuilt from scratch rather than re-running Dijkstra
 	// over measurements that may no longer reflect the network.
 	if (!SB_PingTree_Built() || SB_PingTree_Age() > 120.0) {
-		SB_PingTree_Build();
+		// SB_PingTree_Build() is fire-and-forget (a detached thread flips
+		// pingtree_built once it's done); without a cooldown, a build that
+		// fails or simply takes a while gets re-triggered on every single
+		// frame this tab is drawn/keyed, spamming "Building the Ping
+		// Tree..." and starting a fresh attempt before the last one could
+		// ever finish.
+		if (Sys_DoubleTime() - serverinfo_route_last_build_attempt > 5.0) {
+			serverinfo_route_last_build_attempt = Sys_DoubleTime();
+			SB_PingTree_Build();
+		}
 		return;
 	}
 
@@ -1690,6 +1711,23 @@ static void Serverinfo_Route_ApplyToProxyaddr(void)
 	Cvar_Set(&cl_proxyaddr, out);
 }
 
+// Connects using exactly what the route tab currently has applied to
+// cl_proxyaddr (Serverinfo_Route_ApplyToProxyaddr already ran on every
+// selection/toggle). Deliberately does NOT call SB_PingTree_ConnectBestPath -
+// that recomputes cl_proxyaddr from scratch and would silently discard the
+// user's route/hop choice, which is the whole point of this tab.
+static void Serverinfo_Route_Connect(void)
+{
+	server_data *s = show_serverinfo;
+
+	if (!s)
+		return;
+	Cbuf_AddText("join ");
+	Cbuf_AddText(s->display.ip);
+	Cbuf_AddText("\n");
+	SB_Browser_Hide(s);
+}
+
 void Serverinfo_Route_Draw(int x, int y, int w, int h)
 {
 	int i, listsize, routes_shown;
@@ -1723,13 +1761,14 @@ void Serverinfo_Route_Draw(int x, int y, int w, int h)
 	if (serverinfo_route_pos < serverinfo_route_disp)
 		serverinfo_route_disp = serverinfo_route_pos;
 
-	UI_Print(x, y, " #  cost   hops (ctrl+up/down to move)", true);
+	// header/footer take one row each, so hop area gets everything between
+	UI_Print(x, y, " #  cost  hops", true);
 	for (i = 0; i < routes_shown; i++) {
-		char buf[80];
+		char buf[40];
 		int ri = serverinfo_route_disp + i;
 		sb_route_t *route = &serverinfo_routes[ri];
 
-		snprintf(buf, sizeof(buf), " %-2d %5dms %d", ri + 1, route->total_cost_ms, route->hops);
+		snprintf(buf, sizeof(buf), " %-2d %5dms  %d", ri + 1, route->total_cost_ms, route->hops);
 		buf[w/8] = 0;
 		UI_Print(x, y + i*8 + 8, buf, ri == serverinfo_route_pos);
 	}
@@ -1740,23 +1779,25 @@ void Serverinfo_Route_Draw(int x, int y, int w, int h)
 
 	hopy = y + routes_shown * 8 + 16;
 	if (!hop_count) {
-		UI_Print(x, hopy, "direct connection, no proxy hops", false);
-		return;
+		UI_Print(x, hopy, "direct, no proxy hops", false);
+	}
+	else {
+		UI_Print(x, hopy, "hops:", false);
+		hop_listsize = max(1, (y + h - (hopy + 16)) / 8);
+		hop_disp = max(0, min(serverinfo_route_hop_pos - hop_listsize + 1, hop_count - hop_listsize));
+		hop_disp = max(0, min(hop_disp, serverinfo_route_hop_pos));
+		for (i = 0; i < hop_listsize && hop_disp + i < hop_count; i++) {
+			char buf[40];
+			int hi = hop_disp + i;
+
+			snprintf(buf, sizeof(buf), " [%c] %s",
+			         serverinfo_route_hop_enabled[hi] ? 'x' : ' ', hops[hi]);
+			buf[w/8] = 0;
+			UI_Print(x, hopy + (i+1)*8, buf, hi == serverinfo_route_hop_pos);
+		}
 	}
 
-	UI_Print(x, hopy, "hops (enter to toggle):", false);
-	hop_listsize = max(1, (y + h - (hopy + 8)) / 8);
-	hop_disp = max(0, min(serverinfo_route_hop_pos - hop_listsize + 1, hop_count - hop_listsize));
-	hop_disp = max(0, min(hop_disp, serverinfo_route_hop_pos));
-	for (i = 0; i < hop_listsize && hop_disp + i < hop_count; i++) {
-		char buf[80];
-		int hi = hop_disp + i;
-
-		snprintf(buf, sizeof(buf), " [%c] %s",
-		         serverinfo_route_hop_enabled[hi] ? 'x' : ' ', hops[hi]);
-		buf[w/8] = 0;
-		UI_Print(x, hopy + (i+1)*8, buf, hi == serverinfo_route_hop_pos);
-	}
+	UI_Print(x, y + h - 8, "enter:toggle hop  j:connect", false);
 }
 
 const char *SB_Source_Type_Location_Name(sb_source_type_t type)
@@ -2431,7 +2472,10 @@ void Serverinfo_Key(int key)
 			break;
 		case 'j':
 		case 'p':
-			Join_Server(show_serverinfo);
+			if (serverinfo_pos == 3)
+				Serverinfo_Route_Connect();
+			else
+				Join_Server(show_serverinfo);
 			break;
 		case 'n':
 			Join_Server_Direct(show_serverinfo);
