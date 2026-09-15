@@ -1,5 +1,11 @@
 #version 450
 
+// NOTE: this file is currently NOT wired into the build/pipeline -- see
+// vk_upscale.frag's inlined ReprojectToPreviousFrame for the actual live
+// version of this algorithm (kept in sync manually; this standalone file is
+// the reference/fallback if a separate motion-vector target is ever needed
+// again, e.g. for a future true-per-object-velocity pass).
+//
 // Reconstructed motion vectors: reprojects each low-res scene pixel's world
 // position (recovered from its depth value + this frame's inverse
 // view-projection) back through the PREVIOUS frame's view-projection, and

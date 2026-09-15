@@ -153,6 +153,16 @@ qbool VK_CreateUpscaleResources(void);
 void VK_DestroyUpscaleResources(void);
 void VK_UpscaleComposite(VkCommandBuffer commandBuffer, uint32_t imageIndex);
 void VK_UpscaleForgetDescriptorSets(void);
+// Temporal (motion-vector reprojected history) path on top of the spatial
+// EASU+RCAS upscale -- see vk_upscale.c's VK_TemporalUpscaleActive for the
+// gating conditions. VK_UpscaleUpdateMatrices must be called before the
+// composite render pass begins (vkCmdUpdateBuffer can't run inside a render
+// pass instance); VK_UpscaleUpdateHistory must be called after it ends
+// (vkCmdCopyImage has the same restriction) and before the following HUD
+// pass begins. Both are no-ops (returning false / doing nothing) when
+// temporal upscaling isn't applicable this frame.
+qbool VK_UpscaleUpdateMatrices(VkCommandBuffer commandBuffer);
+void VK_UpscaleUpdateHistory(VkCommandBuffer commandBuffer, uint32_t imageIndex);
 
 // vk_blending.c
 void VK_BlendingConfigure(VkPipelineColorBlendStateCreateInfo* info, VkPipelineColorBlendAttachmentState* blending, r_blendfunc_t func);

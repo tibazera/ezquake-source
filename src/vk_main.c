@@ -932,6 +932,11 @@ void VK_EndWorldPassAndComposite(void)
 			VkRenderPassBeginInfo compositePassInfo = { 0 };
 
 			VK_PostProcessTransitionForSampling(commandBuffer, vk_options.frame.imageIndex);
+			// Must run before vkCmdBeginRenderPass below -- vkCmdUpdateBuffer
+			// (what this does) can't be called inside a render pass instance.
+			// No-op when temporal upscaling isn't applicable this frame (see
+			// VK_TemporalUpscaleActive's gating conditions).
+			VK_UpscaleUpdateMatrices(commandBuffer);
 
 			compositePassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
 			compositePassInfo.renderPass = VK_PostProcessRenderPass();
@@ -943,6 +948,13 @@ void VK_EndWorldPassAndComposite(void)
 			vkCmdBeginRenderPass(commandBuffer, &compositePassInfo, VK_SUBPASS_CONTENTS_INLINE);
 			VK_PostProcessComposite(commandBuffer, vk_options.frame.imageIndex);
 			vkCmdEndRenderPass(commandBuffer);
+
+			// Must run after vkCmdEndRenderPass above (vkCmdCopyImage, same
+			// restriction as vkCmdUpdateBuffer) and before the HUD pass
+			// begins below -- copies this frame's just-finished composite
+			// output into the history buffer for next frame's temporal
+			// resolve. No-op when the upscaler isn't active.
+			VK_UpscaleUpdateHistory(commandBuffer, vk_options.frame.imageIndex);
 		}
 	}
 
