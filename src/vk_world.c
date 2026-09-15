@@ -207,6 +207,18 @@ static int worldDrawCount;
 static int worldDrawCapacity;
 static uint32_t worldIndexCount;
 
+// Highest descriptor-set count any world pipeline binds via VK_WorldBindIfChanged
+// (currently the lightmapped pipeline: texture, lightmap, detail, caustics).
+// Both VK_RenderView's lastBoundDescriptorSets[] array and every call-site
+// literal must stay <= this -- bump both together if a pipeline ever needs
+// a 5th set, see VK_WorldBindIfChanged's assert.
+#define VK_WORLD_MAX_DESCRIPTOR_SETS 4
+// Grow-and-keep scratch buffer for VK_RenderView's opaque/blended stable
+// partition, same pattern as worldDraws[] above instead of a per-frame
+// Q_malloc/Q_free pair.
+static int* worldPassIndices;
+static int worldPassIndicesCapacity;
+
 #define VK_WORLD_OVERLAY_NONE       0
 #define VK_WORLD_OVERLAY_LUMA       1
 #define VK_WORLD_OVERLAY_FULLBRIGHT 2
@@ -2116,11 +2128,23 @@ static qbool VK_WorldDrawOverlay(VkCommandBuffer commandBuffer, const vk_world_d
 // state differs from what's already bound on commandBuffer; skips the redundant
 // vkCmdBind* calls otherwise. *lastPipeline/lastSets/*lastSetCount are the
 // caller's running "currently bound" cache, updated in place.
+//
+// descriptorSetCount is trusted to fit whatever fixed-size array the caller
+// passed as lastSets -- currently VK_WORLD_MAX_DESCRIPTOR_SETS everywhere
+// (see lastBoundDescriptorSets[] at each call site in VK_RenderView). If a
+// future world pipeline needs more sets than that, bump the constant AND the
+// call-site array together; the assert below is a cheap tripwire against
+// forgetting the array side, same overflow class as the stack-buffer bug
+// this diff's sibling commit fixed.
 static void VK_WorldBindIfChanged(VkCommandBuffer commandBuffer, VkPipeline pipeline, VkPipelineLayout layout,
 	const VkDescriptorSet* descriptorSets, int descriptorSetCount,
 	VkPipeline* lastPipeline, VkDescriptorSet* lastSets, int* lastSetCount)
 {
-	qbool pipelineChanged = (pipeline != *lastPipeline);
+	qbool pipelineChanged;
+
+	assert(descriptorSetCount <= VK_WORLD_MAX_DESCRIPTOR_SETS);
+
+	pipelineChanged = (pipeline != *lastPipeline);
 	qbool setsChanged = (descriptorSetCount != *lastSetCount) ||
 		(memcmp(lastSets, descriptorSets, descriptorSetCount * sizeof(VkDescriptorSet)) != 0);
 
@@ -2327,13 +2351,13 @@ void VK_RenderView(void)
 	// Only tracks what each branch below actually binds (pipeline + its
 	// descriptor sets); doesn't touch draw ordering, geometry, or call count.
 	VkPipeline lastBoundPipeline = VK_NULL_HANDLE;
-	// 4, not 3: the lightmapped pipeline now binds 4 descriptor sets (texture,
-	// lightmap, detail, caustics) since the underwater-caustics work added a
-	// 4th set -- this array used to be sized for the old 3-set maximum and
-	// silently overflowed by one VkDescriptorSet (8 bytes) on every bind of
-	// that pipeline. Caught by GCC's -Wstringop-overflow on the Linux build,
-	// not by MSVC.
-	VkDescriptorSet lastBoundDescriptorSets[4] = { VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE };
+	// VK_WORLD_MAX_DESCRIPTOR_SETS, not 3: the lightmapped pipeline binds 4
+	// descriptor sets (texture, lightmap, detail, caustics) since the
+	// underwater-caustics work added a 4th set -- this array used to be sized
+	// for the old 3-set maximum and silently overflowed by one VkDescriptorSet
+	// (8 bytes) on every bind of that pipeline. Caught by GCC's
+	// -Wstringop-overflow on the Linux build, not by MSVC.
+	VkDescriptorSet lastBoundDescriptorSets[VK_WORLD_MAX_DESCRIPTOR_SETS] = { VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE };
 	int lastBoundDescriptorSetCount = 0;
 	qbool worldOutline = false;
 	// Partition worldDraws[] indices by pass once, up front, instead of the
@@ -2426,7 +2450,15 @@ void VK_RenderView(void)
 	// each group keeps its original relative order (a stable partition), which
 	// the blended group in particular depends on for correct back-to-front
 	// alpha compositing.
-	passIndices = Q_malloc(worldDrawCount * sizeof(passIndices[0]));
+	if (worldDrawCount > worldPassIndicesCapacity) {
+		int newCapacity = worldPassIndicesCapacity ? worldPassIndicesCapacity * 2 : 128;
+		if (newCapacity < worldDrawCount) {
+			newCapacity = worldDrawCount;
+		}
+		worldPassIndices = Q_realloc(worldPassIndices, newCapacity * sizeof(worldPassIndices[0]));
+		worldPassIndicesCapacity = newCapacity;
+	}
+	passIndices = worldPassIndices;
 	for (i = 0; i < worldDrawCount; ++i) {
 		if (!worldDraws[i].blended) {
 			passIndices[opaqueCount++] = i;
@@ -2680,8 +2712,10 @@ void VK_RenderView(void)
 		worldIndexCount,
 		worldDraws[0].firstIndex,
 		worldDraws[0].indexCount);
-
-	Q_free(passIndices);
+	// worldPassIndices is a kept grow-and-keep buffer (see its declaration),
+	// not freed here -- only VK_TextureShutdownAll-style full teardown would
+	// free it, and this module has no such per-vid_restart teardown today
+	// (worldDraws[] above has the same lifetime).
 }
 
 #endif // RENDERER_OPTION_VULKAN

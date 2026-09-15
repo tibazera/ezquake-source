@@ -994,11 +994,13 @@ static VkDescriptorSet VK_WorldOutlineDescriptorSet(uint32_t imageIndex)
 }
 
 // VK_WorldNormalsRenderPassCreate leaves the colour attachment in
-// SHADER_READ_ONLY_OPTIMAL as its finalLayout already, so unlike
-// VK_PostProcessTransitionForSampling this needs no barrier -- kept as a
-// named entry point (called right after the normals pass ends, before the
-// main render pass begins) in case that render pass's finalLayout choice
-// ever changes.
+// SHADER_READ_ONLY_OPTIMAL as its finalLayout already, and its own exit
+// VkSubpassDependency (COLOR_ATTACHMENT_OUTPUT/WRITE -> FRAGMENT_SHADER/
+// SHADER_READ) gives the later sampled read its visibility guarantee, so
+// unlike VK_PostProcessTransitionForSampling this needs no separate barrier
+// call here -- kept as a named entry point (called right after the normals
+// pass ends, before the main render pass begins) in case that render pass's
+// dependency/finalLayout choice ever changes.
 void VK_WorldNormalsTransitionForSampling(VkCommandBuffer commandBuffer, uint32_t imageIndex)
 {
 	(void)commandBuffer;

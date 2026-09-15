@@ -154,9 +154,32 @@ static int deferredDescriptorRefreshCount;
 // before any command buffer records. The image/view/memory teardown (guarded by
 // vkDeviceWaitIdle) stays immediate -- only descriptor set free/update trips the
 // UPDATE_AFTER_BIND validation and corrupts the recording command buffer.
-#define VK_MAX_DEFERRED_DESCRIPTOR_FREES 1024
-static VkDescriptorSet deferredDescriptorFrees[VK_MAX_DEFERRED_DESCRIPTOR_FREES];
+// Grow-and-keep, same pattern as VK_WorldEnsureDrawCapacity (vk_world.c):
+// starts NULL/0, VK_DeferredDescriptorFreeEnsureCapacity below grows it on
+// demand. No fixed cap -- capping this and falling back to a synchronous
+// free (as an earlier version of this queue did) reintroduces the exact
+// free-while-bound hazard the deferral exists to prevent, just at a higher
+// count instead of never.
+static VkDescriptorSet* deferredDescriptorFrees;
+static int deferredDescriptorFreeCapacity;
 static int deferredDescriptorFreeCount;
+
+static void VK_DeferredDescriptorFreeEnsureCapacity(int needed)
+{
+	int newCapacity;
+
+	if (needed <= deferredDescriptorFreeCapacity) {
+		return;
+	}
+
+	newCapacity = deferredDescriptorFreeCapacity ? deferredDescriptorFreeCapacity * 2 : 256;
+	if (newCapacity < needed) {
+		newCapacity = needed;
+	}
+
+	deferredDescriptorFrees = (VkDescriptorSet*)Q_realloc(deferredDescriptorFrees, newCapacity * sizeof(deferredDescriptorFrees[0]));
+	deferredDescriptorFreeCapacity = newCapacity;
+}
 
 // See VK_TextureQueueDeferredBindlessSlotRefresh (defined further below,
 // after VK_TextureBindlessUpdateSlot exists to call) for why this queue
@@ -351,13 +374,14 @@ static void VK_TextureDestroyObjects(texture_ref texture)
 		// handle is captured here; the memset() below clears vktex->descriptorSet
 		// so the slot can be safely reused (reallocating a distinct new set) this
 		// same frame without touching the still-queued old one.
-		if (vk_options.frame.active && deferredDescriptorFreeCount < VK_MAX_DEFERRED_DESCRIPTOR_FREES) {
+		if (vk_options.frame.active) {
+			VK_DeferredDescriptorFreeEnsureCapacity(deferredDescriptorFreeCount + 1);
 			deferredDescriptorFrees[deferredDescriptorFreeCount++] = vktex->descriptorSet;
 		}
 		else {
-			// Off-frame (map load, vid_restart, shutdown) or the queue is full:
-			// safe/necessary to free immediately. vkDeviceWaitIdle above already
-			// drained any submitted frame still reading this set.
+			// Off-frame (map load, vid_restart, shutdown): safe/necessary to
+			// free immediately. vkDeviceWaitIdle above already drained any
+			// submitted frame still reading this set.
 			vkFreeDescriptorSets(vk_options.logicalDevice, textureDescriptorPool, 1, &vktex->descriptorSet);
 		}
 	}
@@ -1366,6 +1390,9 @@ void VK_TextureInitialiseState(void)
 	// Drop any queued deferred descriptor frees: their handles belong to the
 	// pool destroyed just below (which frees them wholesale), and freeing them
 	// individually afterwards would use a dangling pool handle.
+	Q_free(deferredDescriptorFrees);
+	deferredDescriptorFrees = NULL;
+	deferredDescriptorFreeCapacity = 0;
 	deferredDescriptorFreeCount = 0;
 
 	if (textureDescriptorPool != VK_NULL_HANDLE) {

@@ -330,7 +330,7 @@ static qbool VK_WorldNormalsRenderPassCreate(void)
 	VkAttachmentReference colorAttachmentRef;
 	VkAttachmentReference depthAttachmentRef;
 	VkSubpassDescription subpass;
-	VkSubpassDependency dependency;
+	VkSubpassDependency dependencies[2];
 	VkRenderPassCreateInfo renderPassInfo;
 
 	VK_InitialiseStructure(attachments[0]);
@@ -372,13 +372,32 @@ static qbool VK_WorldNormalsRenderPassCreate(void)
 	// attachment as a sampler (the composite pipeline's read, later in the
 	// same command buffer within the main render pass) before this pass's
 	// color write actually lands.
-	VK_InitialiseStructure(dependency);
-	dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
-	dependency.dstSubpass = 0;
-	dependency.srcStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-	dependency.srcAccessMask = 0;
-	dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
-	dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+	VK_InitialiseStructure(dependencies[0]);
+	dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+	dependencies[0].dstSubpass = 0;
+	dependencies[0].srcStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+	dependencies[0].srcAccessMask = 0;
+	dependencies[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+	dependencies[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
+	// Exit dependency: attachments[0].finalLayout already transitions the
+	// color attachment to SHADER_READ_ONLY_OPTIMAL, but a layout transition
+	// alone gives no ordering/visibility guarantee -- without this, nothing
+	// stops the GPU from reordering the later fragment-shader sampled read
+	// (VK_WorldOutlineComposite's descriptor, bound inside the main render
+	// pass right after this one ends, see VK_WorldNormalsTransitionForSampling's
+	// comment on why no separate barrier call exists) ahead of this pass's
+	// color write actually landing. Same hazard VK_PostProcessTransitionForSampling
+	// guards against with an explicit barrier for the post-process target;
+	// here a subpass dependency does the equivalent job since both passes
+	// share one command buffer with no gap for a standalone barrier call.
+	VK_InitialiseStructure(dependencies[1]);
+	dependencies[1].srcSubpass = 0;
+	dependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+	dependencies[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	dependencies[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	dependencies[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+	dependencies[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 
 	VK_InitialiseStructure(renderPassInfo);
 	renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
@@ -386,8 +405,8 @@ static qbool VK_WorldNormalsRenderPassCreate(void)
 	renderPassInfo.pAttachments = attachments;
 	renderPassInfo.subpassCount = 1;
 	renderPassInfo.pSubpasses = &subpass;
-	renderPassInfo.dependencyCount = 1;
-	renderPassInfo.pDependencies = &dependency;
+	renderPassInfo.dependencyCount = 2;
+	renderPassInfo.pDependencies = dependencies;
 
 	return vkCreateRenderPass(vk_options.logicalDevice, &renderPassInfo, NULL, &renderPasses[vk_renderpass_worldnormals]) == VK_SUCCESS;
 }
