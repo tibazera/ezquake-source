@@ -556,7 +556,7 @@ static void VK_AliasQueuePreparedDraw(
 
 	R_GetModelviewMatrix(modelView);
 	// R_MultiplyMatrix(lhs, rhs) writes rhs * lhs for the engine's matrix layout.
-	R_MultiplyMatrix(modelView, R_ProjectionMatrix(), mvp);
+	R_MultiplyMatrix(modelView, VK_JitteredProjectionMatrix(), mvp);
 
 	draw = &aliasDraws[aliasDrawCount++];
 	draw->firstVertex = (uint32_t)firstVertex;

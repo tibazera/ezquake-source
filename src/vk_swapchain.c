@@ -180,6 +180,15 @@ static qbool VK_CreateSceneDepthResources(void)
 
 	VK_DestroySceneDepthResources();
 
+	// SAMPLED_BIT on top of the usual DEPTH_STENCIL_ATTACHMENT_BIT: the
+	// motion-vector reconstruction pass (VK_MotionVectorsComposite, vk_upscale.c)
+	// samples this depth buffer to reproject each pixel against the previous
+	// frame. Only meaningful without MSAA -- VK_MotionVectorsActive() (vk_upscale.c)
+	// gates the whole temporal path off when vk_options.msaaSamples > 1, since
+	// sampling a multisampled depth image needs a sampler2DMS + explicit
+	// per-sample resolve this pass doesn't implement; falls back to the
+	// EASU+RCAS spatial-only path in that case, same as before this feature
+	// existed.
 	if (!VK_CreateImageResource(
 			vk_options.swapChain.sceneSize.width,
 			vk_options.swapChain.sceneSize.height,
@@ -187,7 +196,7 @@ static qbool VK_CreateSceneDepthResources(void)
 			vk_options.msaaSamples,
 			VK_DepthFormat(),
 			VK_IMAGE_TILING_OPTIMAL,
-			VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+			VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
 			VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
 			&vk_options.swapChain.sceneDepthImage,
 			&vk_options.swapChain.sceneDepthImageMemory)) {

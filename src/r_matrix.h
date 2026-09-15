@@ -49,6 +49,7 @@ float* R_ModelviewMatrix(void);
 float* R_ProjectionMatrix(void);
 
 void R_MultiplyMatrix(const float* lhs, const float* rhs, float* target);
+qbool R_InvertMatrix(const float* m, float* out);
 void R_MultiplyVector(const float* matrix, const float* vector, float* result);
 void R_MultiplyVector3f(const float* matrix, float x, float y, float z, float* result);
 void R_MultiplyVector3fv(const float* matrix, const vec3_t vector, float* result);

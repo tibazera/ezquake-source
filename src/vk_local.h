@@ -61,6 +61,15 @@ void VK_AbandonActiveFrame(void);
 void VK_PopulateConfig(void);
 void VK_RequestSwapChainRecreate(void);
 void VK_RequestSurfaceRecreate(void);
+// Jittered projection matrix for this frame's 3D draws (world/aliasmodel/
+// sprite3d MVP construction) -- returns R_ProjectionMatrix() unmodified
+// when the upscaler is off, a Halton-jittered copy when it's on. See
+// vk_main.c for the full explanation and VK_PrevViewProjMatrix for the
+// paired previous-frame matrix the motion-vector pass reprojects against.
+const float* VK_JitteredProjectionMatrix(void);
+const float* VK_PrevViewProjMatrix(void);
+void VK_AdvanceJitter(void);
+qbool VK_CurrentInvViewProjMatrix(float* out);
 void VK_EndWorldPassAndComposite(void);
 
 // vk_instance.c

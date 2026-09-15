@@ -2277,7 +2277,7 @@ static qbool VK_DrawWorldNormalsPass(VkCommandBuffer commandBuffer, VkBuffer ver
 			memcpy(push.mvp, lastMvp, sizeof(push.mvp));
 		}
 		else {
-			R_MultiplyMatrix(worldDraws[i].modelView, R_ProjectionMatrix(), push.mvp);
+			R_MultiplyMatrix(worldDraws[i].modelView, VK_JitteredProjectionMatrix(), push.mvp);
 			memcpy(lastModelView, worldDraws[i].modelView, sizeof(lastModelView));
 			memcpy(lastMvp, push.mvp, sizeof(lastMvp));
 			haveLastMvp = true;
@@ -2542,7 +2542,7 @@ void VK_RenderView(void)
 				memcpy(push.mvp, lastMvp, sizeof(push.mvp));
 			}
 			else {
-				R_MultiplyMatrix(worldDraws[i].modelView, R_ProjectionMatrix(), push.mvp);
+				R_MultiplyMatrix(worldDraws[i].modelView, VK_JitteredProjectionMatrix(), push.mvp);
 				memcpy(lastMultipliedModelView, worldDraws[i].modelView, sizeof(lastMultipliedModelView));
 				memcpy(lastMvp, push.mvp, sizeof(lastMvp));
 				haveLastMvp = true;

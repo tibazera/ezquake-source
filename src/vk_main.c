@@ -38,6 +38,18 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 vk_options_t vk_options;
 static qbool vk_recreate_swapchain_requested;
 static qbool vk_recreate_surface_requested;
+
+// Temporal-jitter state for VK_JitteredProjectionMatrix/VK_UpdateJitterHistory
+// (see below) -- reconstructed motion vectors for the FSR2-style upscaler.
+// prevViewProj is the *unjittered* view-projection from the previous frame
+// (jitter must not accumulate into the history compare, only into what's
+// actually rendered this frame); prevViewProjValid is false for exactly one
+// frame after vid_restart or after upscaling becomes active, so the motion
+// vector pass can fall back to "no motion" instead of reprojecting against
+// garbage/stale data.
+static float vk_jitter_prevViewProj[16];
+static qbool vk_jitter_prevViewProjValid;
+static uint32_t vk_jitter_frameIndex;
 // A freshly (re)created swapchain/MSAA image's real Vulkan layout is
 // VK_IMAGE_LAYOUT_UNDEFINED -- it has never been rendered to or presented.
 // vk_renderpass_main_noclear's LOAD op (picked whenever clear_color below
@@ -520,6 +532,131 @@ void VK_RequestSwapChainRecreate(void)
 	vk_recreate_swapchain_requested = true;
 }
 
+// 8-point Halton(2,3) sequence, the standard low-discrepancy jitter pattern
+// TAA/FSR2-style temporal upscalers use (same sequence AMD's own FSR2
+// sample and most TAA implementations use) -- covers a pixel's area evenly
+// over 8 frames before repeating, in NDC-space half-pixel units.
+static const float vk_jitter_halton8[8][2] = {
+	{  0.500000f, -0.333333f }, { -0.500000f,  0.333333f },
+	{  0.250000f, -0.777778f }, { -0.250000f, -0.111111f },
+	{  0.750000f,  0.555556f }, { -0.750000f, -0.555556f },
+	{  0.125000f,  0.111111f }, { -0.125000f, -0.925926f },
+};
+
+// Jittered projection matrix for this frame's 3D draws, used by every
+// vk_world.c/vk_aliasmodel.c/vk_sprite3d.c call site that used to read
+// R_ProjectionMatrix() directly for its MVP. Only jitters when the upscaler
+// is actually going to reproject against it (VK_UpscaleActive()); otherwise
+// returns the real projection unmodified so nothing changes when upscaling
+// is off, matching every draw path's behaviour before this feature existed.
+// The offset is scaled by VK_SceneRenderExtent() (the low-res render
+// target), not the native swapchain size -- jitter must move the sample by
+// a fraction of a low-res texel for the upscaler's history resolve to work,
+// a native-res fraction would be too small to matter after downscaling to
+// sceneSize.
+const float* VK_JitteredProjectionMatrix(void)
+{
+	static float jittered[16];
+	VkExtent2D sceneSize;
+	float jitterX, jitterY;
+
+	if (!VK_UpscaleActive()) {
+		return R_ProjectionMatrix();
+	}
+
+	sceneSize = VK_SceneRenderExtent();
+	jitterX = vk_jitter_halton8[vk_jitter_frameIndex % 8][0] * (2.0f / (float)max(1, (int)sceneSize.width));
+	jitterY = vk_jitter_halton8[vk_jitter_frameIndex % 8][1] * (2.0f / (float)max(1, (int)sceneSize.height));
+
+	memcpy(jittered, R_ProjectionMatrix(), sizeof(jittered));
+	// Standard projection-matrix jitter injection: bias the same terms
+	// R_Frustum uses for the (right+left)/(right-left) and (top+bottom)/
+	// (top-bottom) asymmetric-frustum offset -- column-major layout, so
+	// these are matrix[8]/matrix[9] (third column, x/y rows). Works for any
+	// perspective projection built the way R_Frustum builds it, jittered or
+	// not, orthographic or reversed-depth included, since it only touches
+	// the existing off-axis term rather than assuming a specific near/far
+	// setup.
+	jittered[8] += jitterX;
+	jittered[9] += jitterY;
+	return jittered;
+}
+
+// Converts an engine-convention (GL-style) clip-space matrix into the
+// Vulkan-clip-space matrix every vertex shader here actually produces via
+// its own manual `clip.y = -clip.y; clip.z = clip.z*0.5+clip.w*0.5;` --
+// applying the equivalent transform here as a matrix multiply instead means
+// the motion-vector pass's invViewProj (see VK_PrevViewProjMatrix) is
+// consistent with the depth values it samples (which were written by those
+// same vertex shaders), independent of glConfig.reversed_depth's effect on
+// the projection matrix's Z terms -- this matrix works the same either way
+// since it operates on whatever Z the projection matrix already produced,
+// not a specific assumed range.
+static void VK_ToVulkanClipSpace(const float* glClip, float* vulkanClip)
+{
+	static const float flipRemap[16] = {
+		1, 0, 0, 0,
+		0, -1, 0, 0,
+		0, 0, 0.5f, 0,
+		0, 0, 0.5f, 1,
+	};
+	R_MultiplyMatrix(glClip, flipRemap, vulkanClip);
+}
+
+// Called once per frame from VK_BeginFrame, before any 3D draw call reads
+// VK_JitteredProjectionMatrix() -- advances the jitter sequence and snapshots
+// this frame's *unjittered* view-projection, already converted to Vulkan
+// clip space (see VK_ToVulkanClipSpace), as what VK_PrevViewProjMatrix()
+// will return next frame (see its own comment for why unjittered).
+void VK_AdvanceJitter(void)
+{
+	float modelView[16];
+	float glViewProj[16];
+
+	++vk_jitter_frameIndex;
+
+	if (!VK_UpscaleActive()) {
+		vk_jitter_prevViewProjValid = false;
+		return;
+	}
+
+	R_GetModelviewMatrix(modelView);
+	R_MultiplyMatrix(modelView, R_ProjectionMatrix(), glViewProj);
+	VK_ToVulkanClipSpace(glViewProj, vk_jitter_prevViewProj);
+	vk_jitter_prevViewProjValid = true;
+}
+
+// The *previous* frame's unjittered view-projection matrix (already in
+// Vulkan clip space, see VK_ToVulkanClipSpace), or NULL if none is
+// available yet (first frame upscaling was active, or since the last
+// vid_restart) -- the motion-vector reconstruction pass (vk_upscale.c) uses
+// this to reproject each pixel's world position back to where it was last
+// frame. Deliberately NOT the jittered matrix: jitter is a sub-pixel
+// rendering offset, not a real camera move, and reprojecting through it
+// would inject spurious motion into every static pixel in the scene.
+const float* VK_PrevViewProjMatrix(void)
+{
+	return vk_jitter_prevViewProjValid ? vk_jitter_prevViewProj : NULL;
+}
+
+// This frame's (jittered) view-projection, inverted and already in Vulkan
+// clip space -- what VK_MotionVectorsComposite needs to reconstruct world
+// position from a screen UV + sampled depth. NULL if the camera matrices
+// aren't set up yet this frame (shouldn't happen in practice, since this is
+// only called from the composite pass late in the frame, but checked
+// defensively same as VK_PrevViewProjMatrix) or the matrix is singular.
+qbool VK_CurrentInvViewProjMatrix(float* out)
+{
+	float modelView[16];
+	float glViewProj[16];
+	float vulkanViewProj[16];
+
+	R_GetModelviewMatrix(modelView);
+	R_MultiplyMatrix(modelView, VK_JitteredProjectionMatrix(), glViewProj);
+	VK_ToVulkanClipSpace(glViewProj, vulkanViewProj);
+	return R_InvertMatrix(vulkanViewProj, out);
+}
+
 void VK_RequestSurfaceRecreate(void)
 {
 	vk_recreate_surface_requested = true;
@@ -604,6 +741,13 @@ void VK_BeginFrame(void)
 		}
 	}
 	vk_options.frame.imageInFlightFences[vk_options.frame.imageIndex] = frameFence;
+
+	// Must run before R_SetupFrame/R_RenderView (called by the caller of
+	// R_BeginRendering -> this function, see SCR_UpdateScreenPlayerView)
+	// recompute R_ProjectionMatrix()/the camera's modelview for THIS frame --
+	// VK_AdvanceJitter snapshots whatever those still hold from the PREVIOUS
+	// frame as vk_jitter_prevViewProj before that happens.
+	VK_AdvanceJitter();
 
 	// Anti-lag / low-latency input marker: as close to the start of the
 	// frame's CPU work as we can get it, before any of the (potentially
