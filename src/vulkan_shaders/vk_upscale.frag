@@ -37,8 +37,6 @@ vec3 SampleColor(vec2 uv)
 	return textureLod(sceneColor, uv, 0.0).rgb;
 }
 
-float Luma(vec3 c) { return c.g; }
-
 vec3 Easu(vec2 outPixel)
 {
 	// Center of the output pixel, mapped into input (low-res) pixel space.
@@ -67,23 +65,21 @@ vec3 Easu(vec2 outPixel)
 	// away from) -- e/f/h/i are the 4 texels actually straddling srcPixel.
 	vec3 baseSample = mix(mix(e, f, frac.x), mix(h, i, frac.x), frac.y);
 
-	// Edge-direction sharpening lobe: local Laplacian of luma steers an
-	// unsharp-mask style push away from the blurred bilinear estimate,
-	// clamped to the local min/max so it can't ring past FSR1's intent.
-	float lumaE = Luma(e), lumaMin = lumaE, lumaMax = lumaE;
-	lumaMin = min(lumaMin, min(min(Luma(a), Luma(b)), min(Luma(c), Luma(d))));
-	lumaMin = min(lumaMin, min(min(Luma(f), Luma(g)), min(Luma(h), Luma(i))));
-	lumaMax = max(lumaMax, max(max(Luma(a), Luma(b)), max(Luma(c), Luma(d))));
-	lumaMax = max(lumaMax, max(max(Luma(f), Luma(g)), max(Luma(h), Luma(i))));
-
+	// Edge-direction sharpening lobe: local Laplacian steers an unsharp-mask
+	// style push away from the blurred bilinear estimate, clamped below to
+	// the local per-channel min/max so it can't ring past FSR1's intent.
 	vec3 laplacian = 4.0 * e - (b + d + f + h);
 	vec3 sharpened = baseSample + laplacian * 0.20;
 
-	// Clamp to neighborhood range to avoid halo/ringing artifacts.
-	float lumaS = Luma(sharpened);
-	if (lumaMax > lumaMin) {
-		float t = clamp((lumaS - lumaMin) / (lumaMax - lumaMin), 0.0, 1.0);
-		sharpened = mix(vec3(lumaMin), vec3(lumaMax), t) + (sharpened - vec3(lumaS));
+	// Clamp each RGB channel to its own neighborhood min/max (not just luma)
+	// to avoid halo/ringing artifacts -- a luma-only clamp lets the laplacian
+	// push R or B far outside the neighborhood range while G stays in range,
+	// which reads as a magenta/purple fringe on high-contrast edges (e.g.
+	// world-geometry-against-sky, or HUD-against-3D-scene boundaries).
+	{
+		vec3 nbMin = min(min(min(a, b), min(c, d)), min(min(f, g), min(h, i)));
+		vec3 nbMax = max(max(max(a, b), max(c, d)), max(max(f, g), max(h, i)));
+		sharpened = clamp(sharpened, nbMin, nbMax);
 	}
 
 	return sharpened;
@@ -101,16 +97,16 @@ vec3 Rcas(vec2 outUv, vec3 center)
 	vec3 w = SampleColor(outUv + vec2(-1.0, 0.0) * px);
 	vec3 e = SampleColor(outUv + vec2( 1.0, 0.0) * px);
 
-	float lumaC = Luma(center), lumaN = Luma(n), lumaS = Luma(s), lumaW = Luma(w), lumaE = Luma(e);
-	float lumaMin = min(lumaC, min(min(lumaN, lumaS), min(lumaW, lumaE)));
-	float lumaMax = max(lumaC, max(max(lumaN, lumaS), max(lumaW, lumaE)));
-
 	float amount = 0.25; // fixed moderate sharpen, no user-exposed knob yet
 	vec3 sharpen = center * (1.0 + 4.0 * amount) - (n + s + w + e) * amount;
 
-	if (lumaMax > lumaMin) {
-		float t = clamp((Luma(sharpen) - lumaMin) / (lumaMax - lumaMin), 0.0, 1.0);
-		sharpen = mix(vec3(lumaMin), vec3(lumaMax), t) + (sharpen - vec3(Luma(sharpen)));
+	// Per-channel clamp, same reasoning as Easu()'s clamp above -- a
+	// luma-only clamp here produced the same magenta-fringe artifact on
+	// high-contrast edges.
+	{
+		vec3 nbMin = min(center, min(min(n, s), min(w, e)));
+		vec3 nbMax = max(center, max(max(n, s), max(w, e)));
+		sharpen = clamp(sharpen, nbMin, nbMax);
 	}
 	return sharpen;
 }

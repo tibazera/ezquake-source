@@ -306,10 +306,20 @@ cvar_t vid_vulkan_antilag          = {"vid_vulkan_antilag",            "0" };
 // copy), <1.0 renders smaller and upscales, matching the DLSS "Quality"
 // (0.66)/"Balanced" (0.58)/"Performance" (0.5) convention. HUD/console always
 // draw at native resolution regardless of this value -- see vk_upscale.c.
-cvar_t vid_vulkan_renderscale       = {"vid_vulkan_renderscale",        "1" };
+// CVAR_LATCH_GFX: vk_options.swapChain.sceneSize is only recomputed inside
+// VK_CreatePostProcessResources, which only runs on swapchain
+// creation/resize/vid_restart -- setting this at the console has no visible
+// effect until the next vid_restart. LATCH_GFX makes the engine print that
+// "will be applied after vid_restart" itself instead of silently doing
+// nothing, which is what plain (non-latched) behaved like before this flag
+// was added.
+cvar_t vid_vulkan_renderscale       = {"vid_vulkan_renderscale",        "1",       CVAR_LATCH_GFX };
 // 0 = off (plain bilinear/point copy to native res), 1 = FSR2, 2 = DLSS (once
-// NGX integration lands -- see CONTINUE.md).
-cvar_t vid_vulkan_upscaler          = {"vid_vulkan_upscaler",           "0" };
+// NGX integration lands -- see CONTINUE.md). Same CVAR_LATCH_GFX reasoning
+// as vid_vulkan_renderscale above -- VK_UpscaleActive() itself is read
+// per-frame, but upscaleActive/sceneSize (whether there's actually anything
+// to upscale) are swapchain-recreate-time decisions.
+cvar_t vid_vulkan_upscaler          = {"vid_vulkan_upscaler",           "0",       CVAR_LATCH_GFX };
 
 
 //
