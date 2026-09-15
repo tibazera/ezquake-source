@@ -507,6 +507,7 @@ if(RENDERER_VULKAN)
     add_vulkan_shader(vulkan_spirv_shaders ${VULKAN_SHADER_DIR}/vk_world_normals.vert vk_world_normals_vert.spv)
     add_vulkan_shader(vulkan_spirv_shaders ${VULKAN_SHADER_DIR}/vk_world_normals.frag vk_world_normals_frag.spv)
     add_vulkan_shader(vulkan_spirv_shaders ${VULKAN_SHADER_DIR}/vk_world_outline.frag vk_world_outline_frag.spv)
+    add_vulkan_shader(vulkan_spirv_shaders ${VULKAN_SHADER_DIR}/vk_upscale.frag vk_upscale_frag.spv)
     add_resources(shaders_vulkan ${vulkan_spirv_shaders})
 
     set(vulkan_renderer_headers
@@ -533,6 +534,7 @@ if(RENDERER_VULKAN)
             ${SOURCE_DIR}/vk_sprite3d.c
             ${SOURCE_DIR}/vk_swapchain.c
             ${SOURCE_DIR}/vk_texture.c
+            ${SOURCE_DIR}/vk_upscale.c
             ${SOURCE_DIR}/vk_vao.c
             ${SOURCE_DIR}/vk_window_surface.c
             ${SOURCE_DIR}/vk_world.c

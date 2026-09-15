@@ -130,7 +130,7 @@ static void VK_SetCoordinates(glm_image_t* targ, float x1, float y1, float x2, f
 	targ[0].flags = targ[1].flags = targ[2].flags = targ[3].flags = flags;
 }
 
-static VkShaderModule VK_HudCreateShaderModule(const unsigned char* bytes, unsigned int length)
+VkShaderModule VK_HudCreateShaderModule(const unsigned char* bytes, unsigned int length)
 {
 	VkShaderModuleCreateInfo createInfo;
 	VkShaderModule shaderModule = VK_NULL_HANDLE;
@@ -156,7 +156,7 @@ static VkShaderModule VK_HudCreateShaderModule(const unsigned char* bytes, unsig
 	return shaderModule;
 }
 
-static void VK_HudSetViewportScissor(VkCommandBuffer commandBuffer)
+void VK_HudSetViewportScissor(VkCommandBuffer commandBuffer)
 {
 	VkViewport viewport;
 	VkRect2D scissor;
@@ -726,6 +726,19 @@ void VK_PostProcessComposite(VkCommandBuffer commandBuffer, uint32_t imageIndex)
 	VkDescriptorSet descriptorSet;
 	vk_post_process_push_t push;
 	qbool paletteActive = vid_software_palette.integer != 0;
+
+	// When the scene was rendered below native resolution (sceneSize <
+	// imageSize), this composite pass IS the resize: run the FSR2-style
+	// spatial upscale instead of the plain gamma/FXAA blit below (which
+	// assumes 1:1 source/destination sampling and would just look like a
+	// blurry bilinear stretch). Gamma/contrast/FXAA on the upscaled result
+	// still happen the normal way after this -- VK_HudBeginNativePass's HUD
+	// pass composites on top of whatever this writes, same as the non-
+	// upscaling path.
+	if (VK_UpscaleActive()) {
+		VK_UpscaleComposite(commandBuffer, imageIndex);
+		return;
+	}
 
 	if (!VK_PostProcessCreatePipeline()) {
 		return;

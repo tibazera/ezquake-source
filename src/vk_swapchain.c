@@ -279,6 +279,14 @@ static qbool VK_CreateSceneMSAAColorResources(void)
 
 static void VK_DestroyPostProcessDescriptors(void)
 {
+	// VK_UpscaleForgetDescriptorSets (vk_upscale.c) only frees its tracking
+	// array, it does NOT call vkFreeDescriptorSets -- those sets come from
+	// this same pool and are freed implicitly by vkDestroyDescriptorPool
+	// below. Must run before that destroy so it's not touching stale handles
+	// afterwards, though order doesn't matter for correctness here since it
+	// only frees host memory.
+	VK_UpscaleForgetDescriptorSets();
+
 	if (vk_options.swapChain.postProcessDescriptorPool != VK_NULL_HANDLE) {
 		vkDestroyDescriptorPool(vk_options.logicalDevice, vk_options.swapChain.postProcessDescriptorPool, NULL);
 		vk_options.swapChain.postProcessDescriptorPool = VK_NULL_HANDLE;
@@ -548,15 +556,22 @@ qbool VK_CreatePostProcessResources(void)
 		}
 	}
 
+	// x2: one combined-image-sampler set per swapchain image for the plain
+	// post-process composite (postProcessDescriptorSets), plus one more per
+	// image for the upscale composite (vk_upscale.c's own descriptor sets,
+	// allocated from this same pool) -- both read the same postProcessColor
+	// image but bind through different pipeline layouts, so they need
+	// distinct descriptor sets even though only one of the two is ever
+	// actually drawn with per frame.
 	VK_InitialiseStructure(poolSize);
 	poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-	poolSize.descriptorCount = vk_options.swapChain.imageCount;
+	poolSize.descriptorCount = vk_options.swapChain.imageCount * 2;
 
 	VK_InitialiseStructure(poolInfo);
 	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
 	poolInfo.poolSizeCount = 1;
 	poolInfo.pPoolSizes = &poolSize;
-	poolInfo.maxSets = vk_options.swapChain.imageCount;
+	poolInfo.maxSets = vk_options.swapChain.imageCount * 2;
 
 	if (vkCreateDescriptorPool(vk_options.logicalDevice, &poolInfo, NULL, &vk_options.swapChain.postProcessDescriptorPool) != VK_SUCCESS) {
 		VK_DestroyPostProcessResources();
@@ -1024,6 +1039,7 @@ qbool VK_CreateSwapChainFramebuffers(void)
 
 void VK_DestroySwapChainFramebuffers(void)
 {
+	VK_DestroyUpscaleResources();
 	VK_DestroyPostProcessResources();
 	VK_DestroyWorldNormalsResources();
 

@@ -128,6 +128,22 @@ void VK_PostProcessComposite(VkCommandBuffer commandBuffer, uint32_t imageIndex)
 void VK_WorldNormalsTransitionForSampling(VkCommandBuffer commandBuffer, uint32_t imageIndex);
 void VK_WorldOutlineComposite(VkCommandBuffer commandBuffer, uint32_t imageIndex);
 qbool VK_WorldOutlineActive(void);
+VkShaderModule VK_HudCreateShaderModule(const unsigned char* bytes, unsigned int length);
+void VK_HudSetViewportScissor(VkCommandBuffer commandBuffer);
+
+// vk_upscale.c
+// FSR2-style spatial upscale (EASU+RCAS, see vk_upscale.frag) of the
+// low-res scene target (sceneSize) up to the native swapchain resolution
+// (imageSize), used by VK_PostProcessComposite in place of a plain blit
+// when vk_options.swapChain.upscaleActive. Not temporal FSR2 -- see
+// vk_upscale.frag's header comment for why. DLSS is not implemented (needs
+// the proprietary NVIDIA NGX SDK, not vendored here); vid_vulkan_upscaler 2
+// falls back to this same FSR2-style path until NGX support exists.
+qbool VK_UpscaleActive(void);
+qbool VK_CreateUpscaleResources(void);
+void VK_DestroyUpscaleResources(void);
+void VK_UpscaleComposite(VkCommandBuffer commandBuffer, uint32_t imageIndex);
+void VK_UpscaleForgetDescriptorSets(void);
 
 // vk_blending.c
 void VK_BlendingConfigure(VkPipelineColorBlendStateCreateInfo* info, VkPipelineColorBlendAttachmentState* blending, r_blendfunc_t func);
