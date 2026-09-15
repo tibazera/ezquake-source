@@ -37,6 +37,10 @@ layout(push_constant) uniform PushConstants {
 	// gating conditions) -- false means binding 3's contents are stale/from
 	// an earlier frame and must not be read.
 	int temporalActive;
+	// Mirrors glConfig.reversed_depth (gl_reverse_z cvar, default on) --
+	// which end of the depth range is "far/sky" flips between the two
+	// modes, see ReprojectToPreviousFrame's use of this below.
+	int reversedDepth;
 } pc;
 
 // AMD FidelityFX Super Resolution 1.0 EASU (Edge-Adaptive Spatial Upsampling),
@@ -149,17 +153,20 @@ bool ReprojectToPreviousFrame(vec2 outUv, out vec2 prevUv)
 	// pixel to the low-res source, but here we only need the UV, not a
 	// specific texel's 3x3 neighborhood.
 	float depth = texture(sceneDepth, outUv).r;
-	// Assumes gl_reverse_z 1 (the engine default, see vid_sdl.c) where
-	// depth==0 is the far plane/sky -- "nothing real to reproject" there.
-	// With gl_reverse_z 0 this check is wrong (0 would instead be the NEAR
-	// plane), but reprojecting a wrong depth value just produces a
-	// discarded/clamped-away history sample worst case (see the
-	// neighborhood clamp in main() below), not a crash or visible
-	// corruption -- acceptable for now since gl_reverse_z 0 is not the
-	// common/tested configuration this upscaler was built and reasoned
-	// about against.
-	if (depth <= 0.0) {
-		return false;
+	// With reversedDepth (gl_reverse_z 1, the engine default): depth==0 is
+	// the far plane/sky -- reject reprojecting "nothing real is here".
+	// Without it (gl_reverse_z 0): depth==1 is the far plane/sky instead
+	// (the far/near mapping is inverted between the two modes, see
+	// R_Frustum in r_matrix.c) -- same rejection, opposite threshold.
+	if (pc.reversedDepth != 0) {
+		if (depth <= 0.0) {
+			return false;
+		}
+	}
+	else {
+		if (depth >= 1.0) {
+			return false;
+		}
 	}
 
 	vec4 ndc = vec4(outUv.x * 2.0 - 1.0, outUv.y * 2.0 - 1.0, depth, 1.0);

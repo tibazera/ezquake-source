@@ -31,6 +31,7 @@
 //     integration point rather than raw NGX, worth evaluating first)
 
 #include "quakedef.h"
+#include "tr_types.h"
 #include "vk_local.h"
 
 extern cvar_t vid_vulkan_upscaler;
@@ -47,6 +48,12 @@ typedef struct vk_upscale_push_s {
 	float contrast;
 	int sharpness;
 	int temporalActive;
+	// Mirrors glConfig.reversed_depth (r_matrix.c's R_Frustum reads the
+	// same field to pick the projection matrix's Z terms) -- lets
+	// ReprojectToPreviousFrame's sky/background depth check pick the right
+	// direction instead of assuming reversed_depth 1 (the default, but a
+	// real user-settable CVAR_LATCH_GFX cvar, gl_reverse_z).
+	int reversedDepth;
 } vk_upscale_push_t;
 
 // The two reprojection matrices don't fit in the push constant block above
@@ -77,29 +84,51 @@ static VkDescriptorSetLayout upscaleDescriptorSetLayout = VK_NULL_HANDLE;
 static VkPipelineLayout upscalePipelineLayout = VK_NULL_HANDLE;
 static VkPipeline upscalePipeline = VK_NULL_HANDLE;
 
-// Persistent history buffer: the previous frame's final upscaled color, at
-// native (imageSize) resolution -- NOT indexed by swapchain image index
-// (that can reorder frame to frame, see the comment on
-// VK_UpscaleUpdateHistory below) or frame-in-flight index, just one single
-// image copied into every frame from that frame's final composite output.
-static VkImage historyImage = VK_NULL_HANDLE;
-static VkDeviceMemory historyImageMemory = VK_NULL_HANDLE;
-static VkImageView historyImageView = VK_NULL_HANDLE;
+// Persistent history buffers: the previous frame's final upscaled color, at
+// native (imageSize) resolution -- PING-PONGED across 2 slots (historyIndex
+// below alternates 0/1 every frame), NOT a single shared image. A single
+// image would have frame N's vkCmdCopyImage write racing frame N+1's
+// fragment-shader read of the SAME image with no cross-command-buffer
+// synchronization (command buffers here are indexed by swapchain imageIndex,
+// which VK_BeginFrame only fences per-imageIndex -- neither that fence nor
+// the per-frame barriers inside VK_UpscaleUpdateHistory/VK_UpscaleComposite
+// order two DIFFERENT command buffers' access to a resource neither of them
+// exclusively owns). Ping-ponging means frame N reads slot A / writes slot
+// B while frame N+1 reads slot B / writes slot A -- each slot is written by
+// one frame and read by the NEXT, never touched by two frames' command
+// buffers at once, so the existing per-imageIndex fence wait (which already
+// guarantees frame N-2's command buffer finished before frame N's reuses
+// that imageIndex slot, VK_MAX_FRAMES_IN_FLIGHT=3 frames apart) is enough
+// -- no new synchronization primitive needed, just never aliasing the same
+// image across adjacent frames.
+static VkImage historyImages[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+static VkDeviceMemory historyImageMemories[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+static VkImageView historyImageViews[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
 static VkExtent2D historyImageSize;
-// False for exactly one frame after the history image is (re)created --
-// its contents are undefined until the first copy into it, so the shader
-// must not blend against it yet. Mirrors vk_jitter_prevViewProjValid's
-// same-shaped problem in vk_main.c.
+// Slot written THIS frame (VK_UpscaleUpdateHistory) -- VK_UpscaleComposite
+// reads the OTHER slot (1 - historyIndex), which holds what was written
+// last frame. Advanced once per frame by VK_UpscaleUpdateHistory, after
+// this frame's composite has already read the other slot.
+static int historyIndex;
+// False until the slot VK_UpscaleComposite is about to read has actually
+// been written at least once -- both slots start with undefined contents,
+// so this must stay false for the first 2 frames temporal upscaling is
+// active (one write per slot) before either is safe to sample. Also false
+// for exactly one frame after the history images are (re)created (resize).
+// Mirrors vk_jitter_prevViewProjValid's same-shaped problem in vk_main.c.
 static qbool historyValid;
+static int historyValidFrameCount;
 
-// Per-frame reprojection matrices UBO (see vk_upscale_matrices_t) -- a
-// single persistently-mapped host-visible buffer, updated once per frame
-// via vkCmdUpdateBuffer, not per-swapchain-image like the color/depth
-// samplers above (there's only one "current frame", so no double-buffering
-// concern the way postProcessColorImages[] has to handle across images in
-// flight).
-static VkBuffer matricesBuffer = VK_NULL_HANDLE;
-static VkDeviceMemory matricesBufferMemory = VK_NULL_HANDLE;
+// Per-frame reprojection matrices UBO (see vk_upscale_matrices_t) --
+// ping-ponged across the SAME 2 slots as historyImages above and for the
+// identical reason: frame N's fragment shader can still be reading
+// matricesBuffer[historyIndex from N's own perspective] on the GPU while
+// frame N+1's command buffer calls vkCmdUpdateBuffer on it, since they're
+// different command buffers with no fence between them. Always written and
+// read using the SAME historyIndex/readIndex pairing as historyImages, so
+// the two stay in lockstep (both describe "frame N-1's state").
+static VkBuffer matricesBuffers[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+static VkDeviceMemory matricesBufferMemories[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
 
 qbool VK_UpscaleActive(void)
 {
@@ -208,10 +237,13 @@ static qbool VK_UpscaleCreatePipeline(void)
 		}
 	}
 
-	if (matricesBuffer == VK_NULL_HANDLE) {
-		if (!VK_CreateBufferResource(sizeof(vk_upscale_matrices_t), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-				VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &matricesBuffer, &matricesBufferMemory)) {
-			return false;
+	if (matricesBuffers[0] == VK_NULL_HANDLE) {
+		int slot;
+		for (slot = 0; slot < 2; ++slot) {
+			if (!VK_CreateBufferResource(sizeof(vk_upscale_matrices_t), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+					VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &matricesBuffers[slot], &matricesBufferMemories[slot])) {
+				return false;
+			}
 		}
 	}
 
@@ -348,7 +380,7 @@ static VkDescriptorSet VK_UpscaleDescriptorSet(uint32_t imageIndex)
 	if (imageIndex >= vk_options.swapChain.imageCount || !vk_options.swapChain.postProcessColorImageViews) {
 		return VK_NULL_HANDLE;
 	}
-	if (vk_options.swapChain.sceneDepthImageView == VK_NULL_HANDLE || historyImageView == VK_NULL_HANDLE || matricesBuffer == VK_NULL_HANDLE) {
+	if (vk_options.swapChain.sceneDepthImageView == VK_NULL_HANDLE || historyImageViews[0] == VK_NULL_HANDLE || matricesBuffers[0] == VK_NULL_HANDLE) {
 		return VK_NULL_HANDLE;
 	}
 
@@ -382,13 +414,33 @@ static VkDescriptorSet VK_UpscaleDescriptorSet(uint32_t imageIndex)
 	depthImageInfo.imageView = vk_options.swapChain.sceneDepthImageView;
 	depthImageInfo.sampler = upscaleDepthSampler;
 
+	// History reads slot (1 - historyIndex): historyIndex is the slot THIS
+	// frame's VK_UpscaleUpdateHistory is about to write (or already wrote,
+	// if called before this -- but VK_UpscaleUpdateMatrices/descriptor set
+	// binding happens before the composite render pass, which is before
+	// VK_UpscaleUpdateHistory's post-render-pass write, see the call order
+	// in VK_EndWorldPassAndComposite), so the other slot holds what was
+	// written LAST frame -- exactly what this frame's reprojection needs
+	// (color history has a genuine 1-frame delay: written this frame, read
+	// next frame).
+	//
+	// The matrices UBO reads slot historyIndex instead -- NOT the same
+	// slot as history. Unlike color history, this frame's invViewProj/
+	// prevViewProj are written AND read within the SAME frame (by
+	// VK_UpscaleUpdateMatrices then VK_UpscaleComposite, both this frame);
+	// the ping-pong here exists only so frame N+1's vkCmdUpdateBuffer can't
+	// race frame N's still-in-flight fragment-shader read of the SAME
+	// buffer slot on a different command buffer, by writing a slot frame N
+	// isn't using. historyIndex identifies "the slot not in use by the
+	// previous frame's still-possibly-in-flight command buffer", correct
+	// for both uses despite the different read-timing semantics.
 	VK_InitialiseStructure(historyImageInfo);
 	historyImageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-	historyImageInfo.imageView = historyImageView;
+	historyImageInfo.imageView = historyImageViews[1 - historyIndex];
 	historyImageInfo.sampler = upscaleSampler;
 
 	VK_InitialiseStructure(bufferInfo);
-	bufferInfo.buffer = matricesBuffer;
+	bufferInfo.buffer = matricesBuffers[historyIndex];
 	bufferInfo.offset = 0;
 	bufferInfo.range = sizeof(vk_upscale_matrices_t);
 
@@ -431,24 +483,29 @@ static VkDescriptorSet VK_UpscaleDescriptorSet(uint32_t imageIndex)
 
 static void VK_UpscaleDestroyHistoryBuffer(void)
 {
-	if (historyImageView != VK_NULL_HANDLE) {
-		vkDestroyImageView(vk_options.logicalDevice, historyImageView, NULL);
-		historyImageView = VK_NULL_HANDLE;
-	}
-	if (historyImage != VK_NULL_HANDLE) {
-		vkDestroyImage(vk_options.logicalDevice, historyImage, NULL);
-		historyImage = VK_NULL_HANDLE;
-	}
-	if (historyImageMemory != VK_NULL_HANDLE) {
-		vkFreeMemory(vk_options.logicalDevice, historyImageMemory, NULL);
-		historyImageMemory = VK_NULL_HANDLE;
+	int slot;
+	for (slot = 0; slot < 2; ++slot) {
+		if (historyImageViews[slot] != VK_NULL_HANDLE) {
+			vkDestroyImageView(vk_options.logicalDevice, historyImageViews[slot], NULL);
+			historyImageViews[slot] = VK_NULL_HANDLE;
+		}
+		if (historyImages[slot] != VK_NULL_HANDLE) {
+			vkDestroyImage(vk_options.logicalDevice, historyImages[slot], NULL);
+			historyImages[slot] = VK_NULL_HANDLE;
+		}
+		if (historyImageMemories[slot] != VK_NULL_HANDLE) {
+			vkFreeMemory(vk_options.logicalDevice, historyImageMemories[slot], NULL);
+			historyImageMemories[slot] = VK_NULL_HANDLE;
+		}
 	}
 	historyImageSize.width = historyImageSize.height = 0;
 	historyValid = false;
+	historyValidFrameCount = 0;
+	historyIndex = 0;
 }
 
-// (Re)creates historyImage at vk_options.swapChain.imageSize if it doesn't
-// already exist at that size -- called every frame from
+// (Re)creates both historyImages[] slots at vk_options.swapChain.imageSize
+// if they don't already exist at that size -- called every frame from
 // VK_UpscaleComposite, cheap no-op once sized correctly. Sized at native
 // imageSize (not sceneSize): the history holds the final upscaled result,
 // same resolution the next frame's shader blends it against at output
@@ -456,8 +513,9 @@ static void VK_UpscaleDestroyHistoryBuffer(void)
 static qbool VK_UpscaleEnsureHistoryBuffer(void)
 {
 	VkImageViewCreateInfo viewInfo;
+	int slot;
 
-	if (historyImage != VK_NULL_HANDLE &&
+	if (historyImages[0] != VK_NULL_HANDLE &&
 		historyImageSize.width == vk_options.swapChain.imageSize.width &&
 		historyImageSize.height == vk_options.swapChain.imageSize.height) {
 		return true;
@@ -465,52 +523,78 @@ static qbool VK_UpscaleEnsureHistoryBuffer(void)
 
 	VK_UpscaleDestroyHistoryBuffer();
 
-	if (!VK_CreateImageResource(
-			vk_options.swapChain.imageSize.width,
-			vk_options.swapChain.imageSize.height,
-			1,
-			VK_SAMPLE_COUNT_1_BIT,
-			vk_options.physicalDeviceSurfaceFormat.format,
-			VK_IMAGE_TILING_OPTIMAL,
-			VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-			VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-			&historyImage,
-			&historyImageMemory)) {
-		return false;
-	}
+	for (slot = 0; slot < 2; ++slot) {
+		if (!VK_CreateImageResource(
+				vk_options.swapChain.imageSize.width,
+				vk_options.swapChain.imageSize.height,
+				1,
+				VK_SAMPLE_COUNT_1_BIT,
+				vk_options.physicalDeviceSurfaceFormat.format,
+				VK_IMAGE_TILING_OPTIMAL,
+				VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+				VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+				&historyImages[slot],
+				&historyImageMemories[slot])) {
+			VK_UpscaleDestroyHistoryBuffer();
+			return false;
+		}
 
-	VK_InitialiseStructure(viewInfo);
-	viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-	viewInfo.image = historyImage;
-	viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-	viewInfo.format = vk_options.physicalDeviceSurfaceFormat.format;
-	viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-	viewInfo.subresourceRange.levelCount = 1;
-	viewInfo.subresourceRange.layerCount = 1;
+		VK_InitialiseStructure(viewInfo);
+		viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+		viewInfo.image = historyImages[slot];
+		viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+		viewInfo.format = vk_options.physicalDeviceSurfaceFormat.format;
+		viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		viewInfo.subresourceRange.levelCount = 1;
+		viewInfo.subresourceRange.layerCount = 1;
 
-	if (vkCreateImageView(vk_options.logicalDevice, &viewInfo, NULL, &historyImageView) != VK_SUCCESS) {
-		VK_UpscaleDestroyHistoryBuffer();
-		return false;
+		if (vkCreateImageView(vk_options.logicalDevice, &viewInfo, NULL, &historyImageViews[slot]) != VK_SUCCESS) {
+			VK_UpscaleDestroyHistoryBuffer();
+			return false;
+		}
 	}
 
 	historyImageSize = vk_options.swapChain.imageSize;
-	// Freshly created: VK_IMAGE_LAYOUT_UNDEFINED, contents undefined. The
-	// first vkCmdCopyImage into it (VK_UpscaleUpdateHistory) transitions it
-	// properly; historyValid staying false until after that copy is what
-	// stops the shader from sampling it before then.
+	// Freshly created: both slots VK_IMAGE_LAYOUT_UNDEFINED, contents
+	// undefined. historyValid/historyValidFrameCount staying at their reset
+	// values (false/0) until each slot has been written at least once via
+	// VK_UpscaleUpdateHistory is what stops the shader from sampling either
+	// before then.
 	return true;
 }
 
-// Copies this frame's final composited swapchain image into historyImage,
-// so next frame's VK_UpscaleComposite has something to reproject against.
-// Must run OUTSIDE any render pass instance (vkCmdCopyImage isn't valid
-// inside one) -- called from VK_EndWorldPassAndComposite/VK_EndFrame right
-// after vkCmdEndRenderPass ends the composite pass, before the HUD pass
-// begins. Deliberately copies the pre-HUD composite output, not the final
-// post-HUD frame: reprojecting HUD/console pixels next frame would smear
-// UI elements that don't actually move with the camera.
+static VkImageMemoryBarrier VK_UpscaleMakeImageBarrier(VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout, VkAccessFlags srcAccess, VkAccessFlags dstAccess)
+{
+	VkImageMemoryBarrier barrier;
+
+	VK_InitialiseStructure(barrier);
+	barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	barrier.oldLayout = oldLayout;
+	barrier.newLayout = newLayout;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.image = image;
+	barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	barrier.subresourceRange.levelCount = 1;
+	barrier.subresourceRange.layerCount = 1;
+	barrier.srcAccessMask = srcAccess;
+	barrier.dstAccessMask = dstAccess;
+	return barrier;
+}
+
+// Copies this frame's final composited swapchain image into
+// historyImages[historyIndex] (the slot this frame is writing -- see the
+// historyIndex field comment for the ping-pong scheme), so next frame's
+// VK_UpscaleComposite has something to reproject against. Must run OUTSIDE
+// any render pass instance (vkCmdCopyImage isn't valid inside one) --
+// called from VK_EndWorldPassAndComposite/VK_EndFrame right after
+// vkCmdEndRenderPass ends the composite pass, before the HUD pass begins.
+// Deliberately copies the pre-HUD composite output, not the final post-HUD
+// frame: reprojecting HUD/console pixels next frame would smear UI elements
+// that don't actually move with the camera.
 void VK_UpscaleUpdateHistory(VkCommandBuffer commandBuffer, uint32_t imageIndex)
 {
+	VkImage writeSlot;
 	VkImageMemoryBarrier toTransferSrc;
 	VkImageMemoryBarrier toTransferDst;
 	VkImageMemoryBarrier toShaderRead;
@@ -524,39 +608,27 @@ void VK_UpscaleUpdateHistory(VkCommandBuffer commandBuffer, uint32_t imageIndex)
 		return;
 	}
 
+	writeSlot = historyImages[historyIndex];
+
 	// Swapchain image: PRESENT_SRC_KHR (this render pass's finalLayout, see
 	// VK_PostProcessRenderPassCreate) -> TRANSFER_SRC_OPTIMAL for the copy
 	// read, then back to PRESENT_SRC_KHR afterwards (the HUD pass that
 	// follows this call expects to LOAD it in that layout, same reasoning
 	// as VK_PostProcessTransitionForSampling elsewhere in this file).
-	VK_InitialiseStructure(toTransferSrc);
-	toTransferSrc.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-	toTransferSrc.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-	toTransferSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-	toTransferSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	toTransferSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	toTransferSrc.image = vk_options.swapChain.images[imageIndex];
-	toTransferSrc.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-	toTransferSrc.subresourceRange.levelCount = 1;
-	toTransferSrc.subresourceRange.layerCount = 1;
-	toTransferSrc.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-	toTransferSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	toTransferSrc = VK_UpscaleMakeImageBarrier(vk_options.swapChain.images[imageIndex],
+		VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
 
-	// historyImage: whatever it was left in last frame (SHADER_READ_ONLY
-	// after that frame's VK_UpscaleComposite sampled it, or UNDEFINED if
-	// just created) -> TRANSFER_DST_OPTIMAL for this frame's copy write.
-	VK_InitialiseStructure(toTransferDst);
-	toTransferDst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-	toTransferDst.oldLayout = historyValid ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
-	toTransferDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-	toTransferDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	toTransferDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	toTransferDst.image = historyImage;
-	toTransferDst.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-	toTransferDst.subresourceRange.levelCount = 1;
-	toTransferDst.subresourceRange.layerCount = 1;
-	toTransferDst.srcAccessMask = 0;
-	toTransferDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	// This slot: whatever it was left in the frame it was last written
+	// (SHADER_READ_ONLY, from that frame's VK_UpscaleComposite reading the
+	// OTHER slot doesn't touch this one -- this slot's own last write's
+	// trailing barrier below left it SHADER_READ_ONLY), or UNDEFINED if
+	// just created / never written yet (historyValidFrameCount tracks
+	// that -- see its field comment) -> TRANSFER_DST_OPTIMAL for this
+	// frame's copy write.
+	toTransferDst = VK_UpscaleMakeImageBarrier(writeSlot,
+		historyValidFrameCount >= 2 ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
+		VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
 
 	{
 		VkImageMemoryBarrier barriers[2] = { toTransferSrc, toTransferDst };
@@ -571,40 +643,34 @@ void VK_UpscaleUpdateHistory(VkCommandBuffer commandBuffer, uint32_t imageIndex)
 	region.extent.width = vk_options.swapChain.imageSize.width;
 	region.extent.height = vk_options.swapChain.imageSize.height;
 	region.extent.depth = 1;
-	vkCmdCopyImage(commandBuffer, vk_options.swapChain.images[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, historyImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+	vkCmdCopyImage(commandBuffer, vk_options.swapChain.images[imageIndex], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, writeSlot, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
-	VK_InitialiseStructure(toShaderRead);
-	toShaderRead.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-	toShaderRead.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-	toShaderRead.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-	toShaderRead.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	toShaderRead.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	toShaderRead.image = historyImage;
-	toShaderRead.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-	toShaderRead.subresourceRange.levelCount = 1;
-	toShaderRead.subresourceRange.layerCount = 1;
-	toShaderRead.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-	toShaderRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+	toShaderRead = VK_UpscaleMakeImageBarrier(writeSlot,
+		VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
 
-	VK_InitialiseStructure(backToPresent);
-	backToPresent.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-	backToPresent.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-	backToPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-	backToPresent.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	backToPresent.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	backToPresent.image = vk_options.swapChain.images[imageIndex];
-	backToPresent.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-	backToPresent.subresourceRange.levelCount = 1;
-	backToPresent.subresourceRange.layerCount = 1;
-	backToPresent.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-	backToPresent.dstAccessMask = 0;
+	backToPresent = VK_UpscaleMakeImageBarrier(vk_options.swapChain.images[imageIndex],
+		VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+		VK_ACCESS_TRANSFER_READ_BIT, 0);
 
 	{
 		VkImageMemoryBarrier barriers[2] = { toShaderRead, backToPresent };
 		vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 2, barriers);
 	}
 
-	historyValid = true;
+	if (historyValidFrameCount < 2) {
+		++historyValidFrameCount;
+	}
+	// Only both slots having been written at least once (one write per
+	// slot, alternating below) makes the OTHER slot safe for
+	// VK_UpscaleComposite to sample next -- historyValid mirrors
+	// historyValidFrameCount >= 2 for the simpler check VK_TemporalUpscaleActive
+	// and the (1 - historyIndex) read side use.
+	historyValid = historyValidFrameCount >= 2;
+
+	// Advance to the other slot for NEXT frame's write -- must happen after
+	// everything above that reads historyIndex for THIS frame's write.
+	historyIndex = 1 - historyIndex;
 }
 
 qbool VK_CreateUpscaleResources(void)
@@ -626,13 +692,18 @@ void VK_UpscaleForgetDescriptorSets(void)
 void VK_DestroyUpscaleResources(void)
 {
 	VK_UpscaleDestroyHistoryBuffer();
-	if (matricesBuffer != VK_NULL_HANDLE) {
-		vkDestroyBuffer(vk_options.logicalDevice, matricesBuffer, NULL);
-		matricesBuffer = VK_NULL_HANDLE;
-	}
-	if (matricesBufferMemory != VK_NULL_HANDLE) {
-		vkFreeMemory(vk_options.logicalDevice, matricesBufferMemory, NULL);
-		matricesBufferMemory = VK_NULL_HANDLE;
+	{
+		int slot;
+		for (slot = 0; slot < 2; ++slot) {
+			if (matricesBuffers[slot] != VK_NULL_HANDLE) {
+				vkDestroyBuffer(vk_options.logicalDevice, matricesBuffers[slot], NULL);
+				matricesBuffers[slot] = VK_NULL_HANDLE;
+			}
+			if (matricesBufferMemories[slot] != VK_NULL_HANDLE) {
+				vkFreeMemory(vk_options.logicalDevice, matricesBufferMemories[slot], NULL);
+				matricesBufferMemories[slot] = VK_NULL_HANDLE;
+			}
+		}
 	}
 	if (upscalePipeline != VK_NULL_HANDLE) {
 		vkDestroyPipeline(vk_options.logicalDevice, upscalePipeline, NULL);
@@ -689,16 +760,18 @@ static qbool VK_TemporalUpscaleActive(void)
 // frame leaking through.
 static qbool vk_upscale_matricesUpdatedThisFrame;
 
-// Writes this frame's reprojection matrices into matricesBuffer via
-// vkCmdUpdateBuffer -- must run outside any render pass instance (the spec
-// forbids vkCmdUpdateBuffer inside one), so called from
-// VK_EndWorldPassAndComposite/VK_EndFrame in vk_main.c BEFORE they begin the
-// composite render pass, not from inside VK_UpscaleComposite itself (which
-// always runs inside that render pass). Returns false (and does nothing)
-// if temporal upscaling isn't actually going to run this frame -- the
-// descriptor's binding 3 still points at matricesBuffer regardless, but
-// VK_UpscaleComposite's temporalActive push constant gates the shader from
-// ever reading stale/zero data in that case.
+// Writes this frame's reprojection matrices into matricesBuffers[historyIndex]
+// (the same slot index VK_UpscaleDescriptorSet binds for this frame's
+// read -- see its comment for why this is a different aliasing scheme than
+// the color history's) via vkCmdUpdateBuffer -- must run outside any render
+// pass instance (the spec forbids vkCmdUpdateBuffer inside one), so called
+// from VK_EndWorldPassAndComposite/VK_EndFrame in vk_main.c BEFORE they
+// begin the composite render pass, not from inside VK_UpscaleComposite
+// itself (which always runs inside that render pass). Returns false (and
+// does nothing) if temporal upscaling isn't actually going to run this
+// frame -- the descriptor's binding 3 still points at a matricesBuffers
+// slot regardless, but VK_UpscaleComposite's temporalActive push constant
+// gates the shader from ever reading stale/zero data in that case.
 qbool VK_UpscaleUpdateMatrices(VkCommandBuffer commandBuffer)
 {
 	vk_upscale_matrices_t matrices;
@@ -707,7 +780,7 @@ qbool VK_UpscaleUpdateMatrices(VkCommandBuffer commandBuffer)
 
 	vk_upscale_matricesUpdatedThisFrame = false;
 
-	if (!VK_TemporalUpscaleActive() || matricesBuffer == VK_NULL_HANDLE) {
+	if (!VK_TemporalUpscaleActive() || matricesBuffers[historyIndex] == VK_NULL_HANDLE) {
 		return false;
 	}
 	if (!VK_CurrentInvViewProjMatrix(matrices.invViewProj)) {
@@ -736,7 +809,7 @@ qbool VK_UpscaleUpdateMatrices(VkCommandBuffer commandBuffer)
 	depthToShaderRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 	vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &depthToShaderRead);
 
-	vkCmdUpdateBuffer(commandBuffer, matricesBuffer, 0, sizeof(matrices), &matrices);
+	vkCmdUpdateBuffer(commandBuffer, matricesBuffers[historyIndex], 0, sizeof(matrices), &matrices);
 
 	VK_InitialiseStructure(toUniformRead);
 	toUniformRead.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -744,7 +817,7 @@ qbool VK_UpscaleUpdateMatrices(VkCommandBuffer commandBuffer)
 	toUniformRead.dstAccessMask = VK_ACCESS_UNIFORM_READ_BIT;
 	toUniformRead.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	toUniformRead.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	toUniformRead.buffer = matricesBuffer;
+	toUniformRead.buffer = matricesBuffers[historyIndex];
 	toUniformRead.size = sizeof(matrices);
 	vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 1, &toUniformRead, 0, NULL);
 
@@ -803,6 +876,7 @@ void VK_UpscaleComposite(VkCommandBuffer commandBuffer, uint32_t imageIndex)
 	push.invSrcSize[1] = 1.0f / push.srcSize[1];
 	push.sharpness = 1;
 	push.temporalActive = temporalActive ? 1 : 0;
+	push.reversedDepth = glConfig.reversed_depth ? 1 : 0;
 
 	VK_HudSetViewportScissor(commandBuffer);
 	vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, upscalePipeline);

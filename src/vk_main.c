@@ -918,6 +918,38 @@ void VK_EndWorldPassAndComposite(void)
 {
 	VkCommandBuffer commandBuffer;
 
+	// Multiview/split-screen (cl_multiview): CL_MultiviewEnabled's render
+	// loop in cl_main.c calls SCR_UpdateScreenPlayerView once per PANE, not
+	// once per real frame, and since GL_FramebufferEnabled2D() is hardcoded
+	// false for Vulkan (two_pass_rendering stays false), draw_2d is true on
+	// every pane -- so R_Set2D() -> VK_Begin2DRendering (this function,
+	// see the #define) would otherwise run once per pane instead of once
+	// per real frame. Each pane shares the SAME world render pass instance
+	// (VK_BeginFrame's frame.active guard skips re-opening it per pane), so
+	// this function can't just skip its vkCmdEndRenderPass/HUD-pass-open
+	// work on later panes -- but it MUST NOT re-run VK_UpscaleUpdateMatrices/
+	// VK_UpscaleUpdateHistory a second time with a different pane's camera,
+	// which would corrupt next frame's reprojection with whichever pane
+	// happened to render last. vk_world_pass_already_ended (already used
+	// below to tell VK_EndFrame the composite/HUD-pass split happened) is
+	// reused here as that guard: only the first pane's call runs the
+	// temporal update; a later pane calling this still ends/reopens the
+	// render passes normally, just skipping VK_UpscaleUpdateMatrices/
+	// VK_UpscaleUpdateHistory specifically. Multiview + temporal upscaling
+	// together is a narrow combination (MVD split-screen playback with
+	// upscaling on) -- this trades perfectly-correct-per-pane temporal data
+	// for "never corrupts state", falling back to whatever the first pane's
+	// camera produced rather than a worse per-pane race.
+	// See this function's multiview comment above for why this exists:
+	// true from the second pane onward within the same real frame (this
+	// function has already fully run once, but multiview calls it again
+	// per pane) -- gates ONLY the two temporal-state-mutating calls below
+	// (VK_UpscaleUpdateMatrices/VK_UpscaleUpdateHistory), not any of the
+	// render-pass begin/end sequencing, which every pane still needs to run
+	// exactly as it did before this guard was added.
+	{
+		qbool skipTemporalUpdate = vk_world_pass_already_ended;
+
 	if (!vk_options.frame.active || !vk_options.swapChain.upscaleActive) {
 		return;
 	}
@@ -935,8 +967,11 @@ void VK_EndWorldPassAndComposite(void)
 			// Must run before vkCmdBeginRenderPass below -- vkCmdUpdateBuffer
 			// (what this does) can't be called inside a render pass instance.
 			// No-op when temporal upscaling isn't applicable this frame (see
-			// VK_TemporalUpscaleActive's gating conditions).
-			VK_UpscaleUpdateMatrices(commandBuffer);
+			// VK_TemporalUpscaleActive's gating conditions) or this is a
+			// later multiview pane (skipTemporalUpdate).
+			if (!skipTemporalUpdate) {
+				VK_UpscaleUpdateMatrices(commandBuffer);
+			}
 
 			compositePassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
 			compositePassInfo.renderPass = VK_PostProcessRenderPass();
@@ -953,8 +988,11 @@ void VK_EndWorldPassAndComposite(void)
 			// restriction as vkCmdUpdateBuffer) and before the HUD pass
 			// begins below -- copies this frame's just-finished composite
 			// output into the history buffer for next frame's temporal
-			// resolve. No-op when the upscaler isn't active.
-			VK_UpscaleUpdateHistory(commandBuffer, vk_options.frame.imageIndex);
+			// resolve. No-op when the upscaler isn't active or this is a
+			// later multiview pane (skipTemporalUpdate).
+			if (!skipTemporalUpdate) {
+				VK_UpscaleUpdateHistory(commandBuffer, vk_options.frame.imageIndex);
+			}
 		}
 	}
 
@@ -978,6 +1016,7 @@ void VK_EndWorldPassAndComposite(void)
 	}
 
 	vk_world_pass_already_ended = true;
+	}
 }
 
 void VK_EndFrame(void)
