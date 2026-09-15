@@ -443,6 +443,10 @@ qbool VK_CreatePostProcessResources(void)
 	vk_options.swapChain.sceneSize = VK_ResolveSceneSize();
 	vk_options.swapChain.upscaleActive = vk_options.swapChain.sceneSize.width != vk_options.swapChain.imageSize.width ||
 		vk_options.swapChain.sceneSize.height != vk_options.swapChain.imageSize.height;
+	Con_Printf("vulkan: upscaler diagnostic -- native=%ux%u scene=%ux%u upscaleActive=%d\n",
+		vk_options.swapChain.imageSize.width, vk_options.swapChain.imageSize.height,
+		vk_options.swapChain.sceneSize.width, vk_options.swapChain.sceneSize.height,
+		vk_options.swapChain.upscaleActive);
 
 	if (vk_options.swapChain.upscaleActive) {
 		if (!VK_CreateSceneDepthResources()) {

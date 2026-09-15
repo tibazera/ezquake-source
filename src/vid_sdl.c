@@ -1142,6 +1142,17 @@ static void VID_RegisterLatchCvars(void)
 	Cvar_Register(&vid_gammacorrection);
 #ifdef RENDERER_OPTION_VULKAN
 	Cvar_Register(&vid_vulkan_device);
+	// CVAR_LATCH_GFX only actually applies the latched value when C code
+	// re-registers the cvar (see Cvar_Register's CVAR_LATCH branch and the
+	// flag's own comment in cvar.h) -- it does NOT apply just because a
+	// vid_restart command ran. VID_RegisterLatchCvars (this function) is
+	// what runs on every vid_restart, so these two have to be registered
+	// here, not in VID_RegisterCvars below, or setting them at the console
+	// and running vid_restart silently does nothing (found live: Tiago set
+	// both, ran vid_restart, and the upscaler diagnostic print still showed
+	// upscaleActive=0).
+	Cvar_Register(&vid_vulkan_renderscale);
+	Cvar_Register(&vid_vulkan_upscaler);
 #endif
 
 	Cvar_ResetCurrentGroup();
@@ -1179,8 +1190,6 @@ void VID_RegisterCvars(void)
 	Cvar_Register(&vid_framebuffer_multisample);
 	Cvar_Register(&vid_framebuffer_fxaa);
 	Cvar_Register(&vid_vulkan_antilag);
-	Cvar_Register(&vid_vulkan_renderscale);
-	Cvar_Register(&vid_vulkan_upscaler);
 
 	Cvar_Register(&vid_reload_auto);
 
