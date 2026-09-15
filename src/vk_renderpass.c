@@ -44,6 +44,14 @@ typedef enum {
 	// real gamma/contrast/FXAA, and writes the swapchain image directly --
 	// see VK_PostProcessComposite in vk_draw.c.
 	vk_renderpass_postprocess,
+	// Native-resolution HUD pass, used only when the upscaler pipeline is
+	// actually resizing (vk_options.swapChain.upscaleActive -- see
+	// VK_UpscaleCompositeAndBeginHudPass in vk_upscale.c). Same single
+	// swapchain-image attachment as vk_renderpass_postprocess, but LOAD
+	// instead of DONT_CARE: this pass draws HUD/console on top of what the
+	// upscale composite pass (vk_renderpass_postprocess) just wrote, so its
+	// content must be preserved, not assumed fully overwritten.
+	vk_renderpass_hud,
 	// World-outline normals prepass (gl_outline & 2): a small, always
 	// single-sample render pass with its own color (normal+linear-depth,
 	// RGBA16F) and depth attachments, entirely separate from the main
@@ -254,6 +262,59 @@ static qbool VK_PostProcessRenderPassCreate(void)
 	return vkCreateRenderPass(vk_options.logicalDevice, &renderPassInfo, NULL, &renderPasses[vk_renderpass_postprocess]) == VK_SUCCESS;
 }
 
+// Same shape as VK_PostProcessRenderPassCreate, but LOAD_OP_LOAD -- see
+// vk_renderpass_hud's comment above for why.
+static qbool VK_HudRenderPassCreate(void)
+{
+	VkAttachmentDescription colorAttachment;
+	VkAttachmentReference colorAttachmentRef;
+	VkSubpassDescription subpass;
+	VkSubpassDependency dependency;
+	VkRenderPassCreateInfo renderPassInfo;
+
+	VK_InitialiseStructure(colorAttachment);
+	colorAttachment.format = vk_options.physicalDeviceSurfaceFormat.format;
+	colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+	colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+	colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+	colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	// LOAD requires the attachment to already be in the layout it's loaded
+	// from -- this pass always runs immediately after the composite pass
+	// above left the swapchain image in PRESENT_SRC_KHR (that pass's own
+	// finalLayout), matching vk_renderpass_main_noclear's same reasoning.
+	colorAttachment.initialLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+	colorAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+	VK_InitialiseStructure(colorAttachmentRef);
+	colorAttachmentRef.attachment = 0;
+	colorAttachmentRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+	VK_InitialiseStructure(subpass);
+	subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+	subpass.colorAttachmentCount = 1;
+	subpass.pColorAttachments = &colorAttachmentRef;
+
+	VK_InitialiseStructure(dependency);
+	dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+	dependency.dstSubpass = 0;
+	dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	dependency.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+
+	VK_InitialiseStructure(renderPassInfo);
+	renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+	renderPassInfo.attachmentCount = 1;
+	renderPassInfo.pAttachments = &colorAttachment;
+	renderPassInfo.subpassCount = 1;
+	renderPassInfo.pSubpasses = &subpass;
+	renderPassInfo.dependencyCount = 1;
+	renderPassInfo.pDependencies = &dependency;
+
+	return vkCreateRenderPass(vk_options.logicalDevice, &renderPassInfo, NULL, &renderPasses[vk_renderpass_hud]) == VK_SUCCESS;
+}
+
 // See VK_WorldNormalsFormat above for the color format. Always
 // single-sample regardless of vid_framebuffer_multisample -- the whole point
 // of this being a separate render pass instead of a second attachment on the
@@ -347,6 +408,14 @@ VkRenderPass VK_PostProcessRenderPass(void)
 		VK_PostProcessRenderPassCreate();
 	}
 	return renderPasses[vk_renderpass_postprocess];
+}
+
+VkRenderPass VK_HudRenderPass(void)
+{
+	if (renderPasses[vk_renderpass_hud] == VK_NULL_HANDLE) {
+		VK_HudRenderPassCreate();
+	}
+	return renderPasses[vk_renderpass_hud];
 }
 
 VkRenderPass VK_WorldNormalsRenderPass(void)

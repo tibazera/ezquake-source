@@ -726,7 +726,9 @@ void VK_BeginFrame(void)
 	}
 	renderPassInfo.renderArea.offset.x = 0;
 	renderPassInfo.renderArea.offset.y = 0;
-	renderPassInfo.renderArea.extent = vk_options.swapChain.imageSize;
+	// Same reasoning as VK_WorldBeginMainRenderPassNoClear in vk_world.c: must
+	// match whichever framebuffer was just picked above.
+	renderPassInfo.renderArea.extent = vk_options.swapChain.postProcessActive ? VK_SceneRenderExtent() : vk_options.swapChain.imageSize;
 	renderPassInfo.clearValueCount = sizeof(clearValues) / sizeof(clearValues[0]);
 	renderPassInfo.pClearValues = clearValues;
 
@@ -742,23 +744,39 @@ VkCommandBuffer VK_CurrentCommandBuffer(void)
 	return vk_options.frame.commandBuffers[vk_options.frame.imageIndex];
 }
 
-void VK_EndFrame(void)
-{
-	extern cvar_t vid_vulkan_antilag;
-	VkCommandBuffer commandBuffer;
-	VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
-	VkSubmitInfo submitInfo = { 0 };
-	VkPresentInfoKHR presentInfo = { 0 };
-	VkResult result;
-	qbool presented = false;
-	uint32_t frameIndex;
-	VkFence frameFence;
+// True from VK_EndWorldPassAndComposite() until the frame's command buffer
+// is submitted -- tells VK_EndFrame() the world render pass was already
+// ended and the composite pass already ran (upscaleActive path), so it must
+// only end the HUD pass that was begun after that composite, not repeat any
+// of this. See VK_EndWorldPassAndComposite for why this split exists.
+static qbool vk_world_pass_already_ended = false;
 
-	if (!vk_options.frame.active) {
+// Ends the world's render pass and runs the composite/upscale pass, WITHOUT
+// ending the command buffer or submitting -- called from
+// SCR_UpdateScreenPlayerView (cl_screen.c) right after the 3D scene finishes
+// drawing and before any HUD/2D drawing starts, but only when the upscaler
+// pipeline is actually resizing (vk_options.swapChain.upscaleActive).
+//
+// Why this can't just stay inside VK_EndFrame like the non-upscaling
+// postProcessActive path above did: that composite pass isn't just gamma/
+// FXAA anymore when upscaleActive -- it's what turns the low-res scene
+// target into the native-res swapchain image (VK_PostProcessComposite calls
+// into VK_UpscaleComposite when upscaleActive, see vk_upscale.c). HUD must
+// draw at native resolution AFTER that upscale, not before it (which is
+// where every HUD draw call already runs today, inside the still-open world
+// render pass) -- otherwise HUD would be drawn into the low-res scene target
+// and blurred along with the world when it's upscaled. So when upscaleActive,
+// the composite has to happen here, mid-frame, with a new native-resolution
+// HUD pass begun immediately after it for the HUD draw calls that follow
+// this function to land in. VK_EndFrame below only ends that HUD pass (or,
+// if upscaleActive is false, behaves exactly as before this feature existed).
+void VK_EndWorldPassAndComposite(void)
+{
+	VkCommandBuffer commandBuffer;
+
+	if (!vk_options.frame.active || !vk_options.swapChain.upscaleActive) {
 		return;
 	}
-	frameIndex = vk_options.frame.currentFrame;
-	frameFence = vk_options.frame.inFlightFences[frameIndex];
 
 	commandBuffer = vk_options.frame.commandBuffers[vk_options.frame.imageIndex];
 	vkCmdEndRenderPass(commandBuffer);
@@ -781,6 +799,80 @@ void VK_EndFrame(void)
 			vkCmdBeginRenderPass(commandBuffer, &compositePassInfo, VK_SUBPASS_CONTENTS_INLINE);
 			VK_PostProcessComposite(commandBuffer, vk_options.frame.imageIndex);
 			vkCmdEndRenderPass(commandBuffer);
+		}
+	}
+
+	// Native-resolution HUD pass: LOAD (not CLEAR) so it draws on top of
+	// whatever the composite pass above just wrote, see vk_renderpass_hud.
+	{
+		VkFramebuffer hudFramebuffer = VK_HudFramebuffer(vk_options.frame.imageIndex);
+
+		if (hudFramebuffer != VK_NULL_HANDLE) {
+			VkRenderPassBeginInfo hudPassInfo = { 0 };
+
+			hudPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+			hudPassInfo.renderPass = VK_HudRenderPass();
+			hudPassInfo.framebuffer = hudFramebuffer;
+			hudPassInfo.renderArea.offset.x = 0;
+			hudPassInfo.renderArea.offset.y = 0;
+			hudPassInfo.renderArea.extent = vk_options.swapChain.imageSize;
+
+			vkCmdBeginRenderPass(commandBuffer, &hudPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+		}
+	}
+
+	vk_world_pass_already_ended = true;
+}
+
+void VK_EndFrame(void)
+{
+	extern cvar_t vid_vulkan_antilag;
+	VkCommandBuffer commandBuffer;
+	VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
+	VkSubmitInfo submitInfo = { 0 };
+	VkPresentInfoKHR presentInfo = { 0 };
+	VkResult result;
+	qbool presented = false;
+	uint32_t frameIndex;
+	VkFence frameFence;
+
+	if (!vk_options.frame.active) {
+		return;
+	}
+	frameIndex = vk_options.frame.currentFrame;
+	frameFence = vk_options.frame.inFlightFences[frameIndex];
+
+	commandBuffer = vk_options.frame.commandBuffers[vk_options.frame.imageIndex];
+
+	if (vk_world_pass_already_ended) {
+		// VK_EndWorldPassAndComposite already ended the world pass, ran the
+		// composite/upscale, and began the native-res HUD pass -- HUD draw
+		// calls since then landed in that pass, so just end it now.
+		vkCmdEndRenderPass(commandBuffer);
+		vk_world_pass_already_ended = false;
+	}
+	else {
+		vkCmdEndRenderPass(commandBuffer);
+
+		if (vk_options.swapChain.postProcessActive) {
+			VkFramebuffer compositeFramebuffer = VK_PostProcessCompositeFramebuffer(vk_options.frame.imageIndex);
+
+			if (compositeFramebuffer != VK_NULL_HANDLE) {
+				VkRenderPassBeginInfo compositePassInfo = { 0 };
+
+				VK_PostProcessTransitionForSampling(commandBuffer, vk_options.frame.imageIndex);
+
+				compositePassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+				compositePassInfo.renderPass = VK_PostProcessRenderPass();
+				compositePassInfo.framebuffer = compositeFramebuffer;
+				compositePassInfo.renderArea.offset.x = 0;
+				compositePassInfo.renderArea.offset.y = 0;
+				compositePassInfo.renderArea.extent = vk_options.swapChain.imageSize;
+
+				vkCmdBeginRenderPass(commandBuffer, &compositePassInfo, VK_SUBPASS_CONTENTS_INLINE);
+				VK_PostProcessComposite(commandBuffer, vk_options.frame.imageIndex);
+				vkCmdEndRenderPass(commandBuffer);
+			}
 		}
 	}
 
@@ -1224,7 +1316,7 @@ void VK_PopulateConfig(void)
 #define VK_DrawWaterSurfaces              VK_DrawWaterSurfaces
 #define VK_ScreenDrawStart                VK_NoOperation
 #define VK_EnsureFinished                 VK_NoOperation
-#define VK_Begin2DRendering               VK_NoOperation
+#define VK_Begin2DRendering               VK_EndWorldPassAndComposite
 #define VK_IsFramebufferEnabled3D         VK_False
 #define VK_RenderView                     VK_RenderView
 #define VK_PreRenderView                  VK_PreRenderView

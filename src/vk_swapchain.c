@@ -155,6 +155,128 @@ static qbool VK_CreateSwapChainMSAAColorResources(void)
 	return true;
 }
 
+static void VK_DestroySceneDepthResources(void)
+{
+	if (vk_options.swapChain.sceneDepthImageView != VK_NULL_HANDLE) {
+		vkDestroyImageView(vk_options.logicalDevice, vk_options.swapChain.sceneDepthImageView, NULL);
+		vk_options.swapChain.sceneDepthImageView = VK_NULL_HANDLE;
+	}
+	if (vk_options.swapChain.sceneDepthImage != VK_NULL_HANDLE) {
+		vkDestroyImage(vk_options.logicalDevice, vk_options.swapChain.sceneDepthImage, NULL);
+		vk_options.swapChain.sceneDepthImage = VK_NULL_HANDLE;
+	}
+	if (vk_options.swapChain.sceneDepthImageMemory != VK_NULL_HANDLE) {
+		vkFreeMemory(vk_options.logicalDevice, vk_options.swapChain.sceneDepthImageMemory, NULL);
+		vk_options.swapChain.sceneDepthImageMemory = VK_NULL_HANDLE;
+	}
+}
+
+// Depth attachment for the scene render pass when upscaleActive (sceneSize
+// != imageSize) -- see the sceneDepthImage field comment in vk_local.h for
+// why this can't just reuse the shared depthImage above.
+static qbool VK_CreateSceneDepthResources(void)
+{
+	VkImageViewCreateInfo createImageViewInfo;
+
+	VK_DestroySceneDepthResources();
+
+	if (!VK_CreateImageResource(
+			vk_options.swapChain.sceneSize.width,
+			vk_options.swapChain.sceneSize.height,
+			1,
+			vk_options.msaaSamples,
+			VK_DepthFormat(),
+			VK_IMAGE_TILING_OPTIMAL,
+			VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+			VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+			&vk_options.swapChain.sceneDepthImage,
+			&vk_options.swapChain.sceneDepthImageMemory)) {
+		Com_Printf("vulkan: failed to create scene depth image resource\n");
+		return false;
+	}
+
+	VK_InitialiseStructure(createImageViewInfo);
+	createImageViewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+	createImageViewInfo.image = vk_options.swapChain.sceneDepthImage;
+	createImageViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+	createImageViewInfo.format = VK_DepthFormat();
+	createImageViewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+	createImageViewInfo.subresourceRange.baseMipLevel = 0;
+	createImageViewInfo.subresourceRange.levelCount = 1;
+	createImageViewInfo.subresourceRange.baseArrayLayer = 0;
+	createImageViewInfo.subresourceRange.layerCount = 1;
+
+	{
+		VkResult result = vkCreateImageView(vk_options.logicalDevice, &createImageViewInfo, NULL, &vk_options.swapChain.sceneDepthImageView);
+		if (result != VK_SUCCESS) {
+			Com_Printf("vulkan: vkCreateImageView() failed for scene depth buffer: %d\n", result);
+			VK_DestroySceneDepthResources();
+			return false;
+		}
+	}
+
+	return true;
+}
+
+static void VK_DestroySceneMSAAColorResources(void)
+{
+	if (vk_options.swapChain.sceneMsaaColorImageView != VK_NULL_HANDLE) {
+		vkDestroyImageView(vk_options.logicalDevice, vk_options.swapChain.sceneMsaaColorImageView, NULL);
+		vk_options.swapChain.sceneMsaaColorImageView = VK_NULL_HANDLE;
+	}
+	if (vk_options.swapChain.sceneMsaaColorImage != VK_NULL_HANDLE) {
+		vkDestroyImage(vk_options.logicalDevice, vk_options.swapChain.sceneMsaaColorImage, NULL);
+		vk_options.swapChain.sceneMsaaColorImage = VK_NULL_HANDLE;
+	}
+	if (vk_options.swapChain.sceneMsaaColorImageMemory != VK_NULL_HANDLE) {
+		vkFreeMemory(vk_options.logicalDevice, vk_options.swapChain.sceneMsaaColorImageMemory, NULL);
+		vk_options.swapChain.sceneMsaaColorImageMemory = VK_NULL_HANDLE;
+	}
+}
+
+// MSAA color attachment for the scene render pass when upscaleActive -- same
+// reasoning as VK_CreateSceneDepthResources above.
+static qbool VK_CreateSceneMSAAColorResources(void)
+{
+	VkImageViewCreateInfo createImageViewInfo;
+
+	VK_DestroySceneMSAAColorResources();
+
+	if (!VK_CreateImageResource(
+			vk_options.swapChain.sceneSize.width,
+			vk_options.swapChain.sceneSize.height,
+			1,
+			vk_options.msaaSamples,
+			vk_options.physicalDeviceSurfaceFormat.format,
+			VK_IMAGE_TILING_OPTIMAL,
+			VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT,
+			VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+			&vk_options.swapChain.sceneMsaaColorImage,
+			&vk_options.swapChain.sceneMsaaColorImageMemory)) {
+		Com_Printf("vulkan: failed to create scene MSAA color image resource\n");
+		return false;
+	}
+
+	VK_InitialiseStructure(createImageViewInfo);
+	createImageViewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+	createImageViewInfo.image = vk_options.swapChain.sceneMsaaColorImage;
+	createImageViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+	createImageViewInfo.format = vk_options.physicalDeviceSurfaceFormat.format;
+	createImageViewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	createImageViewInfo.subresourceRange.baseMipLevel = 0;
+	createImageViewInfo.subresourceRange.levelCount = 1;
+	createImageViewInfo.subresourceRange.baseArrayLayer = 0;
+	createImageViewInfo.subresourceRange.layerCount = 1;
+
+	if (vkCreateImageView(vk_options.logicalDevice, &createImageViewInfo, NULL, &vk_options.swapChain.sceneMsaaColorImageView) != VK_SUCCESS) {
+		Com_Printf("vulkan: vkCreateImageView() failed for scene MSAA color buffer\n");
+		VK_DestroySceneMSAAColorResources();
+		return false;
+	}
+
+	return true;
+}
+
 static void VK_DestroyPostProcessDescriptors(void)
 {
 	if (vk_options.swapChain.postProcessDescriptorPool != VK_NULL_HANDLE) {
@@ -170,6 +292,8 @@ void VK_DestroyPostProcessResources(void)
 	uint32_t i;
 
 	VK_DestroyPostProcessDescriptors();
+	VK_DestroySceneDepthResources();
+	VK_DestroySceneMSAAColorResources();
 
 	if (vk_options.swapChain.postProcessFramebuffers) {
 		for (i = 0; i < vk_options.swapChain.imageCount; ++i) {
@@ -189,6 +313,16 @@ void VK_DestroyPostProcessResources(void)
 		}
 		Q_free(vk_options.swapChain.postProcessCompositeFramebuffers);
 		vk_options.swapChain.postProcessCompositeFramebuffers = NULL;
+	}
+
+	if (vk_options.swapChain.hudFramebuffers) {
+		for (i = 0; i < vk_options.swapChain.imageCount; ++i) {
+			if (vk_options.swapChain.hudFramebuffers[i] != VK_NULL_HANDLE) {
+				vkDestroyFramebuffer(vk_options.logicalDevice, vk_options.swapChain.hudFramebuffers[i], NULL);
+			}
+		}
+		Q_free(vk_options.swapChain.hudFramebuffers);
+		vk_options.swapChain.hudFramebuffers = NULL;
 	}
 
 	if (vk_options.swapChain.postProcessColorImageViews) {
@@ -238,6 +372,15 @@ qbool VK_PostProcessActive(void)
 	extern cvar_t v_gamma, v_contrast;
 	extern cvar_t vid_framebuffer_fxaa;
 	extern cvar_t vid_software_palette;
+	extern cvar_t vid_vulkan_upscaler;
+
+	// The upscaler pipeline always routes through the offscreen target +
+	// composite pass -- there's no "upscale directly into the swapchain"
+	// path, so this alone is enough to force the same routing gamma/FXAA
+	// use, independent of whether any of those are also active.
+	if (vid_vulkan_upscaler.integer != 0) {
+		return true;
+	}
 
 	// Matches GLM_CompilePostProcessProgram()'s POST_PROCESS_PALETTE gate: the
 	// real gamma/contrast curve is only a shader pass when vid_software_palette
@@ -252,19 +395,55 @@ qbool VK_PostProcessActive(void)
 	return v_gamma.value != 1.0f || v_contrast.value != 1.0f || vid_framebuffer_fxaa.integer != 0;
 }
 
+// Resolves vid_vulkan_renderscale into vk_options.swapChain.sceneSize: the
+// resolution VK_CreatePostProcessResources actually allocates the offscreen
+// scene target at. Clamped defensively (a stray cvar value of 0 or >1 must
+// not turn into a zero-size or upscale-shrinks-nothing image); the FSR2/DLSS
+// "Quality/Balanced/Performance" presets all live in [0.33, 1.0].
+static VkExtent2D VK_ResolveSceneSize(void)
+{
+	extern cvar_t vid_vulkan_renderscale, vid_vulkan_upscaler;
+	VkExtent2D size = vk_options.swapChain.imageSize;
+	float scale;
+
+	if (vid_vulkan_upscaler.integer == 0) {
+		return size;
+	}
+
+	scale = bound(0.33f, vid_vulkan_renderscale.value, 1.0f);
+	size.width = (uint32_t)max(1.0f, (float)vk_options.swapChain.imageSize.width * scale);
+	size.height = (uint32_t)max(1.0f, (float)vk_options.swapChain.imageSize.height * scale);
+	return size;
+}
+
 qbool VK_CreatePostProcessResources(void)
 {
 	uint32_t i;
 	qbool msaa = vk_options.msaaSamples > VK_SAMPLE_COUNT_1_BIT;
 	VkRenderPass mainRenderPass = VK_MainRenderPass();
 	VkRenderPass compositeRenderPass = VK_PostProcessRenderPass();
+	VkRenderPass hudRenderPass = VK_HudRenderPass();
 	VkDescriptorPoolSize poolSize;
 	VkDescriptorPoolCreateInfo poolInfo;
 
 	VK_DestroyPostProcessResources();
 
-	if (mainRenderPass == VK_NULL_HANDLE || compositeRenderPass == VK_NULL_HANDLE || !vk_options.swapChain.imageCount) {
+	if (mainRenderPass == VK_NULL_HANDLE || compositeRenderPass == VK_NULL_HANDLE || hudRenderPass == VK_NULL_HANDLE || !vk_options.swapChain.imageCount) {
 		return false;
+	}
+
+	vk_options.swapChain.sceneSize = VK_ResolveSceneSize();
+	vk_options.swapChain.upscaleActive = vk_options.swapChain.sceneSize.width != vk_options.swapChain.imageSize.width ||
+		vk_options.swapChain.sceneSize.height != vk_options.swapChain.imageSize.height;
+
+	if (vk_options.swapChain.upscaleActive) {
+		if (!VK_CreateSceneDepthResources()) {
+			return false;
+		}
+		if (msaa && !VK_CreateSceneMSAAColorResources()) {
+			VK_DestroyPostProcessResources();
+			return false;
+		}
 	}
 
 	vk_options.swapChain.postProcessColorImages = Q_calloc(vk_options.swapChain.imageCount, sizeof(vk_options.swapChain.postProcessColorImages[0]));
@@ -278,6 +457,7 @@ qbool VK_CreatePostProcessResources(void)
 	// in VK_EndFrame via VK_PostProcessFramebuffer().
 	vk_options.swapChain.postProcessFramebuffers = Q_calloc(vk_options.swapChain.imageCount, sizeof(vk_options.swapChain.postProcessFramebuffers[0]));
 	vk_options.swapChain.postProcessCompositeFramebuffers = Q_calloc(vk_options.swapChain.imageCount, sizeof(vk_options.swapChain.postProcessCompositeFramebuffers[0]));
+	vk_options.swapChain.hudFramebuffers = Q_calloc(vk_options.swapChain.imageCount, sizeof(vk_options.swapChain.hudFramebuffers[0]));
 
 	for (i = 0; i < vk_options.swapChain.imageCount; ++i) {
 		VkImageViewCreateInfo viewInfo;
@@ -285,8 +465,8 @@ qbool VK_CreatePostProcessResources(void)
 		VkImageView mainAttachments[3];
 
 		if (!VK_CreateImageResource(
-				vk_options.swapChain.imageSize.width,
-				vk_options.swapChain.imageSize.height,
+				vk_options.swapChain.sceneSize.width,
+				vk_options.swapChain.sceneSize.height,
 				1,
 				VK_SAMPLE_COUNT_1_BIT,
 				vk_options.physicalDeviceSurfaceFormat.format,
@@ -316,13 +496,13 @@ qbool VK_CreatePostProcessResources(void)
 		}
 
 		if (msaa) {
-			mainAttachments[0] = vk_options.swapChain.msaaColorImageView;
-			mainAttachments[1] = vk_options.swapChain.depthImageView;
+			mainAttachments[0] = vk_options.swapChain.upscaleActive ? vk_options.swapChain.sceneMsaaColorImageView : vk_options.swapChain.msaaColorImageView;
+			mainAttachments[1] = vk_options.swapChain.upscaleActive ? vk_options.swapChain.sceneDepthImageView : vk_options.swapChain.depthImageView;
 			mainAttachments[2] = vk_options.swapChain.postProcessColorImageViews[i];
 		}
 		else {
 			mainAttachments[0] = vk_options.swapChain.postProcessColorImageViews[i];
-			mainAttachments[1] = vk_options.swapChain.depthImageView;
+			mainAttachments[1] = vk_options.swapChain.upscaleActive ? vk_options.swapChain.sceneDepthImageView : vk_options.swapChain.depthImageView;
 		}
 
 		VK_InitialiseStructure(framebufferInfo);
@@ -330,8 +510,8 @@ qbool VK_CreatePostProcessResources(void)
 		framebufferInfo.renderPass = mainRenderPass;
 		framebufferInfo.attachmentCount = msaa ? 3 : 2;
 		framebufferInfo.pAttachments = mainAttachments;
-		framebufferInfo.width = vk_options.swapChain.imageSize.width;
-		framebufferInfo.height = vk_options.swapChain.imageSize.height;
+		framebufferInfo.width = vk_options.swapChain.sceneSize.width;
+		framebufferInfo.height = vk_options.swapChain.sceneSize.height;
 		framebufferInfo.layers = 1;
 
 		if (vkCreateFramebuffer(vk_options.logicalDevice, &framebufferInfo, NULL, &vk_options.swapChain.postProcessFramebuffers[i]) != VK_SUCCESS) {
@@ -349,6 +529,20 @@ qbool VK_CreatePostProcessResources(void)
 		framebufferInfo.layers = 1;
 
 		if (vkCreateFramebuffer(vk_options.logicalDevice, &framebufferInfo, NULL, &vk_options.swapChain.postProcessCompositeFramebuffers[i]) != VK_SUCCESS) {
+			VK_DestroyPostProcessResources();
+			return false;
+		}
+
+		VK_InitialiseStructure(framebufferInfo);
+		framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+		framebufferInfo.renderPass = hudRenderPass;
+		framebufferInfo.attachmentCount = 1;
+		framebufferInfo.pAttachments = &vk_options.swapChain.imageViews[i];
+		framebufferInfo.width = vk_options.swapChain.imageSize.width;
+		framebufferInfo.height = vk_options.swapChain.imageSize.height;
+		framebufferInfo.layers = 1;
+
+		if (vkCreateFramebuffer(vk_options.logicalDevice, &framebufferInfo, NULL, &vk_options.swapChain.hudFramebuffers[i]) != VK_SUCCESS) {
 			VK_DestroyPostProcessResources();
 			return false;
 		}
@@ -389,6 +583,19 @@ VkFramebuffer VK_PostProcessCompositeFramebuffer(uint32_t imageIndex)
 		return VK_NULL_HANDLE;
 	}
 	return vk_options.swapChain.postProcessCompositeFramebuffers[imageIndex];
+}
+
+VkFramebuffer VK_HudFramebuffer(uint32_t imageIndex)
+{
+	if (!vk_options.swapChain.hudFramebuffers || imageIndex >= vk_options.swapChain.imageCount) {
+		return VK_NULL_HANDLE;
+	}
+	return vk_options.swapChain.hudFramebuffers[imageIndex];
+}
+
+VkExtent2D VK_SceneRenderExtent(void)
+{
+	return vk_options.swapChain.upscaleActive ? vk_options.swapChain.sceneSize : vk_options.swapChain.imageSize;
 }
 
 void VK_DestroyWorldNormalsResources(void)

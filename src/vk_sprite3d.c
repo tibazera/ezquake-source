@@ -145,19 +145,20 @@ static void VK_SpriteSetViewportScissor(VkCommandBuffer commandBuffer)
 {
 	VkViewport viewport;
 	VkRect2D scissor;
+	VkExtent2D extent = VK_SceneRenderExtent();
 
 	VK_InitialiseStructure(viewport);
 	viewport.x = 0.0f;
 	viewport.y = 0.0f;
-	viewport.width = (float)vk_options.swapChain.imageSize.width;
-	viewport.height = (float)vk_options.swapChain.imageSize.height;
+	viewport.width = (float)extent.width;
+	viewport.height = (float)extent.height;
 	viewport.minDepth = 0.0f;
 	viewport.maxDepth = 1.0f;
 
 	VK_InitialiseStructure(scissor);
 	scissor.offset.x = 0;
 	scissor.offset.y = 0;
-	scissor.extent = vk_options.swapChain.imageSize;
+	scissor.extent = extent;
 
 	vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
 	vkCmdSetScissor(commandBuffer, 0, 1, &scissor);

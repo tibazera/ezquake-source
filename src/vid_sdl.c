@@ -301,6 +301,15 @@ cvar_t vid_framebuffer_sshotmode   = {"vid_framebuffer_sshotmode",     "0" };
 cvar_t vid_framebuffer_multisample = {"vid_framebuffer_multisample",   "0" };
 cvar_t vid_framebuffer_fxaa        = {"vid_framebuffer_fxaa",          "0" };
 cvar_t vid_vulkan_antilag          = {"vid_vulkan_antilag",            "0" };
+// Internal 3D render scale for the Vulkan upscaler pipeline (FSR2/DLSS): 1.0
+// renders the world at native resolution (upscaler pass becomes a plain
+// copy), <1.0 renders smaller and upscales, matching the DLSS "Quality"
+// (0.66)/"Balanced" (0.58)/"Performance" (0.5) convention. HUD/console always
+// draw at native resolution regardless of this value -- see vk_upscale.c.
+cvar_t vid_vulkan_renderscale       = {"vid_vulkan_renderscale",        "1" };
+// 0 = off (plain bilinear/point copy to native res), 1 = FSR2, 2 = DLSS (once
+// NGX integration lands -- see CONTINUE.md).
+cvar_t vid_vulkan_upscaler          = {"vid_vulkan_upscaler",           "0" };
 
 
 //
@@ -1160,6 +1169,8 @@ void VID_RegisterCvars(void)
 	Cvar_Register(&vid_framebuffer_multisample);
 	Cvar_Register(&vid_framebuffer_fxaa);
 	Cvar_Register(&vid_vulkan_antilag);
+	Cvar_Register(&vid_vulkan_renderscale);
+	Cvar_Register(&vid_vulkan_upscaler);
 
 	Cvar_Register(&vid_reload_auto);
 

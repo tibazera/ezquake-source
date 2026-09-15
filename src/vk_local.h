@@ -61,6 +61,7 @@ void VK_AbandonActiveFrame(void);
 void VK_PopulateConfig(void);
 void VK_RequestSwapChainRecreate(void);
 void VK_RequestSurfaceRecreate(void);
+void VK_EndWorldPassAndComposite(void);
 
 // vk_instance.c
 qbool VK_CreateInstance(SDL_Window* window, VkInstance* instance);
@@ -96,6 +97,7 @@ void VK_RenderPassDelete(void);
 VkRenderPass VK_MainRenderPass(void);
 VkRenderPass VK_FrameRenderPass(qbool clear_color);
 VkRenderPass VK_PostProcessRenderPass(void);
+VkRenderPass VK_HudRenderPass(void);
 VkRenderPass VK_WorldNormalsRenderPass(void);
 VkFormat VK_DepthFormat(void);
 VkFormat VK_WorldNormalsFormat(void);
@@ -106,6 +108,15 @@ qbool VK_CreatePostProcessResources(void);
 void VK_DestroyPostProcessResources(void);
 VkFramebuffer VK_PostProcessFramebuffer(uint32_t imageIndex);
 VkFramebuffer VK_PostProcessCompositeFramebuffer(uint32_t imageIndex);
+VkFramebuffer VK_HudFramebuffer(uint32_t imageIndex);
+// The resolution every 3D-scene draw call (world/aliasmodel/sprite3d/vao/
+// particles) must set its viewport/scissor to: sceneSize when the upscaler
+// is resizing the scene target, imageSize otherwise (upscaler off or
+// vid_vulkan_renderscale 1 -- identical to native resolution, so every call
+// site that used to hardcode imageSize behaves exactly as before). HUD/2D
+// pipelines do NOT use this -- they always target native imageSize, see
+// VK_HudSetViewportScissor in vk_draw.c.
+VkExtent2D VK_SceneRenderExtent(void);
 qbool VK_CreateWorldNormalsResources(void);
 void VK_DestroyWorldNormalsResources(void);
 VkFramebuffer VK_WorldNormalsFramebuffer(uint32_t imageIndex);
@@ -287,14 +298,50 @@ typedef struct vk_options_s {
 		// target (VK_MAX_FRAMES_IN_FLIGHT > 1). When inactive, none of this
 		// is allocated and the main render pass targets the swapchain image
 		// directly, identical to before this feature existed.
+		//
+		// sceneSize: the resolution this target is actually created at.
+		// Equals imageSize when vid_vulkan_renderscale is 1 (or the upscaler
+		// is off) -- identical behaviour to before the upscaler pipeline
+		// existed. When < imageSize, VK_UpscaleComposite (vk_upscale.c) is
+		// what the composite pass now calls instead of the old plain
+		// gamma/FXAA copy: it upscales postProcessColorImages[i] from
+		// sceneSize to imageSize (FSR2 or bilinear fallback) as part of the
+		// same composite pass, then HUD draws on top at native imageSize --
+		// see VK_HudBeginNativePass in vk_draw.c.
+		VkExtent2D sceneSize;
+		// Depth/MSAA-color for the scene render pass, sized at sceneSize --
+		// only allocated when upscaleActive (sceneSize != imageSize), since
+		// the shared depthImage/msaaColorImage above are sized at imageSize
+		// and Vulkan requires every attachment of a framebuffer to share the
+		// same dimensions. When upscaleActive is false these stay
+		// VK_NULL_HANDLE and postProcessFramebuffers keeps using
+		// depthImage/msaaColorImageView like before this feature existed.
+		VkImage sceneDepthImage;
+		VkDeviceMemory sceneDepthImageMemory;
+		VkImageView sceneDepthImageView;
+		VkImage sceneMsaaColorImage;
+		VkDeviceMemory sceneMsaaColorImageMemory;
+		VkImageView sceneMsaaColorImageView;
 		VkImage* postProcessColorImages;
 		VkDeviceMemory* postProcessColorImageMemory;
 		VkImageView* postProcessColorImageViews;
 		VkFramebuffer* postProcessFramebuffers;
 		VkFramebuffer* postProcessCompositeFramebuffers;
+		// Framebuffer for vk_renderpass_hud (VK_HudRenderPass): same swapchain
+		// image view as postProcessCompositeFramebuffers[i], bound against the
+		// LOAD-instead-of-DONT_CARE render pass so HUD can draw on top of the
+		// composite pass's output -- see VK_UpscaleCompositeAndBeginHudPass.
+		VkFramebuffer* hudFramebuffers;
 		VkDescriptorPool postProcessDescriptorPool;
 		VkDescriptorSet* postProcessDescriptorSets;
 		qbool postProcessActive;
+		// True once sceneSize < imageSize (upscaler pipeline actually
+		// resizing, not just doing gamma/FXAA at native res). Distinguishes
+		// "composite pass is active" (postProcessActive) from "composite
+		// pass also needs to upscale" -- VK_EndFrame checks this to decide
+		// whether HUD draws in the main pass (legacy/native path) or in its
+		// own native-resolution pass after the upscale composite.
+		qbool upscaleActive;
 		// gl_outline & 2 (world outline) prepass resources -- see
 		// VK_CreateWorldNormalsResources. One per swapchain image, same
 		// reasoning as the postProcess* fields above: this pass's framebuffer
