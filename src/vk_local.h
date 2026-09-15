@@ -148,6 +148,9 @@ void VK_UpscaleForgetDescriptorSets(void);
 // vk_blending.c
 void VK_BlendingConfigure(VkPipelineColorBlendStateCreateInfo* info, VkPipelineColorBlendAttachmentState* blending, r_blendfunc_t func);
 
+// vk_misc.c
+void VK_GrowBuffer(void** buffer, int* capacity, int needed, size_t elementSize);
+
 // vk_resources.c
 uint32_t VK_FindMemoryType(uint32_t type_filter, VkMemoryPropertyFlags properties);
 qbool VK_CreateBufferResource(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkBuffer* buffer, VkDeviceMemory* memory);

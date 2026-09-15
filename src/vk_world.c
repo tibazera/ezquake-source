@@ -536,18 +536,7 @@ static void VK_WorldSetViewportScissor(VkCommandBuffer commandBuffer)
 
 static qbool VK_WorldEnsureDrawCapacity(void)
 {
-	if (worldDrawCount >= worldDrawCapacity) {
-		int newCapacity = worldDrawCapacity ? worldDrawCapacity * 2 : 128;
-		vk_world_draw_t* newDraws = Q_malloc(newCapacity * sizeof(newDraws[0]));
-
-		if (worldDraws) {
-			memcpy(newDraws, worldDraws, worldDrawCount * sizeof(worldDraws[0]));
-			Q_free(worldDraws);
-		}
-		worldDraws = newDraws;
-		worldDrawCapacity = newCapacity;
-	}
-
+	VK_GrowBuffer((void**)&worldDraws, &worldDrawCapacity, worldDrawCount + 1, sizeof(worldDraws[0]));
 	return worldDraws != NULL;
 }
 
@@ -1926,6 +1915,10 @@ void VK_WorldResourcesShutdown(void)
 	worldDrawCount = 0;
 	worldDrawCapacity = 0;
 	worldIndexCount = 0;
+
+	Q_free(worldPassIndices);
+	worldPassIndices = NULL;
+	worldPassIndicesCapacity = 0;
 }
 
 void VK_PrepareModelRendering(qbool vid_restart)
@@ -2133,16 +2126,20 @@ static qbool VK_WorldDrawOverlay(VkCommandBuffer commandBuffer, const vk_world_d
 // passed as lastSets -- currently VK_WORLD_MAX_DESCRIPTOR_SETS everywhere
 // (see lastBoundDescriptorSets[] at each call site in VK_RenderView). If a
 // future world pipeline needs more sets than that, bump the constant AND the
-// call-site array together; the assert below is a cheap tripwire against
-// forgetting the array side, same overflow class as the stack-buffer bug
-// this diff's sibling commit fixed.
+// call-site array together. Clamped defensively (not just asserted) because
+// assert() compiles out under NDEBUG/release, and this is exactly the same
+// overflow class as the stack-buffer bug bb8b0c27 already fixed once --
+// worth the two-instruction check even in release.
 static void VK_WorldBindIfChanged(VkCommandBuffer commandBuffer, VkPipeline pipeline, VkPipelineLayout layout,
 	const VkDescriptorSet* descriptorSets, int descriptorSetCount,
 	VkPipeline* lastPipeline, VkDescriptorSet* lastSets, int* lastSetCount)
 {
 	qbool pipelineChanged;
 
-	assert(descriptorSetCount <= VK_WORLD_MAX_DESCRIPTOR_SETS);
+	if (descriptorSetCount > VK_WORLD_MAX_DESCRIPTOR_SETS) {
+		Con_DPrintf("vulkan: VK_WorldBindIfChanged descriptorSetCount %d > max %d, clamping\n", descriptorSetCount, VK_WORLD_MAX_DESCRIPTOR_SETS);
+		descriptorSetCount = VK_WORLD_MAX_DESCRIPTOR_SETS;
+	}
 
 	pipelineChanged = (pipeline != *lastPipeline);
 	qbool setsChanged = (descriptorSetCount != *lastSetCount) ||
@@ -2450,14 +2447,7 @@ void VK_RenderView(void)
 	// each group keeps its original relative order (a stable partition), which
 	// the blended group in particular depends on for correct back-to-front
 	// alpha compositing.
-	if (worldDrawCount > worldPassIndicesCapacity) {
-		int newCapacity = worldPassIndicesCapacity ? worldPassIndicesCapacity * 2 : 128;
-		if (newCapacity < worldDrawCount) {
-			newCapacity = worldDrawCount;
-		}
-		worldPassIndices = Q_realloc(worldPassIndices, newCapacity * sizeof(worldPassIndices[0]));
-		worldPassIndicesCapacity = newCapacity;
-	}
+	VK_GrowBuffer((void**)&worldPassIndices, &worldPassIndicesCapacity, worldDrawCount, sizeof(worldPassIndices[0]));
 	passIndices = worldPassIndices;
 	for (i = 0; i < worldDrawCount; ++i) {
 		if (!worldDraws[i].blended) {
@@ -2712,10 +2702,9 @@ void VK_RenderView(void)
 		worldIndexCount,
 		worldDraws[0].firstIndex,
 		worldDraws[0].indexCount);
-	// worldPassIndices is a kept grow-and-keep buffer (see its declaration),
-	// not freed here -- only VK_TextureShutdownAll-style full teardown would
-	// free it, and this module has no such per-vid_restart teardown today
-	// (worldDraws[] above has the same lifetime).
+	// worldPassIndices is a kept grow-and-keep buffer (see its declaration);
+	// freed on vid_restart by VK_WorldResourcesShutdown, same lifetime as
+	// worldDraws[].
 }
 
 #endif // RENDERER_OPTION_VULKAN

@@ -12,7 +12,12 @@ layout(push_constant) uniform PushConstants {
 	vec2 invSrcSize;
 	float gamma;
 	float contrast;
-	int sharpness;   // 0 = bilinear only; 1 = EASU + RCAS (FSR2-style spatial upscale)
+	// Always 1 today (VK_UpscaleComposite hardcodes it, see vk_upscale.c) --
+	// no cvar currently exposes a plain-bilinear fallback, so the 0 branch
+	// below is unreachable in practice. Kept as a field (not removed) since
+	// it's a natural place to wire a future "upscale quality/sharpness"
+	// cvar without another push-constant-layout change.
+	int sharpness;
 } pc;
 
 // AMD FidelityFX Super Resolution 1.0 EASU (Edge-Adaptive Spatial Upsampling),
@@ -58,13 +63,8 @@ vec3 Easu(vec2 outPixel)
 	vec3 h = SampleColor(base + vec2( 0.0, 1.0) * invSrc);
 	vec3 i = SampleColor(base + vec2( 1.0, 1.0) * invSrc);
 
-	// Bilinear base sample (smooth base layer EASU sharpens on top of).
-	vec3 top = mix(b, c, frac.x);
-	vec3 bot = mix(h, i, frac.x);
-	vec3 bilinear = mix(mix(mix(a, d, frac.x), top, 0.0), mix(bot, bot, 0.0), 0.0);
-	bilinear = mix(mix(d, e, frac.x + 1.0 - 1.0), mix(e, f, frac.x), frac.y);
-	// (kept explicit rather than collapsed, to mirror EASU's separable
-	// bilinear-plus-edge-lobe structure for future tuning)
+	// Bilinear base sample (smooth base layer the sharpening lobe below pushes
+	// away from) -- e/f/h/i are the 4 texels actually straddling srcPixel.
 	vec3 baseSample = mix(mix(e, f, frac.x), mix(h, i, frac.x), frac.y);
 
 	// Edge-direction sharpening lobe: local Laplacian of luma steers an

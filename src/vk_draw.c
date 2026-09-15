@@ -731,10 +731,12 @@ void VK_PostProcessComposite(VkCommandBuffer commandBuffer, uint32_t imageIndex)
 	// imageSize), this composite pass IS the resize: run the FSR2-style
 	// spatial upscale instead of the plain gamma/FXAA blit below (which
 	// assumes 1:1 source/destination sampling and would just look like a
-	// blurry bilinear stretch). Gamma/contrast/FXAA on the upscaled result
-	// still happen the normal way after this -- VK_HudBeginNativePass's HUD
-	// pass composites on top of whatever this writes, same as the non-
-	// upscaling path.
+	// blurry bilinear stretch). VK_UpscaleComposite/vk_upscale.frag applies
+	// gamma/contrast itself, but NOT FXAA -- vid_framebuffer_fxaa currently
+	// has no effect while the upscaler is active (EASU+RCAS's own sharpening
+	// makes the plain FXAA approximation largely redundant on top, but this
+	// is a real gap if that assumption changes). VK_HudBeginNativePass's HUD
+	// pass composites on top of whatever this writes either way.
 	if (VK_UpscaleActive()) {
 		VK_UpscaleComposite(commandBuffer, imageIndex);
 		return;

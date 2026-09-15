@@ -166,19 +166,7 @@ static int deferredDescriptorFreeCount;
 
 static void VK_DeferredDescriptorFreeEnsureCapacity(int needed)
 {
-	int newCapacity;
-
-	if (needed <= deferredDescriptorFreeCapacity) {
-		return;
-	}
-
-	newCapacity = deferredDescriptorFreeCapacity ? deferredDescriptorFreeCapacity * 2 : 256;
-	if (newCapacity < needed) {
-		newCapacity = needed;
-	}
-
-	deferredDescriptorFrees = (VkDescriptorSet*)Q_realloc(deferredDescriptorFrees, newCapacity * sizeof(deferredDescriptorFrees[0]));
-	deferredDescriptorFreeCapacity = newCapacity;
+	VK_GrowBuffer((void**)&deferredDescriptorFrees, &deferredDescriptorFreeCapacity, needed, sizeof(deferredDescriptorFrees[0]));
 }
 
 // See VK_TextureQueueDeferredBindlessSlotRefresh (defined further below,

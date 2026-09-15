@@ -1034,6 +1034,19 @@ qbool VK_CreateSwapChainFramebuffers(void)
 		return false;
 	}
 
+	// Build the upscale pipeline/sampler/layout now (eager) rather than
+	// leaving it to VK_UpscaleComposite's lazy vkCreateGraphicsPipelines on
+	// the first frame that needs it -- avoids a mid-frame pipeline-creation
+	// stall the first time the scene target shrinks. Only worth doing when
+	// upscaleActive (VK_ResolveSceneSize's result, set above by
+	// VK_CreatePostProcessResources); harmless no-op failure otherwise since
+	// VK_UpscaleComposite would just retry lazily -- but currently upscaling
+	// isn't used unless already active, so a failure here isn't fatal to the
+	// swapchain the way the two resource blocks above are.
+	if (vk_options.swapChain.upscaleActive) {
+		VK_CreateUpscaleResources();
+	}
+
 	return true;
 }
 

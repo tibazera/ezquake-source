@@ -456,10 +456,14 @@ const char* vid_software_palette_enum[] = {
 	"shader", "1"
 };
 
+// "DLSS" doesn't run NVIDIA's actual DLSS yet (needs the proprietary NGX
+// SDK, not integrated) -- picking it runs the same FSR2-style shader as
+// option 1, see VK_UpscaleActive/vk_upscale.c. Labelled honestly so this
+// isn't silently misleading in the UI.
 const char* vid_vulkan_upscaler_enum[] = {
 	"off", "0",
 	"FSR2", "1",
-	"DLSS", "2"
+	"DLSS (not yet implemented, uses FSR2)", "2"
 };
 
 #ifdef EZ_MULTIPLE_RENDERERS
