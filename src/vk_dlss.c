@@ -664,6 +664,17 @@ qbool VK_DLSS_Composite(VkCommandBuffer commandBuffer, VkImage sceneColorImage, 
 	return true;
 }
 
+// Called from vk_main.c whenever the FSR2-style path handles a frame
+// instead of DLSS (DLSS unavailable/skipped this frame) -- resets
+// Constants::reset to true on DLSS's next actual run, so it doesn't try to
+// temporally accumulate against a frame it never produced. Mirrors
+// VK_UpscaleInvalidateHistory's identical reasoning for the reverse
+// direction (FSR2 falling back after DLSS handled the previous frame).
+void VK_DLSS_InvalidateHistory(void)
+{
+	vk_dlss_historyValid = false;
+}
+
 // Copies DLSS's output image (native resolution, whatever
 // VK_DLSS_Composite just wrote) into the given destination -- called from
 // vk_main.c right after VK_DLSS_Composite returns true, so the result

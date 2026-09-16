@@ -137,6 +137,22 @@ static int historyIndex;
 static qbool historyValid;
 static int historyValidFrameCount;
 
+// Called from vk_main.c whenever DLSS handles a frame instead of this
+// file's own EASU+RCAS/temporal path (dlssHandledThisFrame == true) --
+// invalidates the FSR2-style history buffer's "ready" state without
+// destroying the underlying image, so a later frame that falls back to
+// this path (DLSS transiently unavailable, or the user switches
+// vid_vulkan_upscaler 2 -> 1) doesn't blend against a stale frame from
+// before the switch. Same reasoning as vid_restart resetting these same
+// fields in VK_UpscaleDestroyHistoryBuffer, just without the image
+// teardown/recreate cost since the image itself doesn't need to change
+// size when swapping between the two upscalers.
+void VK_UpscaleInvalidateHistory(void)
+{
+	historyValid = false;
+	historyValidFrameCount = 0;
+}
+
 // Per-frame reprojection matrices UBO (see vk_upscale_matrices_t) --
 // ping-ponged across the SAME 2 slots as historyImages above and for the
 // identical reason: frame N's fragment shader can still be reading

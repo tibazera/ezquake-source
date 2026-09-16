@@ -166,6 +166,9 @@ void VK_UpscaleForgetDescriptorSets(void);
 // temporal upscaling isn't applicable this frame.
 qbool VK_UpscaleUpdateMatrices(VkCommandBuffer commandBuffer);
 void VK_UpscaleUpdateHistory(VkCommandBuffer commandBuffer, uint32_t imageIndex);
+// Called whenever DLSS handles a frame instead of this file's own path, so
+// a later fallback frame doesn't blend against stale pre-switch history.
+void VK_UpscaleInvalidateHistory(void);
 
 // Populates the DLSS motion-vector buffer -- must run after
 // VK_UpscaleUpdateMatrices (uses the same matricesBuffers[historyIndex]
@@ -200,6 +203,9 @@ qbool VK_DLSS_Composite(VkCommandBuffer commandBuffer, VkImage sceneColorImage, 
 // swapchain image is PRESENT_SRC_KHR going in, same convention as
 // VK_PostProcessTransitionForSampling elsewhere).
 qbool VK_DLSS_CopyOutputTo(VkCommandBuffer commandBuffer, VkImage dstImage, VkImageLayout dstImageLayoutBeforeCopy, VkImageLayout dstImageLayoutAfterCopy);
+// Called whenever the FSR2-style path handles a frame instead of DLSS, so
+// DLSS's next real run doesn't reproject against a frame it never wrote.
+void VK_DLSS_InvalidateHistory(void);
 void VK_DLSS_Shutdown(void);
 
 // vk_blending.c

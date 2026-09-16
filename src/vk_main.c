@@ -1023,11 +1023,26 @@ void VK_EndWorldPassAndComposite(void)
 						// there afterwards for the HUD pass/present to work.
 						dlssHandledThisFrame = VK_DLSS_CopyOutputTo(commandBuffer, vk_options.swapChain.images[vk_options.frame.imageIndex],
 							VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+						// DLSS just wrote this frame instead of the FSR2-style
+						// path below -- invalidate that path's own history so
+						// a later frame that falls back to it (DLSS transiently
+						// unavailable, or vid_vulkan_upscaler switched back to
+						// 1) doesn't blend against a stale pre-DLSS frame.
+						if (dlssHandledThisFrame) {
+							VK_UpscaleInvalidateHistory();
+						}
 					}
 				}
 			}
 
 			if (!dlssHandledThisFrame) {
+				// Mirror of the DLSS-side invalidation above: this frame is
+				// about to be drawn by the FSR2-style path instead of DLSS
+				// (DLSS off, unavailable, or transiently failed this frame)
+				// -- if DLSS runs again later, it must not reproject against
+				// whatever this path is about to write.
+				VK_DLSS_InvalidateHistory();
+
 				compositePassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
 				compositePassInfo.renderPass = VK_PostProcessRenderPass();
 				compositePassInfo.framebuffer = compositeFramebuffer;
