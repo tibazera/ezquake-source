@@ -725,6 +725,16 @@ void VK_UpscaleForgetDescriptorSets(void)
 
 void VK_DestroyUpscaleResources(void)
 {
+	// Called on every vid_restart (via VK_DestroySwapChainFramebuffers) --
+	// VK_UpscaleDestroyHistoryBuffer below already resets this file's own
+	// FSR2-style historyValid for the same reason. DLSS's history lives in
+	// vk_dlss.c instead (its output image survives vid_restart, resized
+	// lazily by VK_DLSS_EnsureOutputImage rather than torn down here), but
+	// its "ready to temporally accumulate" flag must reset the same way: a
+	// vid_restart discards/reloads the whole scene, so the next DLSS frame
+	// must not reproject against whatever it last saw before the restart.
+	VK_DLSS_InvalidateHistory();
+
 	VK_UpscaleDestroyHistoryBuffer();
 	{
 		int slot;
