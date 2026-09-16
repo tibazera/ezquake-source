@@ -1040,8 +1040,14 @@ void VK_EndWorldPassAndComposite(void)
 				// about to be drawn by the FSR2-style path instead of DLSS
 				// (DLSS off, unavailable, or transiently failed this frame)
 				// -- if DLSS runs again later, it must not reproject against
-				// whatever this path is about to write.
-				VK_DLSS_InvalidateHistory();
+				// whatever this path is about to write. Gated by
+				// skipTemporalUpdate too: a later multiview pane within the
+				// SAME real frame also lands here (the DLSS block above is
+				// skipped for it), but it must not invalidate history DLSS
+				// may have just validated on the first pane of this frame.
+				if (!skipTemporalUpdate) {
+					VK_DLSS_InvalidateHistory();
+				}
 
 				compositePassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
 				compositePassInfo.renderPass = VK_PostProcessRenderPass();
