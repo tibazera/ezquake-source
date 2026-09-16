@@ -566,6 +566,37 @@ static const float vk_jitter_halton8[8][2] = {
 // dereferencing an obviously-invalid address for what should have been this
 // function's static array). An output parameter has no aliasing ambiguity
 // for the optimizer to get wrong.
+// Same Halton-8 jitter sequence VK_JitteredProjectionMatrix bakes into the
+// projection matrix, but returned as a raw pixel offset (low-res scene
+// pixels) instead -- what vk_fsr2.c's compute passes need directly (real
+// FSR2's own jitterOffset field is documented as pixel-space, not an NDC
+// matrix term). Kept in sync with VK_JitteredProjectionMatrix's own jitterX/
+// jitterY computation; if that sequence or its indexing ever changes, update
+// both together.
+void VK_JitterPixelOffset(float* outX, float* outY)
+{
+	if (!VK_UpscaleActive()) {
+		*outX = 0.0f;
+		*outY = 0.0f;
+		return;
+	}
+	*outX = vk_jitter_halton8[vk_jitter_frameIndex % 8][0];
+	// Y sign flipped relative to the raw Halton table: VK_JitteredProjectionMatrix
+	// applies this same jitter to out[9] in GL clip space, which
+	// VK_ToVulkanClipSpace then flips (vk_flipRemapMatrix's [1][1] = -1) to
+	// get real Vulkan clip space -- the jitter that actually ends up moving
+	// pixels on screen is therefore the NEGATION of the raw table value, in
+	// Vulkan's Y-down pixel convention. vk_fsr2.c's compute shaders sample
+	// Jitter() directly in that same pixel-space convention (see
+	// ffx_fsr2_upsample.h's Jitter() usage, pixel units not NDC), so this
+	// function must return the value actually applied to what got rendered,
+	// not the raw pre-flip table entry -- returning the wrong sign here was
+	// found to cause continuous reprojection error every frame (visible as
+	// constant flickering/shimmering, reported live during this session's
+	// smoke test).
+	*outY = -vk_jitter_halton8[vk_jitter_frameIndex % 8][1];
+}
+
 void VK_JitteredProjectionMatrix(float* out)
 {
 	VkExtent2D sceneSize;
@@ -984,6 +1015,7 @@ void VK_EndWorldPassAndComposite(void)
 		if (compositeFramebuffer != VK_NULL_HANDLE) {
 			VkRenderPassBeginInfo compositePassInfo = { 0 };
 			qbool dlssHandledThisFrame = false;
+			qbool fsr2HandledThisFrame = false;
 
 			VK_PostProcessTransitionForSampling(commandBuffer, vk_options.frame.imageIndex);
 			// Must run before vkCmdBeginRenderPass below -- vkCmdUpdateBuffer
@@ -994,6 +1026,34 @@ void VK_EndWorldPassAndComposite(void)
 			// multiview pane (skipTemporalUpdate).
 			if (!skipTemporalUpdate) {
 				VK_UpscaleUpdateMatrices(commandBuffer);
+			}
+
+			// Real FSR2 path (vid_vulkan_upscaler==1): entirely outside the
+			// composite render pass below, same reasoning as DLSS just below
+			// -- all 5 of its passes are compute dispatches. Reuses the same
+			// motion-vector buffer DLSS would (VK_MotionVectorsComposite),
+			// since both need the identical camera-reprojection motion
+			// vectors and computing them twice would be wasted work. Same
+			// vk_force_clear_frames_remaining guard as DLSS below: a raw
+			// vkCmdCopyImage into a genuinely fresh (UNDEFINED-layout)
+			// swapchain image would lie to the driver about its prior
+			// layout, so skip real-FSR2 for those frames too and let the
+			// render-pass fallback establish the image's real layout first.
+			if (vk_force_clear_frames_remaining == 0 && !skipTemporalUpdate && VK_Fsr2Active() &&
+				VK_MotionVectorsComposite(commandBuffer, vk_options.frame.imageIndex)) {
+				fsr2HandledThisFrame = VK_Fsr2Composite(commandBuffer, vk_options.frame.currentFrame,
+					vk_options.swapChain.postProcessColorImageViews[vk_options.frame.imageIndex],
+					vk_options.swapChain.sceneDepthImageView,
+					VK_MotionVectorsImageView(),
+					vk_options.swapChain.images[vk_options.frame.imageIndex],
+					VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+				// Real FSR2 just wrote this frame instead of DLSS or the old
+				// render-pass fallback -- invalidate DLSS's history for the
+				// same cross-path-corruption reason the DLSS branch below
+				// invalidates this path's history when DLSS handles a frame.
+				if (fsr2HandledThisFrame) {
+					VK_DLSS_InvalidateHistory();
+				}
 			}
 
 			// DLSS path: entirely outside the composite render pass below
@@ -1018,7 +1078,7 @@ void VK_EndWorldPassAndComposite(void)
 			// would be a real lie to the driver on a genuinely fresh image.
 			// Skip DLSS for those frames; the EASU+RCAS path already needs to
 			// run through them anyway to establish the image's real layout.
-			if (vk_force_clear_frames_remaining == 0 && !skipTemporalUpdate && VK_DLSS_Active() &&
+			if (!fsr2HandledThisFrame && vk_force_clear_frames_remaining == 0 && !skipTemporalUpdate && VK_DLSS_Active() &&
 				VK_MotionVectorsComposite(commandBuffer, vk_options.frame.imageIndex)) {
 				float dlssInvViewProj[16];
 
@@ -1049,18 +1109,20 @@ void VK_EndWorldPassAndComposite(void)
 				}
 			}
 
-			if (!dlssHandledThisFrame) {
-				// Mirror of the DLSS-side invalidation above: this frame is
-				// about to be drawn by the FSR2-style path instead of DLSS
-				// (DLSS off, unavailable, or transiently failed this frame)
-				// -- if DLSS runs again later, it must not reproject against
+			if (!fsr2HandledThisFrame && !dlssHandledThisFrame) {
+				// Mirror of the DLSS-side/FSR2-side invalidation above: this
+				// frame is about to be drawn by the old render-pass fallback
+				// path instead of either specialised upscaler (both off,
+				// unavailable, or transiently failed this frame) -- if
+				// either runs again later, it must not reproject against
 				// whatever this path is about to write. Gated by
 				// skipTemporalUpdate too: a later multiview pane within the
-				// SAME real frame also lands here (the DLSS block above is
-				// skipped for it), but it must not invalidate history DLSS
-				// may have just validated on the first pane of this frame.
+				// SAME real frame also lands here (both blocks above are
+				// skipped for it), but it must not invalidate history either
+				// path may have just validated on the first pane of this frame.
 				if (!skipTemporalUpdate) {
 					VK_DLSS_InvalidateHistory();
+					VK_Fsr2InvalidateHistory();
 				}
 
 				compositePassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;

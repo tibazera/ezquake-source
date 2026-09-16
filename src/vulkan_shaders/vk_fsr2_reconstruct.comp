@@ -1,0 +1,182 @@
+#version 450
+// Real FSR2 pass 1/5: reconstruct+dilate depth/motion, reconstruct previous
+// frame's depth, compute lock input luma. Ported from AMD's
+// FidelityFX-FSR2 (GPUOpen-Effects/FidelityFX-FSR2, MIT licensed) --
+// ffx_fsr2_reconstruct_dilated_velocity_and_previous_depth.h's
+// ReconstructAndDilate/ReconstructPrevDepth/FindNearestDepth/
+// ComputeLockInputLuma, ported from the FFX_* macro-abstracted GLSL/HLSL
+// dialect to plain GLSL for this project's compute pipeline. Logic and
+// constants preserved exactly; only the macro layer and resource-binding
+// mechanism differ (this project uses fixed descriptor bindings instead of
+// FFX's runtime resource-registration backend).
+//
+// Runs once per LOW-RES (render size) pixel, group size 8x8 to match
+// upstream's threadGroupWorkRegionDim.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0) uniform sampler2D sceneColor;   // low-res, current frame
+layout(binding = 1) uniform sampler2D sceneDepth;   // low-res, current frame
+layout(binding = 2) uniform sampler2D motionVectors; // low-res, current frame (UV-space, render target relative)
+
+layout(binding = 3, r32f) uniform writeonly image2D dilatedDepthOut;       // low-res
+layout(binding = 4, rg16f) uniform writeonly image2D dilatedMotionOut;     // low-res
+layout(binding = 5, r16f) uniform writeonly image2D lockInputLumaOut;      // low-res
+
+layout(push_constant) uniform PushConstants {
+	vec2 renderSize;
+	vec2 displaySize;
+	int reversedDepth;
+	float preExposure;
+	float exposure;
+} pc;
+
+// Matches ffx_fsr2_common.h's GetViewSpaceDepth -- deviceToViewDepth here is
+// simplified to the two coefficients that formula actually needs (the
+// perspective projection's [2][2]/[3][2] terms), computed on the CPU side
+// from the same near/far the engine's own projection matrix uses. Passed as
+// part of the reprojection matrices UBO shared with the other FSR2 passes
+// (see VK_Fsr2UpdateMatrices in vk_upscale.c).
+layout(binding = 6) uniform DepthParamsUBO {
+	vec2 deviceToViewDepth; // x: offset, y: scale -- viewDepth = scale / (deviceDepth - offset)
+} depthParams;
+
+float GetViewSpaceDepth(float deviceDepth)
+{
+	return depthParams.deviceToViewDepth.y / (deviceDepth - depthParams.deviceToViewDepth.x);
+}
+
+bool IsOnScreen(ivec2 pos, ivec2 size)
+{
+	return all(greaterThanEqual(pos, ivec2(0))) && all(lessThan(pos, size));
+}
+
+// FindNearestDepth: 9-tap cross+diagonal search for the depth closest to the
+// camera (reversed-depth-aware), same sample pattern as upstream.
+void FindNearestDepth(ivec2 iPxPos, ivec2 iPxSize, out float fNearestDepth, out ivec2 iNearestDepthCoord)
+{
+	const ivec2 offsets[9] = ivec2[9](
+		ivec2(0, 0), ivec2(1, 0), ivec2(0, 1), ivec2(0, -1),
+		ivec2(-1, 0), ivec2(-1, 1), ivec2(1, 1), ivec2(-1, -1), ivec2(1, -1)
+	);
+
+	float depth[9];
+	for (int i = 0; i < 9; ++i) {
+		ivec2 p = iPxPos + offsets[i];
+		p = clamp(p, ivec2(0), iPxSize - ivec2(1));
+		depth[i] = texelFetch(sceneDepth, p, 0).r;
+	}
+
+	iNearestDepthCoord = iPxPos;
+	fNearestDepth = depth[0];
+	for (int i = 1; i < 9; ++i) {
+		ivec2 p = iPxPos + offsets[i];
+		if (IsOnScreen(p, iPxSize)) {
+			bool better = (pc.reversedDepth != 0) ? (depth[i] > fNearestDepth) : (depth[i] < fNearestDepth);
+			if (better) {
+				iNearestDepthCoord = p;
+				fNearestDepth = depth[i];
+			}
+		}
+	}
+}
+
+// Bilinear splat of this frame's depth into where it lands in the PREVIOUS
+// frame's grid (reprojected by its own motion vector) -- same technique
+// upstream uses (ReconstructPrevDepth), needed so next frame's depth-clip
+// pass has a plausible "previous depth" to compare against even though
+// nothing explicitly stores a full previous depth buffer. Uses imageAtomicMax
+// on a uint bit-pattern (this project's version of upstream's InterlockedMax
+// on the D3D/VK side) since GLSL has no float imageAtomicMax on all targets.
+layout(binding = 7, r32ui) uniform uimage2D reconstructedPrevDepthAtomic;
+
+void ReconstructPrevDepth(ivec2 iPxPos, float fDepth, vec2 fMotionVector, ivec2 iPxDepthSize)
+{
+	// Discard motion vectors under ~0.1 display pixels (upstream's exact
+	// threshold), same reasoning as depth-clip's own MV discard: avoids
+	// splatting static-scene noise into neighbouring texels.
+	if (length(fMotionVector * pc.displaySize) <= 0.1) {
+		fMotionVector = vec2(0.0);
+	}
+
+	vec2 fUv = (vec2(iPxPos) + 0.5) / vec2(iPxDepthSize);
+	vec2 fReprojectedUv = fUv + fMotionVector;
+
+	vec2 fPxSample = (fReprojectedUv * vec2(iPxDepthSize)) - vec2(0.5);
+	ivec2 iBasePos = ivec2(floor(fPxSample));
+	vec2 fPxFrac = fract(fPxSample);
+
+	const ivec2 offsets[4] = ivec2[4](ivec2(0, 0), ivec2(1, 0), ivec2(0, 1), ivec2(1, 1));
+	float weights[4] = float[4](
+		(1.0 - fPxFrac.x) * (1.0 - fPxFrac.y),
+		fPxFrac.x * (1.0 - fPxFrac.y),
+		(1.0 - fPxFrac.x) * fPxFrac.y,
+		fPxFrac.x * fPxFrac.y
+	);
+
+	const float weightThreshold = 0.01; // fReconstructedDepthBilinearWeightThreshold, upstream's exact value
+
+	for (int i = 0; i < 4; ++i) {
+		if (weights[i] > weightThreshold) {
+			ivec2 storePos = iBasePos + offsets[i];
+			if (IsOnScreen(storePos, iPxDepthSize)) {
+				// Reversed depth: "nearest" is the numerically largest value,
+				// so atomicMax on the raw bit pattern works directly for
+				// positive floats (IEEE754 float ordering matches uint
+				// ordering for values >= 0, which depth always is).
+				// Non-reversed depth wants the max view-space-far (smallest
+				// device depth is nearest for non-reversed) -- same atomicMax
+				// on the bit pattern still selects "furthest device depth",
+				// matching upstream's own fPlaneDepth = max(prev, current)
+				// convention used by the depth-clip pass that reads this back.
+				imageAtomicMax(reconstructedPrevDepthAtomic, storePos, floatBitsToUint(fDepth));
+			}
+		}
+	}
+}
+
+// ComputeLockInputLuma: perceptual luma (Rec.709 -> CIE 1931-style L* curve),
+// same formula upstream uses so the lock pass's thin-feature detector sees
+// identical input.
+float RGBToLuma(vec3 c)
+{
+	return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+float RGBToPerceivedLuma(vec3 c)
+{
+	float luminance = RGBToLuma(c);
+	float perceived;
+	if (luminance <= 216.0 / 24389.0) {
+		perceived = luminance * (24389.0 / 27.0);
+	} else {
+		perceived = pow(luminance, 1.0 / 3.0) * 116.0 - 16.0;
+	}
+	return perceived * 0.01;
+}
+
+void main()
+{
+	ivec2 iPxLrPos = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 renderSizeI = ivec2(pc.renderSize);
+	if (any(greaterThanEqual(iPxLrPos, renderSizeI))) {
+		return;
+	}
+
+	float fDilatedDepth;
+	ivec2 iNearestDepthCoord;
+	FindNearestDepth(iPxLrPos, renderSizeI, fDilatedDepth, iNearestDepthCoord);
+
+	vec2 fDilatedMotionVector = texelFetch(motionVectors, iNearestDepthCoord, 0).rg;
+
+	imageStore(dilatedDepthOut, iPxLrPos, vec4(fDilatedDepth, 0, 0, 0));
+	imageStore(dilatedMotionOut, iPxLrPos, vec4(fDilatedMotionVector, 0, 0));
+
+	ReconstructPrevDepth(iPxLrPos, fDilatedDepth, fDilatedMotionVector, renderSizeI);
+
+	vec3 rgb = max(texelFetch(sceneColor, iPxLrPos, 0).rgb, vec3(0.0));
+	rgb /= pc.preExposure;
+	rgb *= pc.exposure;
+	float fLockInputLuma = pow(RGBToPerceivedLuma(rgb), 1.0 / 6.0);
+	imageStore(lockInputLumaOut, iPxLrPos, vec4(fLockInputLuma, 0, 0, 0));
+}

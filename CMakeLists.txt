@@ -509,6 +509,11 @@ if(RENDERER_VULKAN)
     add_vulkan_shader(vulkan_spirv_shaders ${VULKAN_SHADER_DIR}/vk_world_outline.frag vk_world_outline_frag.spv)
     add_vulkan_shader(vulkan_spirv_shaders ${VULKAN_SHADER_DIR}/vk_upscale.frag vk_upscale_frag.spv)
     add_vulkan_shader(vulkan_spirv_shaders ${VULKAN_SHADER_DIR}/vk_motion_vectors.frag vk_motion_vectors_frag.spv)
+    add_vulkan_shader(vulkan_spirv_shaders ${VULKAN_SHADER_DIR}/vk_fsr2_reconstruct.comp vk_fsr2_reconstruct_comp.spv)
+    add_vulkan_shader(vulkan_spirv_shaders ${VULKAN_SHADER_DIR}/vk_fsr2_depthclip.comp vk_fsr2_depthclip_comp.spv)
+    add_vulkan_shader(vulkan_spirv_shaders ${VULKAN_SHADER_DIR}/vk_fsr2_lock.comp vk_fsr2_lock_comp.spv)
+    add_vulkan_shader(vulkan_spirv_shaders ${VULKAN_SHADER_DIR}/vk_fsr2_accumulate.comp vk_fsr2_accumulate_comp.spv)
+    add_vulkan_shader(vulkan_spirv_shaders ${VULKAN_SHADER_DIR}/vk_fsr2_rcas.comp vk_fsr2_rcas_comp.spv)
     add_resources(shaders_vulkan ${vulkan_spirv_shaders})
 
     set(vulkan_renderer_headers
@@ -536,6 +541,7 @@ if(RENDERER_VULKAN)
             ${SOURCE_DIR}/vk_swapchain.c
             ${SOURCE_DIR}/vk_texture.c
             ${SOURCE_DIR}/vk_dlss.c
+            ${SOURCE_DIR}/vk_fsr2.c
             ${SOURCE_DIR}/vk_upscale.c
             ${SOURCE_DIR}/vk_vao.c
             ${SOURCE_DIR}/vk_window_surface.c

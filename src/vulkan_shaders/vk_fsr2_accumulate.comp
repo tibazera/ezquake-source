@@ -1,0 +1,586 @@
+#version 450
+// Real FSR2 pass 4/5: reproject history + Lanczos upsample + rectification
+// box + lock-status update + temporal accumulate. Ported from AMD's
+// FidelityFX-FSR2 (GPUOpen-Effects/FidelityFX-FSR2, MIT licensed) --
+// ffx_fsr2_reproject.h, ffx_fsr2_upsample.h, ffx_fsr2_accumulate.h,
+// ffx_fsr2_postprocess_lock_status.h, and ffx_fsr2_common.h's
+// RectificationBox/YCoCg/Tonemap helpers, ported from the FFX_*
+// macro-abstracted GLSL/HLSL dialect to plain GLSL. This is the single
+// largest and most load-bearing pass in real FSR2; every constant
+// (fUpsampleLanczosWeightScale, fMaxAccumulationLanczosWeight,
+// fAverageLanczosWeightPerFrame, the rectification curve bias, the luma
+// instability thresholds) is preserved exactly from upstream, not
+// approximated.
+//
+// Simplification vs upstream (documented, not silent): upstream's lock
+// "shading change" detection samples a dedicated SPD-generated MIP pyramid
+// of scene luminance at a configurable level (FFX_FSR2_SHADING_CHANGE_MIP_LEVEL,
+// normally mip ~5) so the comparison is spatially smoothed/robust to noise.
+// This port reads the reconstruct pass's per-texel lockInputLuma directly
+// (mip 0 equivalent) instead of building and sampling a full SPD mip chain
+// -- same UpdateLockStatus logic and thresholds, just compared at native
+// low-res texel granularity rather than a downsampled/smoothed one. This
+// trades some noise-robustness in the lock decision for a much smaller,
+// simpler implementation; the core reactive-factor/lifetime/luma-diff
+// mechanics upstream uses are otherwise unchanged.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0) uniform sampler2D preparedInputColor;      // low-res, RGBA16F: .rgb YCoCg, .a depth-clip factor
+layout(binding = 1) uniform sampler2D dilatedReactiveMasks;    // low-res, .r reactive, .g accumulation/in-motion mask
+layout(binding = 2) uniform sampler2D lockInputLuma;           // low-res, from reconstruct pass (see file header re: shading-change simplification)
+layout(binding = 3) uniform sampler2D dilatedMotionVectorsHr;  // display-res equivalent sample point (see main(): sampled at render-res grid, scaled by GetMotionVector)
+layout(binding = 4) uniform sampler2D history;                 // display-res, previous frame's final accumulated color (.rgb) + temporal reactive factor (.a, signed)
+layout(binding = 5) uniform sampler2D lockStatusIn;             // display-res, .r lifetime remaining, .g temporal luma (previous frame's, read-only this pass)
+
+layout(binding = 6, rgba16f) uniform writeonly image2D upscaledOutputOut; // display-res, this pass's final color (pre-RCAS)
+layout(binding = 7, rg16f) uniform writeonly image2D lockStatusOut;       // display-res, this frame's updated lock status (ping-ponged with lockStatusIn)
+layout(binding = 8) uniform sampler2D newLocks;                          // display-res, r8, written by the lock pass this frame
+
+layout(push_constant) uniform PushConstants {
+	vec2 renderSize;
+	vec2 displaySize;
+	vec2 jitter;
+	vec2 downscaleFactor; // renderSize / displaySize
+	int frameIndex;       // 0 == reset frame (upstream's bIsResetFrame)
+	int reversedDepth;
+	float jitterPhaseCount;
+	float preExposure;
+	float exposure;
+	float previousFramePreExposure;
+} pc;
+
+const float FSR2_EPSILON = 1e-03;
+const float FSR2_FP16_MAX = 65504.0;
+
+// ---- shared helpers (see ffx_fsr2_common.h) -------------------------------
+
+vec3 YCoCgToRGB(vec3 c)
+{
+	return vec3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z);
+}
+
+vec3 RGBToYCoCg(vec3 rgb)
+{
+	return vec3(
+		0.25 * rgb.r + 0.5 * rgb.g + 0.25 * rgb.b,
+		0.5 * rgb.r - 0.5 * rgb.b,
+		-0.25 * rgb.r + 0.5 * rgb.g - 0.25 * rgb.b);
+}
+
+float RGBToLuma(vec3 c)
+{
+	return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+float RGBToPerceivedLuma(vec3 c)
+{
+	float luminance = RGBToLuma(c);
+	float perceived;
+	if (luminance <= 216.0 / 24389.0) {
+		perceived = luminance * (24389.0 / 27.0);
+	} else {
+		perceived = pow(luminance, 1.0 / 3.0) * 116.0 - 16.0;
+	}
+	return perceived * 0.01;
+}
+
+vec3 Tonemap(vec3 rgb)
+{
+	return rgb / (max(max(0.0, rgb.r), max(rgb.g, rgb.b)) + 1.0);
+}
+
+vec3 InverseTonemap(vec3 rgb)
+{
+	const float tonemapEpsilon = 1.0 / FSR2_FP16_MAX;
+	return rgb / max(tonemapEpsilon, 1.0 - max(rgb.r, max(rgb.g, rgb.b)));
+}
+
+vec3 PrepareRgb(vec3 rgb, float exposure, float preExposure)
+{
+	rgb /= preExposure;
+	rgb *= exposure;
+	return clamp(rgb, 0.0, FSR2_FP16_MAX);
+}
+
+vec3 UnprepareRgb(vec3 rgb, float exposure)
+{
+	rgb /= exposure;
+	rgb *= pc.preExposure;
+	return rgb;
+}
+
+float MinDividedByMax(float v0, float v1)
+{
+	float m = max(v0, v1);
+	return m != 0.0 ? min(v0, v1) / m : 0.0;
+}
+
+bool IsUvInside(vec2 uv)
+{
+	return uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0;
+}
+
+vec2 ClampUv(vec2 uv, ivec2 size, ivec2 resourceSize)
+{
+	vec2 sampleLoc = uv * size;
+	vec2 clampedLoc = clamp(sampleLoc, vec2(0.5), vec2(size) - vec2(0.5));
+	return clampedLoc / vec2(resourceSize);
+}
+
+// ---- Lanczos2 (approximate variant, upstream's default LANCZOS_TYPE_APPROXIMATE) ----
+
+float Lanczos2ApproxSqNoClamp(float x2)
+{
+	float a = (2.0 / 5.0) * x2 - 1.0;
+	float b = (1.0 / 4.0) * x2 - 1.0;
+	return ((25.0 / 16.0) * a * a - (25.0 / 16.0 - 1.0)) * (b * b);
+}
+
+float Lanczos2ApproxSq(float x2)
+{
+	x2 = min(x2, 4.0);
+	return Lanczos2ApproxSqNoClamp(x2);
+}
+
+float GetUpsampleLanczosWeight(vec2 fSrcSampleOffset, float fKernelWeight)
+{
+	vec2 fSrcSampleOffsetBiased = fSrcSampleOffset * fKernelWeight;
+	return Lanczos2ApproxSq(dot(fSrcSampleOffsetBiased, fSrcSampleOffsetBiased));
+}
+
+// Reference (non-approximate) Lanczos2, used for the history bicubic
+// resample below -- upstream's reproject pass uses LANCZOS_TYPE_REFERENCE
+// (option 0), distinct from the upsample pass's approximate variant.
+float Lanczos2Reference(float x)
+{
+	x = min(abs(x), 2.0);
+	const float PI = 3.141592653589793;
+	return x < FSR2_EPSILON ? 1.0 : (sin(PI * x) / (PI * x)) * (sin(0.5 * PI * x) / (0.5 * PI * x));
+}
+
+vec4 Lanczos2Sample4(vec4 c0, vec4 c1, vec4 c2, vec4 c3, float t)
+{
+	float w0 = Lanczos2Reference(-1.0 - t);
+	float w1 = Lanczos2Reference(-0.0 - t);
+	float w2 = Lanczos2Reference(1.0 - t);
+	float w3 = Lanczos2Reference(2.0 - t);
+	return (w0 * c0 + w1 * c1 + w2 * c2 + w3 * c3) / max(w0 + w1 + w2 + w3, 1e-8);
+}
+
+// 4x4-tap bicubic Lanczos history resample with deringing (clamp to the
+// inner 2x2's min/max), matching upstream's Lanczos2(FetchedBicubicSamples).
+vec4 HistorySample(vec2 uv, ivec2 historySize)
+{
+	vec2 fPxSample = (uv * historySize) - vec2(0.5);
+	ivec2 iBasePos = ivec2(floor(fPxSample)) - ivec2(1);
+	vec2 fPxFrac = fract(fPxSample);
+
+	vec4 rows[4];
+	vec4 inner00, inner10, inner01, inner11;
+	for (int row = 0; row < 4; ++row) {
+		vec4 c[4];
+		for (int col = 0; col < 4; ++col) {
+			ivec2 p = clamp(iBasePos + ivec2(col, row), ivec2(0), historySize - 1);
+			c[col] = texelFetch(history, p, 0);
+			if (row == 1 && col == 1) inner00 = c[col];
+			if (row == 1 && col == 2) inner10 = c[col];
+			if (row == 2 && col == 1) inner01 = c[col];
+			if (row == 2 && col == 2) inner11 = c[col];
+		}
+		rows[row] = Lanczos2Sample4(c[0], c[1], c[2], c[3], fPxFrac.x);
+	}
+	vec4 result = Lanczos2Sample4(rows[0], rows[1], rows[2], rows[3], fPxFrac.y);
+
+	vec4 deringMin = min(min(inner00, inner10), min(inner01, inner11));
+	vec4 deringMax = max(max(inner00, inner10), max(inner01, inner11));
+	return clamp(result, deringMin, deringMax);
+}
+
+// ---- rectification box (see ffx_fsr2_common.h) -----------------------------
+
+struct RectificationBox {
+	vec3 boxCenter;
+	vec3 boxVec;
+	vec3 aabbMin;
+	vec3 aabbMax;
+	float boxCenterWeight;
+};
+
+void RectificationBoxAddSample(bool bInitial, inout RectificationBox box, vec3 colorSample, float weight)
+{
+	if (bInitial) {
+		box.aabbMin = colorSample;
+		box.aabbMax = colorSample;
+		vec3 weighted = colorSample * weight;
+		box.boxCenter = weighted;
+		box.boxVec = colorSample * weighted;
+		box.boxCenterWeight = weight;
+	} else {
+		box.aabbMin = min(box.aabbMin, colorSample);
+		box.aabbMax = max(box.aabbMax, colorSample);
+		vec3 weighted = colorSample * weight;
+		box.boxCenter += weighted;
+		box.boxVec += colorSample * weighted;
+		box.boxCenterWeight += weight;
+	}
+}
+
+void RectificationBoxComputeVarianceBoxData(inout RectificationBox box)
+{
+	box.boxCenterWeight = (abs(box.boxCenterWeight) > FSR2_EPSILON) ? box.boxCenterWeight : 1.0;
+	box.boxCenter /= box.boxCenterWeight;
+	box.boxVec /= box.boxCenterWeight;
+	vec3 stdDev = sqrt(abs(box.boxVec - box.boxCenter * box.boxCenter));
+	box.boxVec = stdDev;
+}
+
+// ---- per-pixel state --------------------------------------------------------
+
+struct Params {
+	ivec2 iPxHrPos;
+	vec2 fHrUv;
+	vec2 fLrUvSampler;
+	vec2 fMotionVector;
+	vec2 fReprojectedHrUv;
+	float fHrVelocity;
+	float fDepthClipFactor;
+	float fDilatedReactiveFactor;
+	float fAccumulationMask;
+	bool bIsResetFrame;
+	bool bIsExistingSample;
+	bool bIsNewSample;
+};
+
+float GetPxHrVelocity(vec2 fMotionVector)
+{
+	return length(fMotionVector * pc.displaySize);
+}
+
+void ComputeReprojectedUVs(Params p, out vec2 fReprojectedHrUv, out bool bIsExistingSample)
+{
+	fReprojectedHrUv = p.fHrUv + p.fMotionVector;
+	bIsExistingSample = IsUvInside(fReprojectedHrUv);
+}
+
+Params InitParams(ivec2 iPxHrPos)
+{
+	Params p;
+	p.iPxHrPos = iPxHrPos;
+	vec2 fHrUv = (vec2(iPxHrPos) + 0.5) / pc.displaySize;
+	p.fHrUv = fHrUv;
+
+	vec2 fLrUvJittered = fHrUv + pc.jitter / pc.renderSize;
+	p.fLrUvSampler = ClampUv(fLrUvJittered, ivec2(pc.renderSize), ivec2(pc.renderSize));
+
+	// Motion vectors are stored at render resolution (this project's low-res
+	// scene target); sample at the render-res grid this HR pixel maps back to.
+	ivec2 lrPos = clamp(ivec2(fHrUv * pc.renderSize), ivec2(0), ivec2(pc.renderSize) - 1);
+	p.fMotionVector = texelFetch(dilatedMotionVectorsHr, lrPos, 0).rg;
+	p.fHrVelocity = GetPxHrVelocity(p.fMotionVector);
+
+	ComputeReprojectedUVs(p, p.fReprojectedHrUv, p.bIsExistingSample);
+
+	p.fDepthClipFactor = clamp(textureLod(preparedInputColor, p.fLrUvSampler, 0.0).a, 0.0, 1.0);
+
+	vec2 dilatedMasks = textureLod(dilatedReactiveMasks, p.fLrUvSampler, 0.0).rg;
+	p.fDilatedReactiveFactor = dilatedMasks.x;
+	p.fAccumulationMask = dilatedMasks.y;
+
+	p.bIsResetFrame = (pc.frameIndex == 0);
+	p.bIsNewSample = (!p.bIsExistingSample) || p.bIsResetFrame;
+
+	return p;
+}
+
+void ReprojectHistoryColor(Params p, out vec3 fHistoryColor, out float fTemporalReactiveFactor, out bool bInMotionLastFrame)
+{
+	vec4 fHistory = HistorySample(p.fReprojectedHrUv, ivec2(pc.displaySize));
+	fHistoryColor = PrepareRgb(fHistory.rgb, pc.exposure, pc.previousFramePreExposure);
+	fHistoryColor = RGBToYCoCg(fHistoryColor);
+	fTemporalReactiveFactor = clamp(abs(fHistory.w), 0.0, 1.0);
+	bInMotionLastFrame = (fHistory.w < 0.0);
+}
+
+struct LockState {
+	bool newLock;
+	bool wasLockedPrevFrame;
+};
+
+LockState ReprojectHistoryLockStatus(Params p, out vec2 fReprojectedLockStatus)
+{
+	LockState state;
+	state.newLock = false;
+	state.wasLockedPrevFrame = false;
+
+	float fNewLockIntensity = texelFetch(newLocks, p.iPxHrPos, 0).r;
+	state.newLock = fNewLockIntensity > (127.0 / 255.0);
+
+	fReprojectedLockStatus = textureLod(lockStatusIn, ClampUv(p.fReprojectedHrUv, ivec2(pc.displaySize), ivec2(pc.displaySize)), 0.0).rg;
+
+	if (fReprojectedLockStatus.x != 0.0) {
+		state.wasLockedPrevFrame = true;
+	}
+
+	return state;
+}
+
+// ---- lock status update (see ffx_fsr2_postprocess_lock_status.h) ----------
+// Simplified per this file's header comment: reads lockInputLuma directly
+// instead of a smoothed SPD mip level.
+
+float GetShadingChangeLuma(ivec2 iPxLrPos)
+{
+	float luma = pc.exposure * exp(texelFetch(lockInputLuma, clamp(iPxLrPos, ivec2(0), ivec2(pc.renderSize) - 1), 0).r);
+	return pow(max(luma, 0.0), 1.0 / 6.0);
+}
+
+void UpdateLockStatus(Params p, inout float fReactiveFactor, LockState state, inout vec2 fLockStatus, out float fLockContributionThisFrame, out float fLuminanceDiff)
+{
+	ivec2 lrPos = clamp(ivec2(p.fHrUv * pc.renderSize), ivec2(0), ivec2(pc.renderSize) - 1);
+	float fShadingChangeLuma = GetShadingChangeLuma(lrPos);
+
+	fLockStatus.y = (fLockStatus.y == 0.0) ? fShadingChangeLuma : fLockStatus.y;
+	float fPreviousShadingChangeLuma = fLockStatus.y;
+
+	fLuminanceDiff = 1.0 - MinDividedByMax(fPreviousShadingChangeLuma, fShadingChangeLuma);
+
+	if (state.newLock) {
+		fLockStatus.y = fShadingChangeLuma;
+		fLockStatus.x = (fLockStatus.x != 0.0) ? 2.0 : 1.0;
+	} else if (fLockStatus.x <= 1.0) {
+		fLockStatus.y = mix(fLockStatus.y, fShadingChangeLuma, 0.5);
+	} else {
+		if (fLuminanceDiff > 0.1) {
+			fLockStatus.x = 0.0;
+		}
+	}
+
+	fReactiveFactor = max(fReactiveFactor, clamp((fLuminanceDiff - 0.1) * 10.0, 0.0, 1.0));
+	fLockStatus.x *= (1.0 - fReactiveFactor);
+	fLockStatus.x *= clamp(1.0 - p.fAccumulationMask, 0.0, 1.0);
+	fLockStatus.x *= float(p.fDepthClipFactor < 0.1);
+
+	float fLifetimeContribution = clamp(fLockStatus.x - 1.0, 0.0, 1.0);
+	float fShadingChangeContribution = clamp(MinDividedByMax(fLockStatus.y, fShadingChangeLuma), 0.0, 1.0);
+
+	fLockContributionThisFrame = clamp(clamp(fLifetimeContribution * 4.0, 0.0, 1.0) * fShadingChangeContribution, 0.0, 1.0);
+}
+
+// ---- upsample (see ffx_fsr2_upsample.h) ------------------------------------
+
+float ComputeMaxKernelWeight()
+{
+	const float kernelSizeBias = 1.0;
+	float kernelWeight = 1.0 + ((1.0 / pc.downscaleFactor.x) - 1.0) * kernelSizeBias;
+	return min(1.99, kernelWeight);
+}
+
+vec4 ComputeUpsampledColorAndWeight(Params p, inout RectificationBox clippingBox, float fReactiveFactor)
+{
+	vec2 fDstOutputPos = vec2(p.iPxHrPos) + 0.5;
+	vec2 fSrcOutputPos = fDstOutputPos * pc.downscaleFactor;
+	ivec2 iSrcInputPos = ivec2(floor(fSrcOutputPos));
+
+	vec2 fSrcUnjitteredPos = (vec2(iSrcInputPos) + 0.5) - pc.jitter;
+
+	ivec2 offsetTL;
+	offsetTL.x = (fSrcUnjitteredPos.x > fSrcOutputPos.x) ? -2 : -1;
+	offsetTL.y = (fSrcUnjitteredPos.y > fSrcOutputPos.y) ? -2 : -1;
+
+	vec3 samples[9];
+	ivec2 renderSizeI = ivec2(pc.renderSize);
+	for (int row = 0; row < 3; ++row) {
+		for (int col = 0; col < 3; ++col) {
+			int sampleIndex = col + row * 3;
+			ivec2 srcPos = iSrcInputPos + offsetTL + ivec2(col, row);
+			ivec2 clamped = clamp(srcPos, ivec2(0), renderSizeI - 1);
+			samples[sampleIndex] = textureLod(preparedInputColor, (vec2(clamped) + 0.5) / pc.renderSize, 0.0).rgb;
+		}
+	}
+
+	vec4 fColorAndWeight = vec4(0.0);
+	vec2 fBaseSampleOffset = fSrcUnjitteredPos - fSrcOutputPos;
+
+	float fKernelReactiveFactor = max(fReactiveFactor, float(p.bIsNewSample));
+	float fKernelBiasMax = ComputeMaxKernelWeight() * (1.0 - fKernelReactiveFactor);
+	float fKernelBiasMin = max(1.0, (1.0 + fKernelBiasMax) * 0.3);
+	float fKernelBiasFactor = max(0.0, max(0.25 * p.fDepthClipFactor, fKernelReactiveFactor));
+	float fKernelBias = mix(fKernelBiasMax, fKernelBiasMin, fKernelBiasFactor);
+
+	float fRectificationCurveBias = mix(-2.0, -3.0, clamp(p.fHrVelocity / 50.0, 0.0, 1.0));
+
+	for (int row = 0; row < 3; ++row) {
+		for (int col = 0; col < 3; ++col) {
+			int sampleIndex = col + row * 3;
+			vec2 fOffset = vec2(offsetTL) + vec2(col, row);
+			vec2 fSrcSampleOffset = fBaseSampleOffset + fOffset;
+			ivec2 iSrcSamplePos = iSrcInputPos + offsetTL + ivec2(col, row);
+
+			float fOnScreenFactor = float(all(greaterThanEqual(iSrcSamplePos, ivec2(0))) && all(lessThan(iSrcSamplePos, renderSizeI)));
+			float fSampleWeight = fOnScreenFactor * GetUpsampleLanczosWeight(fSrcSampleOffset, fKernelBias);
+
+			fColorAndWeight += vec4(samples[sampleIndex] * fSampleWeight, fSampleWeight);
+
+			float fSrcSampleOffsetSq = dot(fSrcSampleOffset, fSrcSampleOffset);
+			float fBoxSampleWeight = exp(fRectificationCurveBias * fSrcSampleOffsetSq);
+			bool bInitial = (row == 0) && (col == 0);
+			RectificationBoxAddSample(bInitial, clippingBox, samples[sampleIndex], fBoxSampleWeight);
+		}
+	}
+
+	RectificationBoxComputeVarianceBoxData(clippingBox);
+
+	const float fUpsampleLanczosWeightScale = 1.0 / 12.0;
+	fColorAndWeight.w *= float(fColorAndWeight.w > FSR2_EPSILON);
+	if (fColorAndWeight.w > FSR2_EPSILON) {
+		fColorAndWeight.xyz /= fColorAndWeight.w;
+		fColorAndWeight.w *= fUpsampleLanczosWeightScale;
+		fColorAndWeight.xyz = clamp(fColorAndWeight.xyz, clippingBox.aabbMin, clippingBox.aabbMax);
+	}
+
+	return fColorAndWeight;
+}
+
+// ---- accumulate (see ffx_fsr2_accumulate.h) --------------------------------
+
+void RectifyHistory(Params p, RectificationBox clippingBox, inout vec3 fHistoryColor, inout vec3 fAccumulation, float fLockContributionThisFrame, float fTemporalReactiveFactor, float fLumaInstabilityFactor)
+{
+	float fScaleFactorInfluence = min(20.0, pow(1.0 / max(pc.downscaleFactor.x * pc.downscaleFactor.y, 1e-6), 3.0));
+	float fVelocityFactor = clamp(p.fHrVelocity / 20.0, 0.0, 1.0);
+	float fBoxScaleT = max(p.fDepthClipFactor, max(p.fAccumulationMask, fVelocityFactor));
+	float fBoxScale = mix(fScaleFactorInfluence, 1.0, fBoxScaleT);
+
+	vec3 fScaledBoxVec = clippingBox.boxVec * fBoxScale;
+	vec3 boxMin = clippingBox.boxCenter - fScaledBoxVec;
+	vec3 boxMax = clippingBox.boxCenter + fScaledBoxVec;
+
+	boxMin = max(clippingBox.aabbMin, boxMin);
+	boxMax = min(clippingBox.aabbMax, boxMax);
+
+	if (any(greaterThan(boxMin, fHistoryColor)) || any(greaterThan(fHistoryColor, boxMax))) {
+		vec3 fClampedHistoryColor = clamp(fHistoryColor, boxMin, boxMax);
+
+		vec3 fHistoryContribution = vec3(max(fLumaInstabilityFactor, fLockContributionThisFrame));
+
+		float fReactiveContribution = 1.0 - pow(p.fDilatedReactiveFactor, 1.0 / 2.0);
+		fHistoryContribution *= fReactiveContribution;
+
+		fHistoryColor = mix(fClampedHistoryColor, fHistoryColor, clamp(fHistoryContribution, 0.0, 1.0));
+
+		vec3 fAccumulationMin = min(fAccumulation, vec3(0.1));
+		fAccumulation = mix(fAccumulationMin, fAccumulation, clamp(fHistoryContribution, 0.0, 1.0));
+	}
+}
+
+vec3 AccumulateColor(vec3 fHistoryColor, inout vec3 fAccumulation, vec4 fUpsampledColorAndWeight)
+{
+	fAccumulation = max(vec3(FSR2_EPSILON), fAccumulation + fUpsampledColorAndWeight.www);
+	vec3 fAlpha = fUpsampledColorAndWeight.www / fAccumulation;
+	fHistoryColor = mix(fHistoryColor, fUpsampledColorAndWeight.xyz, fAlpha);
+	return YCoCgToRGB(fHistoryColor);
+}
+
+vec3 ComputeBaseAccumulationWeight(Params p, float fThisFrameReactiveFactor, bool bInMotionLastFrame, float fUpsampledWeight)
+{
+	const float fMaxAccumulationLanczosWeight = 1.0;
+	float fBaseAccumulation = fMaxAccumulationLanczosWeight * float(p.bIsExistingSample) * (1.0 - fThisFrameReactiveFactor) * (1.0 - p.fDepthClipFactor);
+
+	fBaseAccumulation = min(fBaseAccumulation, mix(fBaseAccumulation, fUpsampledWeight * 10.0, max(float(bInMotionLastFrame), clamp(p.fHrVelocity * 10.0, 0.0, 1.0))));
+	fBaseAccumulation = min(fBaseAccumulation, mix(fBaseAccumulation, fUpsampledWeight, clamp(p.fHrVelocity / 20.0, 0.0, 1.0)));
+
+	return vec3(fBaseAccumulation);
+}
+
+float ComputeTemporalReactiveFactor(Params p, float fTemporalReactiveFactor)
+{
+	float fNewFactor = min(0.99, fTemporalReactiveFactor);
+	fNewFactor = max(fNewFactor, mix(fNewFactor, 0.4, clamp(p.fHrVelocity, 0.0, 1.0)));
+	fNewFactor = max(fNewFactor * fNewFactor, max(p.fDepthClipFactor * 0.1, p.fDilatedReactiveFactor));
+	fNewFactor = p.bIsNewSample ? 1.0 : fNewFactor;
+
+	if (clamp(p.fHrVelocity * 10.0, 0.0, 1.0) >= 1.0) {
+		fNewFactor = max(FSR2_EPSILON, fNewFactor) * -1.0;
+	}
+	return fNewFactor;
+}
+
+// Simplified per this file's header comment (no smoothed luma-history ring
+// buffer -- would need an extra display-res RGBA16F resource this port
+// doesn't allocate). Real FSR2 tracks 4 frames of quantized luma at each
+// pixel to detect flicker/instability independent of the lock system; here
+// the lock/reactive-factor path (unaffected by this simplification) already
+// handles the dominant real-world case (moving/reactive content), so this
+// is a smaller, secondary refinement being traded for scope.
+float ComputeLumaInstabilityFactorSimplified()
+{
+	return 0.0;
+}
+
+void FinalizeLockStatus(Params p, inout vec2 fLockStatus, float fUpsampledWeight)
+{
+	vec2 fEstimatedUvNextFrame = p.fHrUv - p.fMotionVector;
+	if (!IsUvInside(fEstimatedUvNextFrame)) {
+		fLockStatus.x = 0.0;
+	} else {
+		const float fAverageLanczosWeightPerFrame = 0.74 * (1.0 / 12.0);
+		float fLifetimeDecreaseLanczosMax = pc.jitterPhaseCount * fAverageLanczosWeightPerFrame;
+		float fLifetimeDecrease = fUpsampledWeight / max(fLifetimeDecreaseLanczosMax, 1e-6);
+		fLockStatus.x = max(0.0, fLockStatus.x - fLifetimeDecrease);
+	}
+}
+
+void main()
+{
+	ivec2 iPxHrPos = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(iPxHrPos, ivec2(pc.displaySize)))) {
+		return;
+	}
+
+	Params p = InitParams(iPxHrPos);
+
+	vec3 fHistoryColor = vec3(0.0);
+	vec2 fLockStatus = vec2(0.0);
+
+	float fTemporalReactiveFactor = 0.0;
+	bool bInMotionLastFrame = false;
+	LockState lockState;
+	lockState.newLock = false;
+	lockState.wasLockedPrevFrame = false;
+
+	if (p.bIsExistingSample && !p.bIsResetFrame) {
+		ReprojectHistoryColor(p, fHistoryColor, fTemporalReactiveFactor, bInMotionLastFrame);
+		vec2 reprojLockStatus;
+		lockState = ReprojectHistoryLockStatus(p, reprojLockStatus);
+		fLockStatus = reprojLockStatus;
+	}
+
+	float fThisFrameReactiveFactor = max(p.fDilatedReactiveFactor, fTemporalReactiveFactor);
+
+	float fLuminanceDiff = 0.0;
+	float fLockContributionThisFrame = 0.0;
+	UpdateLockStatus(p, fThisFrameReactiveFactor, lockState, fLockStatus, fLockContributionThisFrame, fLuminanceDiff);
+
+	RectificationBox clippingBox;
+	vec4 fUpsampledColorAndWeight = ComputeUpsampledColorAndWeight(p, clippingBox, fThisFrameReactiveFactor);
+
+	float fLumaInstabilityFactor = ComputeLumaInstabilityFactorSimplified();
+
+	vec3 fAccumulation = ComputeBaseAccumulationWeight(p, fThisFrameReactiveFactor, bInMotionLastFrame, fUpsampledColorAndWeight.w);
+
+	if (p.bIsNewSample) {
+		fHistoryColor = YCoCgToRGB(fUpsampledColorAndWeight.xyz);
+	} else {
+		RectifyHistory(p, clippingBox, fHistoryColor, fAccumulation, fLockContributionThisFrame, fThisFrameReactiveFactor, fLumaInstabilityFactor);
+		fHistoryColor = AccumulateColor(fHistoryColor, fAccumulation, fUpsampledColorAndWeight);
+	}
+
+	fHistoryColor = UnprepareRgb(fHistoryColor, pc.exposure);
+
+	FinalizeLockStatus(p, fLockStatus, fUpsampledColorAndWeight.w);
+
+	fTemporalReactiveFactor = ComputeTemporalReactiveFactor(p, fThisFrameReactiveFactor);
+
+	imageStore(upscaledOutputOut, iPxHrPos, vec4(fHistoryColor, fTemporalReactiveFactor));
+	imageStore(lockStatusOut, iPxHrPos, vec4(fLockStatus, 0, 0));
+}

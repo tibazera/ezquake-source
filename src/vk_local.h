@@ -70,6 +70,7 @@ void VK_RequestSurfaceRecreate(void);
 // build). VK_PrevViewProjMatrix is the paired previous-frame matrix the
 // motion-vector pass reprojects against.
 void VK_JitteredProjectionMatrix(float* out);
+void VK_JitterPixelOffset(float* outX, float* outY);
 const float* VK_PrevViewProjMatrix(void);
 void VK_AdvanceJitter(void);
 qbool VK_CurrentInvViewProjMatrix(float* out);
@@ -211,6 +212,22 @@ qbool VK_DLSS_CopyOutputTo(VkCommandBuffer commandBuffer, VkImage dstImage, VkIm
 // DLSS's next real run doesn't reproject against a frame it never wrote.
 void VK_DLSS_InvalidateHistory(void);
 void VK_DLSS_Shutdown(void);
+
+// vk_fsr2.c -- real FidelityFX Super Resolution 2 (ported from
+// github.com/GPUOpen-Effects/FidelityFX-FSR2), replacing the earlier
+// EASU+RCAS+simple-TAA approximation. See vk_fsr2.c's own header comment
+// for the full pass list and what's scoped out (SPD auto-exposure).
+qbool VK_Fsr2Active(void);
+qbool VK_Fsr2CreateResources(void);
+void VK_Fsr2DestroyResources(void);
+void VK_Fsr2InvalidateHistory(void);
+// Runs all 5 FSR2 compute passes and copies the result into dstImage (the
+// swapchain image) -- same calling convention as VK_DLSS_CopyOutputTo,
+// called instead of it when vid_vulkan_upscaler==1. frameSlot must be
+// vk_options.frame.currentFrame (indexes this call's own per-frame-in-flight
+// descriptor sets, distinct from vk_options.frame.imageIndex).
+qbool VK_Fsr2Composite(VkCommandBuffer commandBuffer, uint32_t frameSlot, VkImageView sceneColorView, VkImageView sceneDepthView, VkImageView motionVectorsView,
+	VkImage dstImage, VkImageLayout dstImageLayoutBeforeCopy, VkImageLayout dstImageLayoutAfterCopy);
 
 // vk_blending.c
 void VK_BlendingConfigure(VkPipelineColorBlendStateCreateInfo* info, VkPipelineColorBlendAttachmentState* blending, r_blendfunc_t func);

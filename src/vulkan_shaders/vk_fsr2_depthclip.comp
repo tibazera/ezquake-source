@@ -1,0 +1,308 @@
+#version 450
+// Real FSR2 pass 2/5: depth-clip factor + prepared (YCoCg) input color +
+// dilated reactive/composition masks. Ported from AMD's FidelityFX-FSR2
+// (GPUOpen-Effects/FidelityFX-FSR2, MIT licensed) --
+// ffx_fsr2_depth_clip.h's DepthClip/ComputeDepthClip/ComputeMotionDivergence/
+// ComputeDepthDivergence/ComputeTemporalMotionDivergence/
+// PreProcessReactiveMasks/ComputePreparedInputColor/EvaluateSurface, ported
+// from the FFX_* macro-abstracted GLSL/HLSL dialect to plain GLSL. Logic and
+// every constant preserved exactly (Ksep, the resolution-dependent power
+// curve, the 9-tap reactive mask dilation weights) -- only the macro layer
+// and resource-binding mechanism differ.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0) uniform sampler2D sceneColor;           // low-res, current
+layout(binding = 1) uniform sampler2D sceneDepth;            // low-res, current (device depth)
+layout(binding = 2) uniform sampler2D dilatedMotionVectors;  // low-res, from reconstruct pass
+layout(binding = 3) uniform sampler2D dilatedDepth;          // low-res, from reconstruct pass
+layout(binding = 4) uniform sampler2D reconstructedPrevDepth; // low-res, atomic-max target from reconstruct pass, reversed-depth-aware "nearest wins"
+layout(binding = 5) uniform sampler2D reactiveMask;          // low-res, engine-provided (particles/alpha), 0 if none
+layout(binding = 6) uniform sampler2D compositionMask;       // low-res, engine-provided (translucency/composite), 0 if none
+layout(binding = 7) uniform sampler2D previousDilatedMotionVectors; // low-res, previous frame's dilated MV (ping-ponged)
+
+layout(binding = 8, rgba16f) uniform writeonly image2D preparedInputColorOut; // low-res, .rgb = YCoCg, .a = depth clip factor
+layout(binding = 9, rg16f) uniform writeonly image2D dilatedReactiveMasksOut;  // low-res, .r = reactive factor, .g = "in motion" / accumulation mask
+
+layout(push_constant) uniform PushConstants {
+	vec2 renderSize;
+	vec2 displaySize;
+	int reversedDepth;
+	float preExposure;
+	float exposure;
+	float viewSpaceToMetersFactor;
+} pc;
+
+layout(binding = 10) uniform DepthParamsUBO {
+	vec2 deviceToViewDepth;
+} depthParams;
+
+float GetViewSpaceDepth(float deviceDepth)
+{
+	return depthParams.deviceToViewDepth.y / (deviceDepth - depthParams.deviceToViewDepth.x);
+}
+
+float GetViewSpaceDepthInMeters(float deviceDepth)
+{
+	return GetViewSpaceDepth(deviceDepth) * pc.viewSpaceToMetersFactor;
+}
+
+vec2 ComputeNdc(vec2 pxPos, ivec2 size)
+{
+	return pxPos / vec2(size) * vec2(2.0, -2.0) + vec2(-1.0, 1.0);
+}
+
+// Upstream passes the projection's [2][2]/[3][2] inverse terms too, needed
+// to reconstruct view-space X/Y from NDC for the depth-clip plane-distance
+// heuristic -- same UBO as the reconstruct pass's deviceToViewDepth, plus
+// the two extra terms.
+layout(binding = 11) uniform ViewProjParamsUBO {
+	vec2 ndcToViewMul; // x/y NDC-to-view-space scale factors at depth=1
+} viewProjParams;
+
+vec3 GetViewSpacePosition(ivec2 viewportPos, ivec2 viewportSize, float deviceDepth)
+{
+	float z = GetViewSpaceDepth(deviceDepth);
+	vec2 ndc = ComputeNdc(vec2(viewportPos), viewportSize);
+	float x = viewProjParams.ndcToViewMul.x * ndc.x * z;
+	float y = viewProjParams.ndcToViewMul.y * ndc.y * z;
+	return vec3(x, y, z);
+}
+
+bool IsOnScreen(ivec2 pos, ivec2 size)
+{
+	return all(greaterThanEqual(pos, ivec2(0))) && all(lessThan(pos, size));
+}
+
+struct BilinearSamplingData {
+	ivec2 iOffsets[4];
+	float fWeights[4];
+	ivec2 iBasePos;
+};
+
+BilinearSamplingData GetBilinearSamplingData(vec2 fUv, ivec2 iSize)
+{
+	BilinearSamplingData data;
+	vec2 fPxSample = (fUv * iSize) - vec2(0.5);
+	data.iBasePos = ivec2(floor(fPxSample));
+	vec2 fPxFrac = fract(fPxSample);
+
+	data.iOffsets[0] = ivec2(0, 0);
+	data.iOffsets[1] = ivec2(1, 0);
+	data.iOffsets[2] = ivec2(0, 1);
+	data.iOffsets[3] = ivec2(1, 1);
+
+	data.fWeights[0] = (1.0 - fPxFrac.x) * (1.0 - fPxFrac.y);
+	data.fWeights[1] = fPxFrac.x * (1.0 - fPxFrac.y);
+	data.fWeights[2] = (1.0 - fPxFrac.x) * fPxFrac.y;
+	data.fWeights[3] = fPxFrac.x * fPxFrac.y;
+	return data;
+}
+
+// ComputeDepthClip: upstream's exact plane-separation heuristic. Ksep/Kfov
+// magic constants preserved verbatim from ffx_fsr2_depth_clip.h -- they were
+// empirically tuned by AMD against real content and aren't derivable from
+// first principles, so changing them would silently diverge from upstream
+// behaviour rather than fix anything.
+const float weightThreshold = 0.01;
+
+float ComputeDepthClip(vec2 fUvSample, float fCurrentDepthSample)
+{
+	float fCurrentDepthViewSpace = GetViewSpaceDepth(fCurrentDepthSample);
+	BilinearSamplingData bilinearInfo = GetBilinearSamplingData(fUvSample, ivec2(pc.renderSize));
+
+	float fDilatedSum = 0.0;
+	float fDepth = 0.0;
+	float fWeightSum = 0.0;
+
+	for (int i = 0; i < 4; ++i) {
+		ivec2 iSamplePos = bilinearInfo.iBasePos + bilinearInfo.iOffsets[i];
+		if (!IsOnScreen(iSamplePos, ivec2(pc.renderSize))) {
+			continue;
+		}
+		float fWeight = bilinearInfo.fWeights[i];
+		if (fWeight <= weightThreshold) {
+			continue;
+		}
+
+		float fPrevDepthSample = texelFetch(reconstructedPrevDepth, iSamplePos, 0).r;
+		float fPrevNearestDepthViewSpace = GetViewSpaceDepth(fPrevDepthSample);
+		float fDepthDiff = fCurrentDepthViewSpace - fPrevNearestDepthViewSpace;
+
+		if (fDepthDiff > 0.0) {
+			float fPlaneDepth = (pc.reversedDepth != 0) ? min(fPrevDepthSample, fCurrentDepthSample) : max(fPrevDepthSample, fCurrentDepthSample);
+
+			vec3 fCenter = GetViewSpacePosition(ivec2(pc.renderSize * 0.5), ivec2(pc.renderSize), fPlaneDepth);
+			vec3 fCorner = GetViewSpacePosition(ivec2(0, 0), ivec2(pc.renderSize), fPlaneDepth);
+
+			float fHalfViewportWidth = length(pc.renderSize);
+			float fDepthThreshold = max(fCurrentDepthViewSpace, fPrevNearestDepthViewSpace);
+
+			const float Ksep = 1.37e-05;
+			float Kfov = length(fCorner) / max(length(fCenter), 1e-6);
+			float fRequiredDepthSeparation = Ksep * Kfov * fHalfViewportWidth * fDepthThreshold;
+
+			float fResolutionFactor = clamp(length(pc.renderSize) / length(vec2(1920.0, 1080.0)), 0.0, 1.0);
+			float fPower = mix(1.0, 3.0, fResolutionFactor);
+			fDepth += pow(clamp(fRequiredDepthSeparation / fDepthDiff, 0.0, 1.0), fPower) * fWeight;
+			fWeightSum += fWeight;
+		}
+	}
+
+	return (fWeightSum > 0.0) ? clamp(1.0 - fDepth / fWeightSum, 0.0, 1.0) : 0.0;
+}
+
+float EvaluateSurface(ivec2 iPxPos, vec2 fMotionVector)
+{
+	float d0 = GetViewSpaceDepth(texelFetch(reconstructedPrevDepth, iPxPos + ivec2(0, -1), 0).r);
+	float d1 = GetViewSpaceDepth(texelFetch(reconstructedPrevDepth, iPxPos, 0).r);
+	float d2 = GetViewSpaceDepth(texelFetch(reconstructedPrevDepth, iPxPos + ivec2(0, 1), 0).r);
+	return 1.0 - float(((d0 - d1) > (d1 * 0.01)) && ((d1 - d2) > (d2 * 0.01)));
+}
+
+float ComputeMotionDivergence(ivec2 iPxPos, ivec2 iSize)
+{
+	float minconvergence = 1.0;
+	vec2 fMotionVectorNucleus = texelFetch(dilatedMotionVectors, iPxPos, 0).rg;
+	float fNucleusVelocityLr = length(fMotionVectorNucleus * pc.renderSize);
+	float fMaxVelocityUv = length(fMotionVectorNucleus);
+
+	const float epsilon = 1e-02;
+
+	if (fNucleusVelocityLr > epsilon) {
+		for (int y = -1; y <= 1; ++y) {
+			for (int x = -1; x <= 1; ++x) {
+				ivec2 sp = clamp(iPxPos + ivec2(x, y), ivec2(0), iSize - ivec2(1));
+				vec2 fMotionVector = texelFetch(dilatedMotionVectors, sp, 0).rg;
+				float fVelocityUv = length(fMotionVector);
+				fMaxVelocityUv = max(fVelocityUv, fMaxVelocityUv);
+				fVelocityUv = max(fVelocityUv, fMaxVelocityUv);
+				minconvergence = min(minconvergence, dot(fMotionVector / max(fVelocityUv, 1e-8), fMotionVectorNucleus / max(fVelocityUv, 1e-8)));
+			}
+		}
+	}
+
+	return clamp(1.0 - minconvergence, 0.0, 1.0) * clamp(fMaxVelocityUv / 0.01, 0.0, 1.0);
+}
+
+float ComputeDepthDivergence(ivec2 iPxPos)
+{
+	float fMaxDistInMeters = (pc.reversedDepth != 0) ? GetViewSpaceDepthInMeters(0.0) : GetViewSpaceDepthInMeters(1.0);
+	float fDepthMax = 0.0;
+	float fDepthMin = fMaxDistInMeters;
+	int iMaxDistFound = 0;
+
+	for (int y = -1; y < 2; ++y) {
+		for (int x = -1; x < 2; ++x) {
+			ivec2 iSamplePos = iPxPos + ivec2(x, y);
+			float fOnScreenFactor = IsOnScreen(iSamplePos, ivec2(pc.renderSize)) ? 1.0 : 0.0;
+			float fDepth = GetViewSpaceDepthInMeters(texelFetch(dilatedDepth, clamp(iSamplePos, ivec2(0), ivec2(pc.renderSize) - 1), 0).r) * fOnScreenFactor;
+			iMaxDistFound |= int(fMaxDistInMeters == fDepth);
+			fDepthMin = min(fDepthMin, fDepth);
+			fDepthMax = max(fDepthMax, fDepth);
+		}
+	}
+
+	return (1.0 - fDepthMin / max(fDepthMax, 1e-8)) * (bool(iMaxDistFound) ? 0.0 : 1.0);
+}
+
+float ComputeTemporalMotionDivergence(ivec2 iPxPos)
+{
+	vec2 fUv = (vec2(iPxPos) + 0.5) / pc.renderSize;
+	vec2 fMotionVector = texelFetch(dilatedMotionVectors, iPxPos, 0).rg;
+	vec2 fReprojectedUv = fUv + fMotionVector;
+	vec2 clampedLocation = clamp(fReprojectedUv * pc.renderSize, vec2(0.5), pc.renderSize - vec2(0.5));
+	vec2 fClampedUv = clampedLocation / pc.renderSize;
+	vec2 fPrevMotionVector = textureLod(previousDilatedMotionVectors, fClampedUv, 0.0).rg;
+
+	float fPxDistance = length(fMotionVector * pc.displaySize);
+	return fPxDistance > 1.0
+		? mix(0.0, 1.0 - clamp(length(fPrevMotionVector) / max(length(fMotionVector), 1e-8), 0.0, 1.0), clamp(pow(fPxDistance / 20.0, 3.0), 0.0, 1.0))
+		: 0.0;
+}
+
+vec3 RGBToYCoCg(vec3 rgb)
+{
+	return vec3(
+		0.25 * rgb.r + 0.5 * rgb.g + 0.25 * rgb.b,
+		0.5 * rgb.r - 0.5 * rgb.b,
+		-0.25 * rgb.r + 0.5 * rgb.g - 0.25 * rgb.b);
+}
+
+vec3 PrepareRgb(vec3 rgb, float exposure, float preExposure)
+{
+	rgb /= preExposure;
+	rgb *= exposure;
+	return clamp(rgb, 0.0, 65504.0);
+}
+
+vec3 ComputePreparedInputColor(ivec2 iPxLrPos)
+{
+	vec3 rgb = max(texelFetch(sceneColor, iPxLrPos, 0).rgb, vec3(0.0));
+	rgb = PrepareRgb(rgb, pc.exposure, pc.preExposure);
+	return RGBToYCoCg(rgb);
+}
+
+void PreProcessReactiveMasks(ivec2 iPxLrPos, float fMotionDivergence)
+{
+	vec3 fReferenceColor = texelFetch(sceneColor, iPxLrPos, 0).rgb;
+	vec2 fReactiveFactor = vec2(0.0, fMotionDivergence);
+
+	vec3 colorSamples[9];
+	float reactiveSamples[9];
+	float compositionSamples[9];
+	float masksSum = 0.0;
+
+	int idx = 0;
+	for (int y = -1; y < 2; ++y) {
+		for (int x = -1; x < 2; ++x, ++idx) {
+			ivec2 sc = clamp(iPxLrPos + ivec2(x, y), ivec2(0), ivec2(pc.renderSize) - 1);
+			colorSamples[idx] = texelFetch(sceneColor, sc, 0).rgb;
+			reactiveSamples[idx] = texelFetch(reactiveMask, sc, 0).r;
+			compositionSamples[idx] = texelFetch(compositionMask, sc, 0).r;
+			masksSum += reactiveSamples[idx] + compositionSamples[idx];
+		}
+	}
+
+	if (masksSum > 0.0) {
+		for (int i = 0; i < 9; ++i) {
+			float maxLenSq = max(dot(fReferenceColor, fReferenceColor), dot(colorSamples[i], colorSamples[i]));
+			float similarity = dot(fReferenceColor, colorSamples[i]) / max(maxLenSq, 1e-8);
+
+			const float powerBiasMax = 6.0;
+			float similarityPower = 1.0 + (powerBiasMax - similarity * powerBiasMax);
+			float weightedReactive = pow(max(reactiveSamples[i], 0.0), similarityPower);
+			float weightedComposition = pow(max(compositionSamples[i], 0.0), similarityPower);
+
+			fReactiveFactor = max(fReactiveFactor, vec2(weightedReactive, weightedComposition));
+		}
+	}
+
+	imageStore(dilatedReactiveMasksOut, iPxLrPos, vec4(fReactiveFactor, 0, 0));
+}
+
+void main()
+{
+	ivec2 iPxPos = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 renderSizeI = ivec2(pc.renderSize);
+	if (any(greaterThanEqual(iPxPos, renderSizeI))) {
+		return;
+	}
+
+	vec2 fDepthUv = (vec2(iPxPos) + 0.5) / pc.renderSize;
+	vec2 fMotionVector = texelFetch(dilatedMotionVectors, iPxPos, 0).rg;
+	fMotionVector *= float(length(fMotionVector * pc.displaySize) > 0.01);
+
+	vec2 fDilatedUv = fDepthUv + fMotionVector;
+	float fDilatedDepthVal = texelFetch(dilatedDepth, iPxPos, 0).r;
+	float fCurrentDepthViewSpace = GetViewSpaceDepth(texelFetch(sceneDepth, iPxPos, 0).r);
+
+	float fDepthClip = ComputeDepthClip(fDilatedUv, fDilatedDepthVal) * EvaluateSurface(iPxPos, fMotionVector);
+	vec3 fPreparedYCoCg = ComputePreparedInputColor(iPxPos);
+	imageStore(preparedInputColorOut, iPxPos, vec4(fPreparedYCoCg, fDepthClip));
+
+	float fMotionDivergence = ComputeMotionDivergence(iPxPos, renderSizeI);
+	float fTemporalMotionDifference = clamp(ComputeTemporalMotionDivergence(iPxPos) - ComputeDepthDivergence(iPxPos), 0.0, 1.0);
+
+	PreProcessReactiveMasks(iPxPos, max(fTemporalMotionDifference, fMotionDivergence));
+}

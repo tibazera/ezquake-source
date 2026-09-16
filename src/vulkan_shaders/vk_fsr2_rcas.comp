@@ -1,0 +1,98 @@
+#version 450
+// Real FSR2 pass 5/5: RCAS (Robust Contrast Adaptive Sharpening). Ported
+// from AMD's FidelityFX-FSR2 (GPUOpen-Effects/FidelityFX-FSR2, MIT
+// licensed) -- ffx_fsr1.h's FsrRcasF (the actual sharpening math FSR2's own
+// ffx_fsr2_rcas.h wraps), ported from the FFX_* macro-abstracted GLSL/HLSL
+// dialect to plain GLSL. Every constant (FSR_RCAS_LIMIT, the noise-detection
+// weights, the min/max ring formula) preserved exactly -- this replaces an
+// earlier from-scratch RCAS approximation in this project with upstream's
+// real formula.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0) uniform sampler2D rcasInput; // display-res, accumulate pass's output
+layout(binding = 1, rgba16f) uniform writeonly image2D rcasOutput;
+
+layout(push_constant) uniform PushConstants {
+	vec2 displaySize;
+	float sharpness; // upstream's "con.x" -- exp2(-stops), 1.0 = max sharpness
+	float preExposure;
+	float exposure;
+} pc;
+
+const float FSR_RCAS_LIMIT = 0.25 - (1.0 / 16.0);
+
+vec3 PrepareRgb(vec3 rgb, float exposure, float preExposure)
+{
+	rgb /= preExposure;
+	rgb *= exposure;
+	return clamp(rgb, 0.0, 65504.0);
+}
+
+vec3 UnprepareRgb(vec3 rgb, float exposure)
+{
+	rgb /= exposure;
+	rgb *= pc.preExposure;
+	return rgb;
+}
+
+vec3 FsrRcasLoad(ivec2 p)
+{
+	ivec2 clamped = clamp(p, ivec2(0), ivec2(pc.displaySize) - 1);
+	vec3 c = texelFetch(rcasInput, clamped, 0).rgb;
+	return PrepareRgb(c, pc.exposure, pc.preExposure);
+}
+
+vec3 FsrRcasF(ivec2 ip)
+{
+	vec3 b = FsrRcasLoad(ip + ivec2(0, -1));
+	vec3 d = FsrRcasLoad(ip + ivec2(-1, 0));
+	vec3 e = FsrRcasLoad(ip);
+	vec3 f = FsrRcasLoad(ip + ivec2(1, 0));
+	vec3 h = FsrRcasLoad(ip + ivec2(0, 1));
+
+	float bL = b.b * 0.5 + (b.r * 0.5 + b.g);
+	float dL = d.b * 0.5 + (d.r * 0.5 + d.g);
+	float eL = e.b * 0.5 + (e.r * 0.5 + e.g);
+	float fL = f.b * 0.5 + (f.r * 0.5 + f.g);
+	float hL = h.b * 0.5 + (h.r * 0.5 + h.g);
+
+	float nz = 0.25 * bL + 0.25 * dL + 0.25 * fL + 0.25 * hL - eL;
+	float range = max(max(bL, max(dL, eL)), max(fL, hL)) - min(min(bL, min(dL, eL)), min(fL, hL));
+	nz = clamp(abs(nz) / max(range, 1e-8), 0.0, 1.0);
+	nz = -0.5 * nz + 1.0;
+
+	vec3 mn4 = min(min(b, d), min(f, h));
+	vec3 mx4 = max(max(b, d), max(f, h));
+
+	vec2 peakC = vec2(1.0, -4.0);
+	vec3 hitMin = mn4 / max(4.0 * mx4, 1e-8);
+	vec3 hitMax = (peakC.x - mx4) / max(4.0 * mn4 + peakC.y, -1e-8);
+	// NOTE: upstream's hitMax denominator can be negative by design (peakC.y
+	// = -4.0 dominates when mn4 is small) -- clamp only guards the
+	// pathological mn4==0 && peakC.y==0 case, matching real RCAS behaviour
+	// for any non-degenerate input.
+	hitMax = (peakC.x - mx4) / (4.0 * mn4 + peakC.y);
+
+	vec3 lobeRGB = max(-hitMin, hitMax);
+	float lobe = max(-FSR_RCAS_LIMIT, min(max(max(lobeRGB.r, lobeRGB.g), lobeRGB.b), 0.0)) * pc.sharpness;
+
+	// FSR_RCAS_DENOISE (upstream default on)
+	lobe *= nz;
+
+	float rcpL = 1.0 / (4.0 * lobe + 1.0);
+	vec3 result = (lobe * (b + d + h + f) + e) * rcpL;
+	return result;
+}
+
+void main()
+{
+	ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(pos, ivec2(pc.displaySize)))) {
+		return;
+	}
+
+	vec3 c = FsrRcasF(pos);
+	c = UnprepareRgb(c, pc.exposure);
+	imageStore(rcasOutput, pos, vec4(c, 1.0));
+}

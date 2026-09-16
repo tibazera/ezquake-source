@@ -1,0 +1,118 @@
+#version 450
+// Real FSR2 pass 3/5: thin-feature lock detection. Ported from AMD's
+// FidelityFX-FSR2 (GPUOpen-Effects/FidelityFX-FSR2, MIT licensed) --
+// ffx_fsr2_lock.h's ComputeThinFeatureConfidence/ComputeLock, ported from
+// the FFX_* macro-abstracted GLSL/HLSL dialect to plain GLSL. The 3x3
+// rejection-mask logic (detects a locally-brightest-or-darkest "ridge",
+// i.e. a thin line/edge feature likely to be lost to blur without a lock)
+// is preserved exactly, including its 4 corner-quadrant rejection masks.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0) uniform sampler2D lockInputLuma; // low-res, from reconstruct pass
+
+layout(binding = 1, r8) uniform image2D newLocksOut; // high-res (display size) -- upstream writes into HR space via ComputeHrPosFromLrPos
+layout(binding = 2, r32ui) uniform writeonly uimage2D reconstructedPrevDepthOut; // low-res -- same atomic-max target the reconstruct pass writes; this resets it back to the far-plane sentinel so NEXT frame's reconstruct pass starts from a clean slate instead of the atomic max ratcheting up (never back down) across every frame since creation
+
+layout(push_constant) uniform PushConstants {
+	vec2 renderSize;
+	vec2 displaySize;
+	vec2 jitter;
+	int reversedDepth;
+} pc;
+
+// ClearResourcesForNextFrame (ffx_fsr2_lock.h): upstream calls this from
+// EVERY frame's lock pass, not just once at creation -- the atomic-max
+// target it resets is written every frame via imageAtomicMax (see the
+// reconstruct pass), which only ever increases, never decreases, within a
+// single accumulation window. Without this reset every frame, the buffer
+// would latch onto the highest depth value seen since the upscaler was
+// created and never update again, breaking depth-clip (disocclusion
+// detection) for every frame after the first.
+void ClearResourcesForNextFrame(ivec2 iPxHrPos)
+{
+	if (all(lessThan(iPxHrPos, ivec2(pc.renderSize)))) {
+		uint farZ = (pc.reversedDepth != 0) ? 0x0u : 0x3f800000u;
+		imageStore(reconstructedPrevDepthOut, iPxHrPos, uvec4(farZ, 0, 0, 0));
+	}
+}
+
+bool ComputeThinFeatureConfidence(ivec2 pos)
+{
+	const int RADIUS = 1;
+	float fNucleus = texelFetch(lockInputLuma, pos, 0).r;
+
+	const float similarThreshold = 1.05;
+	float dissimilarLumaMin = 3.402823466e+38;
+	float dissimilarLumaMax = 0.0;
+
+	uint mask = 1u << 4; // SETBIT(4): flag nucleus as similar to itself
+
+	const uint rejectionMasks[4] = uint[4](
+		(1u << 0) | (1u << 1) | (1u << 3) | (1u << 4), // upper-left
+		(1u << 1) | (1u << 2) | (1u << 4) | (1u << 5), // upper-right
+		(1u << 3) | (1u << 4) | (1u << 6) | (1u << 7), // lower-left
+		(1u << 4) | (1u << 5) | (1u << 7) | (1u << 8)  // lower-right
+	);
+
+	int idx = 0;
+	ivec2 renderSizeI = ivec2(pc.renderSize);
+	for (int y = -RADIUS; y <= RADIUS; ++y) {
+		for (int x = -RADIUS; x <= RADIUS; ++x, ++idx) {
+			if (x == 0 && y == 0) {
+				continue;
+			}
+			ivec2 samplePos = clamp(pos + ivec2(x, y), ivec2(0), renderSizeI - 1);
+			float sampleLuma = texelFetch(lockInputLuma, samplePos, 0).r;
+			float difference = max(sampleLuma, fNucleus) / max(min(sampleLuma, fNucleus), 1e-8);
+
+			if (difference > 0.0 && difference < similarThreshold) {
+				mask |= 1u << idx;
+			} else {
+				dissimilarLumaMin = min(dissimilarLumaMin, sampleLuma);
+				dissimilarLumaMax = max(dissimilarLumaMax, sampleLuma);
+			}
+		}
+	}
+
+	bool isRidge = fNucleus > dissimilarLumaMax || fNucleus < dissimilarLumaMin;
+	if (!isRidge) {
+		return false;
+	}
+
+	for (int i = 0; i < 4; ++i) {
+		if ((mask & rejectionMasks[i]) == rejectionMasks[i]) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+// ComputeHrPosFromLrPos: upstream maps a low-res texel to the high-res pixel
+// its (jittered) sample center lands closest to -- same formula as this
+// project's other FSR2 passes use for the same mapping (kept in sync
+// manually, no shared header across these GLSL entry points in this build).
+ivec2 ComputeHrPosFromLrPos(ivec2 iPxLrPos)
+{
+	vec2 fSrcJitteredPos = vec2(iPxLrPos) + 0.5 - pc.jitter;
+	vec2 fLrPosInHr = (fSrcJitteredPos / pc.renderSize) * pc.displaySize;
+	return ivec2(floor(fLrPosInHr));
+}
+
+void main()
+{
+	ivec2 iPxLrPos = ivec2(gl_GlobalInvocationID.xy);
+	if (any(greaterThanEqual(iPxLrPos, ivec2(pc.renderSize)))) {
+		return;
+	}
+
+	if (ComputeThinFeatureConfidence(iPxLrPos)) {
+		ivec2 hrPos = ComputeHrPosFromLrPos(iPxLrPos);
+		if (all(greaterThanEqual(hrPos, ivec2(0))) && all(lessThan(hrPos, ivec2(pc.displaySize)))) {
+			imageStore(newLocksOut, hrPos, vec4(1.0, 0, 0, 0));
+		}
+	}
+
+	ClearResourcesForNextFrame(iPxLrPos);
+}

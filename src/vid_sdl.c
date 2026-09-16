@@ -320,6 +320,12 @@ cvar_t vid_vulkan_renderscale       = {"vid_vulkan_renderscale",        "1",    
 // per-frame, but upscaleActive/sceneSize (whether there's actually anything
 // to upscale) are swapchain-recreate-time decisions.
 cvar_t vid_vulkan_upscaler          = {"vid_vulkan_upscaler",           "0",       CVAR_LATCH_GFX };
+// FSR2's RCAS sharpen amount, [0,1] where 0 disables the RCAS pass entirely
+// (see VK_Fsr2Composite in vk_fsr2.c) and 1 is maximum sharpness -- not
+// latched, read fresh every frame, matching real FSR2's own per-dispatch
+// `sharpness` parameter (no swapchain-recreate dependency, unlike renderscale/
+// upscaler above).
+cvar_t vid_vulkan_sharpness         = {"vid_vulkan_sharpness",          "0.5" };
 
 
 //
@@ -1153,6 +1159,7 @@ static void VID_RegisterLatchCvars(void)
 	// upscaleActive=0).
 	Cvar_Register(&vid_vulkan_renderscale);
 	Cvar_Register(&vid_vulkan_upscaler);
+	Cvar_Register(&vid_vulkan_sharpness);
 #endif
 
 	Cvar_ResetCurrentGroup();
