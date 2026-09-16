@@ -66,12 +66,19 @@ typedef uint32_t sl_buffer_type_t;
 // code, so the individual enum values aren't mirrored.
 #define SL_RESULT_OK 0
 
-// sl::Boolean (sl_consts.h)
-typedef enum sl_boolean_e {
-	SL_FALSE = 0,
-	SL_TRUE = 1,
-	SL_INVALID = 2,
-} sl_boolean_t;
+// sl::Boolean (sl_consts.h) -- `enum Boolean : char`, explicitly 1 byte in
+// C++. A C enum with the same value range has compiler-chosen underlying
+// type -- MSVC picks `int` (4 bytes) for a plain `enum`, not the 1 byte the
+// real struct needs -- so this MUST be a fixed-width typedef, not a C enum,
+// or every struct embedding it (sl::Constants has seven of these in a row,
+// sl::DLSSOptions has several more) silently mismatches the real layout:
+// every field after the first Boolean lands at the wrong offset, and
+// sizeof() itself comes out wrong, which the SDK may use internally to
+// validate/copy the struct. An earlier draft of this file got this wrong.
+typedef uint8_t sl_boolean_t;
+#define SL_FALSE ((sl_boolean_t)0)
+#define SL_TRUE ((sl_boolean_t)1)
+#define SL_INVALID ((sl_boolean_t)2)
 
 // sl::LogLevel (sl_core_types.h) -- only the values this project sets.
 typedef enum sl_log_level_e {
@@ -184,10 +191,24 @@ typedef struct sl_extent_s {
 	uint32_t height;
 } sl_extent_t;
 
+// Mirrors sl::ResourceLifecycle (sl_core_types.h) -- a plain (non-class) C++
+// enum, so its underlying type is a compiler-chosen int, same as this
+// C enum. IMPORTANT: values must match the real header's declaration
+// order exactly (eOnlyValidNow=0, eValidUntilPresent=1,
+// eValidUntilEvaluate=2) -- an earlier draft of this file had these three
+// permuted (VALID_UNTIL_PRESENT=0/VALID_UNTIL_EVALUATE=1/ONLY_VALID_NOW=2),
+// which silently sent DLSS the wrong resource-recycling lifetime for every
+// tagged buffer (this project's own call sites use ONLY_VALID_NOW for
+// color-in/out/motion-vectors and VALID_UNTIL_PRESENT for depth, so under
+// the old wrong mapping DLSS was actually told eValidUntilEvaluate for the
+// former three and eOnlyValidNow for the latter) -- not a crash, but a real
+// correctness bug that could show up as ghosting/corruption on real
+// hardware since SL could believe it's safe to recycle a resource earlier
+// than this project's actual usage allows, or vice versa.
 typedef enum sl_resource_lifecycle_e {
-	SL_RESOURCE_LIFECYCLE_VALID_UNTIL_PRESENT = 0,
-	SL_RESOURCE_LIFECYCLE_VALID_UNTIL_EVALUATE = 1,
-	SL_RESOURCE_LIFECYCLE_ONLY_VALID_NOW = 2,
+	SL_RESOURCE_LIFECYCLE_ONLY_VALID_NOW = 0,
+	SL_RESOURCE_LIFECYCLE_VALID_UNTIL_PRESENT = 1,
+	SL_RESOURCE_LIFECYCLE_VALID_UNTIL_EVALUATE = 2,
 } sl_resource_lifecycle_t;
 
 // Mirrors sl::ResourceTag (sl_core_types.h, StructVersion1).
@@ -233,6 +254,11 @@ typedef struct sl_constants_s {
 	sl_boolean_t orthographicProjection;
 	sl_boolean_t motionVectorsDilated;
 	sl_boolean_t motionVectorsJittered;
+	// 1 byte of compiler-inserted padding follows automatically here (7
+	// single-byte sl_boolean_t fields above need 1 more byte to reach the
+	// next float's 4-byte alignment) -- both MSVC's C and C++ compilers
+	// apply the identical standard alignment rule, so no explicit padding
+	// field is needed for this to match sl::Constants' real layout.
 	float minRelativeLinearDepthObjectSeparation;
 } sl_constants_t;
 
@@ -273,6 +299,9 @@ typedef struct sl_dlss_options_s {
 	sl_boolean_t colorBuffersHDR;
 	sl_boolean_t indicatorInvertAxisX;
 	sl_boolean_t indicatorInvertAxisY;
+	// 1 byte of compiler-inserted padding follows automatically (3
+	// single-byte bools need 1 more to reach dlaaPreset's 4-byte alignment)
+	// -- same reasoning as sl_constants_t's trailing bools above.
 	sl_dlss_preset_t dlaaPreset;
 	sl_dlss_preset_t qualityPreset;
 	sl_dlss_preset_t balancedPreset;

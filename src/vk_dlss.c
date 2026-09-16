@@ -373,6 +373,21 @@ qbool VK_DLSS_GetOptimalRenderSize(uint32_t outputWidth, uint32_t outputHeight, 
 	}
 
 	memset(&settings, 0, sizeof(settings));
+	// structType/structVersion on an output-only struct still matter --
+	// Streamline's plugins commonly validate a passed struct's declared
+	// type/version even when they're about to overwrite its data fields
+	// (same GUID-checking pattern used on every other sl:: struct in this
+	// file); left zeroed here in an earlier draft, which real hardware
+	// could reject or (per this SDK's own convention elsewhere) simply
+	// ignore the call for silently.
+	settings.structType.data1 = 0xef1d0957;
+	settings.structType.data2 = 0xfd58;
+	settings.structType.data3 = 0x4df7;
+	{
+		static const uint8_t guid4[8] = { 0xb5, 0x4, 0x8b, 0x69, 0xd8, 0xaa, 0x6b, 0x76 };
+		memcpy(settings.structType.data4, guid4, 8);
+	}
+	settings.structVersion = 1; // kStructVersion1
 	result = p_slDLSSGetOptimalSettings(&options, &settings);
 	if (result != SL_RESULT_OK || !settings.optimalRenderWidth || !settings.optimalRenderHeight) {
 		return false;
@@ -607,6 +622,21 @@ qbool VK_DLSS_Composite(VkCommandBuffer commandBuffer, VkImage sceneColorImage, 
 		memcpy(consts.structType.data4, guid4, 8);
 	}
 	consts.structVersion = 2; // kStructVersion2
+	// cameraNear/Far/FOV/AspectRatio, motionVectorsInvalidValue: not tracked
+	// by this project's own matrix/camera state today (only the composed
+	// clipToPrevClip/prevClipToClip reprojection matrices below are), so
+	// leave them at the SDK's own documented "not provided" sentinel
+	// (sl::INVALID_FLOAT) rather than the 0.0f the memset above left them
+	// at -- 0 is a plausible-looking but wrong value for a near-plane
+	// distance or FOV that DLSS could silently misuse, where INVALID_FLOAT
+	// is the SDK's own explicit "caller didn't supply this" signal. If a
+	// future pass threads real near/far/FOV values through from r_rmain.c's
+	// MYgluPerspective call site, replace these with the real values instead.
+	consts.cameraNear = 3.40282346638528859811704183484516925440e38f;
+	consts.cameraFar = consts.cameraNear;
+	consts.cameraFOV = consts.cameraNear;
+	consts.cameraAspectRatio = consts.cameraNear;
+	consts.motionVectorsInvalidValue = consts.cameraNear;
 	memcpy(&consts.clipToPrevClip, invViewProj, sizeof(consts.clipToPrevClip));
 	// prevClipToClip is the true inverse of clipToPrevClip, not just
 	// invViewProj/prevViewProj swapped (matrix inversion isn't
