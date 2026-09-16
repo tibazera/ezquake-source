@@ -487,7 +487,7 @@ void VK_Draw3DSprites(void)
 
 	memset(&push, 0, sizeof(push));
 	memcpy(push.modelView, R_ModelviewMatrix(), sizeof(push.modelView));
-	memcpy(push.projection, VK_JitteredProjectionMatrix(), sizeof(push.projection));
+	VK_JitteredProjectionMatrix(push.projection);
 
 	VK_SpriteSetViewportScissor(commandBuffer);
 	vkCmdBindVertexBuffers(commandBuffer, 0, 1, &vertexBuffer, &vertexOffset);

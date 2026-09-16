@@ -171,15 +171,31 @@ bool ReprojectToPreviousFrame(vec2 outUv, out vec2 prevUv)
 
 	vec4 ndc = vec4(outUv.x * 2.0 - 1.0, outUv.y * 2.0 - 1.0, depth, 1.0);
 	vec4 worldPos = matrices.invViewProj * ndc;
+	// Guard against a near-zero/zero w (can happen at grazing angles or
+	// numerical edge cases in the inverse) producing Inf/NaN through the
+	// divide below -- that would propagate through prevClip and the
+	// eventual history blend as a flickering white/garbage pixel.
+	if (abs(worldPos.w) < 1e-6) {
+		return false;
+	}
 	worldPos /= worldPos.w;
 
 	vec4 prevClip = matrices.prevViewProj * worldPos;
-	if (prevClip.w <= 0.0) {
+	if (abs(prevClip.w) < 1e-6 || prevClip.w <= 0.0) {
 		return false;
 	}
 	prevClip /= prevClip.w;
 
 	prevUv = prevClip.xy * 0.5 + 0.5;
+
+	// NaN/Inf guard on the final result -- belt-and-suspenders in case
+	// anything upstream still produced a non-finite value despite the w
+	// guards above (e.g. an extreme but nonzero w very close to the
+	// threshold). NaN fails every comparison, so this check alone is
+	// sufficient without a separate isnan() call.
+	if (!(prevUv.x == prevUv.x) || !(prevUv.y == prevUv.y)) {
+		return false;
+	}
 	return true;
 }
 

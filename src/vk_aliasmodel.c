@@ -542,6 +542,7 @@ static void VK_AliasQueuePreparedDraw(
 	vk_alias_draw_t* draw;
 	float modelView[16];
 	float mvp[16];
+	float jitteredProjection[16];
 	qbool textureReady;
 	static const float emptyAltColor[4] = { 0, 0, 0, 0 };
 
@@ -555,8 +556,9 @@ static void VK_AliasQueuePreparedDraw(
 	}
 
 	R_GetModelviewMatrix(modelView);
+	VK_JitteredProjectionMatrix(jitteredProjection);
 	// R_MultiplyMatrix(lhs, rhs) writes rhs * lhs for the engine's matrix layout.
-	R_MultiplyMatrix(modelView, VK_JitteredProjectionMatrix(), mvp);
+	R_MultiplyMatrix(modelView, jitteredProjection, mvp);
 
 	draw = &aliasDraws[aliasDrawCount++];
 	draw->firstVertex = (uint32_t)firstVertex;

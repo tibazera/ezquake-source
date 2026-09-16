@@ -31,6 +31,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include "gl_model.h"
 #include "r_aliasmodel.h"
 #include "r_renderer.h"
+#include "r_matrix.h"
 #include "tr_types.h"
 #include "glsl/constants.glsl"
 #include "vk_local.h"
@@ -554,21 +555,32 @@ static const float vk_jitter_halton8[8][2] = {
 // a fraction of a low-res texel for the upscaler's history resolve to work,
 // a native-res fraction would be too small to matter after downscaling to
 // sceneSize.
-const float* VK_JitteredProjectionMatrix(void)
+// Writes into caller-supplied `out` (16 floats) rather than returning a
+// pointer to an internal static buffer -- a `static float[16]` returned by
+// pointer here was found to crash under this project's RelWithDebInfo/LTO
+// build: multiple 8-byte-return-by-register functions (this one, and
+// VK_SceneRenderExtent's VkExtent2D) called back-to-back at several call
+// sites across translation units apparently confused the linker's
+// cross-module inlining/aliasing analysis, producing a garbage pointer at
+// the call site (observed via WinDbg on 2 real crash dumps: R_MultiplyMatrix
+// dereferencing an obviously-invalid address for what should have been this
+// function's static array). An output parameter has no aliasing ambiguity
+// for the optimizer to get wrong.
+void VK_JitteredProjectionMatrix(float* out)
 {
-	static float jittered[16];
 	VkExtent2D sceneSize;
 	float jitterX, jitterY;
 
 	if (!VK_UpscaleActive()) {
-		return R_ProjectionMatrix();
+		memcpy(out, R_ProjectionMatrix(), 16 * sizeof(float));
+		return;
 	}
 
 	sceneSize = VK_SceneRenderExtent();
 	jitterX = vk_jitter_halton8[vk_jitter_frameIndex % 8][0] * (2.0f / (float)max(1, (int)sceneSize.width));
 	jitterY = vk_jitter_halton8[vk_jitter_frameIndex % 8][1] * (2.0f / (float)max(1, (int)sceneSize.height));
 
-	memcpy(jittered, R_ProjectionMatrix(), sizeof(jittered));
+	memcpy(out, R_ProjectionMatrix(), 16 * sizeof(float));
 	// Standard projection-matrix jitter injection: bias the same terms
 	// R_Frustum uses for the (right+left)/(right-left) and (top+bottom)/
 	// (top-bottom) asymmetric-frustum offset -- column-major layout, so
@@ -577,9 +589,8 @@ const float* VK_JitteredProjectionMatrix(void)
 	// not, orthographic or reversed-depth included, since it only touches
 	// the existing off-axis term rather than assuming a specific near/far
 	// setup.
-	jittered[8] += jitterX;
-	jittered[9] += jitterY;
-	return jittered;
+	out[8] += jitterX;
+	out[9] += jitterY;
 }
 
 // Converts an engine-convention (GL-style) clip-space matrix into the
@@ -592,15 +603,22 @@ const float* VK_JitteredProjectionMatrix(void)
 // the projection matrix's Z terms -- this matrix works the same either way
 // since it operates on whatever Z the projection matrix already produced,
 // not a specific assumed range.
+// File-scope, not a function-local static -- this project's RelWithDebInfo/
+// LTO build was found to produce a garbage pointer for a function-local
+// `static const float[16]` passed into R_MultiplyMatrix at several call
+// sites (see VK_JitteredProjectionMatrix's own comment for the two crash
+// dumps that pinned this down); moving the constant out to file scope
+// removes any ambiguity about its address across inlined call sites.
+static const float vk_flipRemapMatrix[16] = {
+	1, 0, 0, 0,
+	0, -1, 0, 0,
+	0, 0, 0.5f, 0,
+	0, 0, 0.5f, 1,
+};
+
 static void VK_ToVulkanClipSpace(const float* glClip, float* vulkanClip)
 {
-	static const float flipRemap[16] = {
-		1, 0, 0, 0,
-		0, -1, 0, 0,
-		0, 0, 0.5f, 0,
-		0, 0, 0.5f, 1,
-	};
-	R_MultiplyMatrix(glClip, flipRemap, vulkanClip);
+	R_MultiplyMatrix(glClip, vk_flipRemapMatrix, vulkanClip);
 }
 
 // Called once per frame from VK_BeginFrame, before any 3D draw call reads
@@ -648,11 +666,13 @@ const float* VK_PrevViewProjMatrix(void)
 qbool VK_CurrentInvViewProjMatrix(float* out)
 {
 	float modelView[16];
+	float jitteredProjection[16];
 	float glViewProj[16];
 	float vulkanViewProj[16];
 
 	R_GetModelviewMatrix(modelView);
-	R_MultiplyMatrix(modelView, VK_JitteredProjectionMatrix(), glViewProj);
+	VK_JitteredProjectionMatrix(jitteredProjection);
+	R_MultiplyMatrix(modelView, jitteredProjection, glViewProj);
 	VK_ToVulkanClipSpace(glViewProj, vulkanViewProj);
 	return R_InvertMatrix(vulkanViewProj, out);
 }

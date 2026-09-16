@@ -2225,10 +2225,13 @@ static qbool VK_DrawWorldNormalsPass(VkCommandBuffer commandBuffer, VkBuffer ver
 	qbool haveLastMvp = false;
 	float zFar;
 	int i;
+	float jitteredProjection[16];
 
 	if (!VK_WorldCreateNormalsPipeline()) {
 		return false;
 	}
+
+	VK_JitteredProjectionMatrix(jitteredProjection);
 
 	framebuffer = VK_WorldNormalsFramebuffer(vk_options.frame.imageIndex);
 	if (framebuffer == VK_NULL_HANDLE) {
@@ -2277,7 +2280,7 @@ static qbool VK_DrawWorldNormalsPass(VkCommandBuffer commandBuffer, VkBuffer ver
 			memcpy(push.mvp, lastMvp, sizeof(push.mvp));
 		}
 		else {
-			R_MultiplyMatrix(worldDraws[i].modelView, VK_JitteredProjectionMatrix(), push.mvp);
+			R_MultiplyMatrix(worldDraws[i].modelView, jitteredProjection, push.mvp);
 			memcpy(lastModelView, worldDraws[i].modelView, sizeof(lastModelView));
 			memcpy(lastMvp, push.mvp, sizeof(lastMvp));
 			haveLastMvp = true;
@@ -2340,6 +2343,7 @@ void VK_RenderView(void)
 	float lastMultipliedModelView[16];
 	float lastMvp[16];
 	qbool haveLastMvp = false;
+	float jitteredProjection[16];
 	// Consecutive draws are usually pre-sorted by material (same texture/
 	// lightmap/pipeline), so re-issuing vkCmdBindPipeline/vkCmdBindDescriptorSets
 	// for a state that's already bound is pure redundant driver overhead --
@@ -2375,6 +2379,8 @@ void VK_RenderView(void)
 
 	R_UploadChangedLightmaps();
 	VK_Prepare3DSprites();
+
+	VK_JitteredProjectionMatrix(jitteredProjection);
 
 	if (!VK_WorldCreateFlatPipeline()) {
 		VK_WorldDebugLog("render skipped: flat pipeline creation failed");
@@ -2542,7 +2548,7 @@ void VK_RenderView(void)
 				memcpy(push.mvp, lastMvp, sizeof(push.mvp));
 			}
 			else {
-				R_MultiplyMatrix(worldDraws[i].modelView, VK_JitteredProjectionMatrix(), push.mvp);
+				R_MultiplyMatrix(worldDraws[i].modelView, jitteredProjection, push.mvp);
 				memcpy(lastMultipliedModelView, worldDraws[i].modelView, sizeof(lastMultipliedModelView));
 				memcpy(lastMvp, push.mvp, sizeof(lastMvp));
 				haveLastMvp = true;

@@ -861,6 +861,21 @@ void VK_UpscaleComposite(VkCommandBuffer commandBuffer, uint32_t imageIndex)
 	// UBO contents.
 	temporalActive = vk_upscale_matricesUpdatedThisFrame;
 
+	// One-shot diagnostic: prints only when temporalActive's value actually
+	// changes (not every frame) so Tiago can confirm from the console
+	// whether the spatial-only path or the real temporal (motion-vector
+	// reprojection) path is running, without having to guess from visual
+	// inspection alone.
+	{
+		static qbool lastTemporalActive = false;
+		static qbool everPrinted = false;
+		if (!everPrinted || temporalActive != lastTemporalActive) {
+			Con_Printf("vulkan: upscaler temporal path %s (historyValidFrameCount=%d)\n", temporalActive ? "ACTIVE (motion-vector reprojection)" : "inactive (spatial-only EASU+RCAS)", historyValidFrameCount);
+			lastTemporalActive = temporalActive;
+			everPrinted = true;
+		}
+	}
+
 	// Same gate/formula as VK_PostProcessComposite -- this pass replaces
 	// that one entirely when upscaleActive, so gamma/contrast has to happen
 	// here instead (see the comment at VK_PostProcessComposite's call site).
