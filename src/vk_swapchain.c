@@ -614,11 +614,23 @@ qbool VK_CreatePostProcessResources(void)
 		poolInfo.poolSizeCount = 2;
 		poolInfo.pPoolSizes = poolSizes;
 		poolInfo.maxSets = vk_options.swapChain.imageCount * 3;
-	}
 
-	if (vkCreateDescriptorPool(vk_options.logicalDevice, &poolInfo, NULL, &vk_options.swapChain.postProcessDescriptorPool) != VK_SUCCESS) {
-		VK_DestroyPostProcessResources();
-		return false;
+		// vkCreateDescriptorPool must run inside this block -- poolSizes is a
+		// stack array local to it, and poolInfo.pPoolSizes above only stores a
+		// pointer to it, not a copy. Calling vkCreateDescriptorPool after this
+		// block closed (as this used to do) read poolSizes through a dangling
+		// pointer: undefined behaviour that happened to work most of the time
+		// (stack memory not yet overwritten) but could hand the driver garbage
+		// descriptor type/count values on any call where something else
+		// clobbered that stack slot first -- a real, intermittent cause of
+		// "vkAllocateDescriptorSets: pool has no COMBINED_IMAGE_SAMPLER
+		// capacity" validation errors and the solid-white scene rendering
+		// that followed (every upscale/motion-vector descriptor set read
+		// through this pool comes back unbound in that failure case).
+		if (vkCreateDescriptorPool(vk_options.logicalDevice, &poolInfo, NULL, &vk_options.swapChain.postProcessDescriptorPool) != VK_SUCCESS) {
+			VK_DestroyPostProcessResources();
+			return false;
+		}
 	}
 
 	vk_options.swapChain.postProcessDescriptorSets = Q_calloc(vk_options.swapChain.imageCount, sizeof(vk_options.swapChain.postProcessDescriptorSets[0]));
