@@ -53,6 +53,7 @@ typedef sl_result_t (*PFN_slFreeResources)(sl_feature_t feature, const sl_viewpo
 typedef sl_result_t (*PFN_slEvaluateFeature)(sl_feature_t feature, const void* frame, const sl_base_structure_t** inputs, uint32_t numInputs, void* cmdBuffer);
 typedef sl_result_t (*PFN_slGetFeatureFunction)(sl_feature_t feature, const char* functionName, void** function);
 typedef sl_result_t (*PFN_slGetNewFrameToken)(void** token, const uint32_t* frameIndex);
+typedef sl_result_t (*PFN_slGetFeatureRequirements)(sl_feature_t feature, sl_feature_requirements_t* requirements);
 
 // Feature-loaded (obtained via slGetFeatureFunction, not exported directly
 // from the DLL -- see sl_dlss.h's SL_FEATURE_FUN_IMPORT_STATIC pattern).
@@ -71,6 +72,7 @@ static PFN_slFreeResources p_slFreeResources;
 static PFN_slEvaluateFeature p_slEvaluateFeature;
 static PFN_slGetFeatureFunction p_slGetFeatureFunction;
 static PFN_slGetNewFrameToken p_slGetNewFrameToken;
+static PFN_slGetFeatureRequirements p_slGetFeatureRequirements;
 static PFN_slDLSSGetOptimalSettings p_slDLSSGetOptimalSettings;
 static PFN_slDLSSSetOptions p_slDLSSSetOptions;
 
@@ -166,6 +168,13 @@ qbool VK_DLSS_LoadLibrary(void)
 	p_slEvaluateFeature = (PFN_slEvaluateFeature)GetProcAddress(vk_dlss_module, "slEvaluateFeature");
 	p_slGetFeatureFunction = (PFN_slGetFeatureFunction)GetProcAddress(vk_dlss_module, "slGetFeatureFunction");
 	p_slGetNewFrameToken = (PFN_slGetNewFrameToken)GetProcAddress(vk_dlss_module, "slGetNewFrameToken");
+	// Not in the mandatory-exports check below: VK_DLSS_GetRequiredDeviceExtensions
+	// (this file, called from vk_physical_devices.c before device creation)
+	// already treats a missing/failing slGetFeatureRequirements as "nothing
+	// extra required" and falls through -- a real DLL that happens to be an
+	// older/newer build without this specific export shouldn't lose DLSS
+	// entirely over an extension-discovery nicety.
+	p_slGetFeatureRequirements = (PFN_slGetFeatureRequirements)GetProcAddress(vk_dlss_module, "slGetFeatureRequirements");
 
 	if (!p_slInit || !p_slShutdown || !p_slIsFeatureSupported || !p_slSetVulkanInfo ||
 		!p_slSetTagForFrame || !p_slSetConstants || !p_slAllocateResources || !p_slFreeResources ||
@@ -247,6 +256,61 @@ qbool VK_DLSS_CheckSupport(VkPhysicalDevice physicalDevice)
 		Con_DPrintf("vulkan: DLSS not supported on this adapter (result=%d) -- needs RTX 50-series+ and a current driver\n", result);
 	}
 	return vk_dlss_supported;
+}
+
+// Called from VK_CreateLogicalDevice (vk_physical_devices.c) BEFORE
+// vkCreateDevice, right after VK_DLSS_CheckSupport confirms this adapter
+// supports DLSS -- queries what Vulkan device extensions Streamline needs
+// enabled for DLSS to actually work, per the SDK's documented integration
+// order (slInit -> slGetFeatureRequirements -> create VkDevice with those
+// extensions enabled -> slSetVulkanInfo), matching NVIDIA's own
+// nvpro-samples/vk_streamline reference sample. This project previously
+// created its VkDevice without ever consulting this, which is a real gap:
+// if DLSS actually needs an extension this engine doesn't otherwise
+// request, slSetVulkanInfo/slEvaluateFeature would fail (or worse) on real
+// hardware once the graceful-fallback checks stopped masking it.
+//
+// Returns the extension count and writes up to maxNames extension name
+// pointers (owned by Streamline, valid for the process lifetime -- same
+// convention as vkEnumerateDeviceExtensionProperties's static string
+// table) into outNames. Returns 0 (not a failure) if slGetFeatureRequirements
+// isn't exported by this DLL build, the call fails, or DLSS needs nothing
+// extra -- all of which mean "proceed with device creation exactly as
+// before", the same behavior this had prior to this function existing.
+uint32_t VK_DLSS_GetRequiredDeviceExtensions(const char** outNames, uint32_t maxNames)
+{
+	sl_feature_requirements_t requirements;
+	sl_result_t result;
+	uint32_t i, count;
+
+	if (!vk_dlss_available || !vk_dlss_supported || !p_slGetFeatureRequirements || !outNames || maxNames == 0) {
+		return 0;
+	}
+
+	memset(&requirements, 0, sizeof(requirements));
+	requirements.structType.data1 = 0x66714097;
+	requirements.structType.data2 = 0xac6d;
+	requirements.structType.data3 = 0x4bc6;
+	{
+		static const uint8_t guid4[8] = { 0x89, 0x15, 0x1e, 0xf, 0x55, 0xa6, 0xb6, 0x1f };
+		memcpy(requirements.structType.data4, guid4, 8);
+	}
+	requirements.structVersion = 2; // kStructVersion2
+
+	result = p_slGetFeatureRequirements(SL_FEATURE_DLSS, &requirements);
+	if (result != SL_RESULT_OK || !requirements.vkDeviceExtensions) {
+		return 0;
+	}
+
+	count = min(requirements.vkNumDeviceExtensions, maxNames);
+	for (i = 0; i < count; ++i) {
+		outNames[i] = requirements.vkDeviceExtensions[i];
+	}
+	if (requirements.vkNumDeviceExtensions > maxNames) {
+		Con_Printf("vulkan: DLSS requires %u device extensions but only %u slots were available -- some may be missing, DLSS may fail to initialise\n",
+			requirements.vkNumDeviceExtensions, maxNames);
+	}
+	return count;
 }
 
 // Called once after the logical device is created (VK_CreateLogicalDevice)

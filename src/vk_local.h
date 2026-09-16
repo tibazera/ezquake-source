@@ -188,6 +188,10 @@ VkImageMemoryBarrier VK_UpscaleMakeImageBarrier(VkImage image, VkImageLayout old
 // when unavailable; see vk_dlss.c's own header comment for the full design.
 qbool VK_DLSS_LoadLibrary(void);
 qbool VK_DLSS_CheckSupport(VkPhysicalDevice physicalDevice);
+// Called before vkCreateDevice -- writes up to maxNames required Vulkan
+// device extension name pointers into outNames, returns how many were
+// written (0 if none needed / not queryable, which is not a failure).
+uint32_t VK_DLSS_GetRequiredDeviceExtensions(const char** outNames, uint32_t maxNames);
 qbool VK_DLSS_SetVulkanInfo(VkInstance instance, VkPhysicalDevice physicalDevice, VkDevice device, uint32_t graphicsQueueFamily, uint32_t graphicsQueueIndex);
 qbool VK_DLSS_Available(void);
 qbool VK_DLSS_Active(void);

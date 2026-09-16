@@ -534,7 +534,11 @@ qbool VK_CreateLogicalDevice(VkInstance instance)
 	VkPhysicalDeviceDescriptorIndexingFeatures descriptorIndexingEnable = { 0 };
 	float priorities[] = { 1.0f };
 	uint32_t queueCount = 0;
-	const char* enabledExtensions[4];
+	// 1 (swapchain, always) + up to 8 (DLSS/Streamline, best-effort, see
+	// VK_DLSS_GetRequiredDeviceExtensions below) + 2 (AMD anti-lag / NVIDIA
+	// low-latency, opt-in) -- was 4, too tight once DLSS extensions were
+	// added here (a real Streamline build can require several).
+	const char* enabledExtensions[11];
 	uint32_t enabledExtensionCount = 0;
 	qbool amdAntiLagExtPresent = false;
 	qbool nvLowLatency2Present = false;
@@ -549,6 +553,24 @@ qbool VK_CreateLogicalDevice(VkInstance instance)
 
 	for (i = 0; i < sizeof(requiredDeviceExtensions) / sizeof(requiredDeviceExtensions[0]); ++i) {
 		enabledExtensions[enabledExtensionCount++] = requiredDeviceExtensions[i];
+	}
+
+	// DLSS (Streamline SDK) device extensions, best-effort: must be gathered
+	// and enabled HERE, before vkCreateDevice, not after -- see the SDK's
+	// documented integration order (slInit -> slGetFeatureRequirements ->
+	// create VkDevice with those extensions -> slSetVulkanInfo), matching
+	// NVIDIA's own nvpro-samples/vk_streamline reference sample. Enabling
+	// them after the fact (this project's own earlier approach) means real
+	// DLSS hardware could get a VkDevice missing an extension Streamline
+	// actually needs. VK_DLSS_CheckSupport only needs physicalDevice (moved
+	// here from after device creation -- it never used to need the device
+	// either, it just happened to run there); VK_DLSS_LoadLibrary already
+	// ran earlier in VK_SelectPhysicalDevice's caller (VK_Initialise), so
+	// slGetFeatureRequirements is safe to call by this point. Both fail
+	// gracefully to 0 extensions on any non-RTX-50 GPU or missing DLLs.
+	if (VK_DLSS_CheckSupport(vk_options.physicalDevice)) {
+		const uint32_t maxDlssExtensions = (uint32_t)(sizeof(enabledExtensions) / sizeof(enabledExtensions[0])) - enabledExtensionCount;
+		enabledExtensionCount += VK_DLSS_GetRequiredDeviceExtensions(&enabledExtensions[enabledExtensionCount], maxDlssExtensions);
 	}
 
 	// Only probe/enable the vendor low-latency extensions when the user has
@@ -724,13 +746,12 @@ qbool VK_CreateLogicalDevice(VkInstance instance)
 
 	VK_LoadPipelineCache();
 
-	// DLSS (Streamline SDK) hookup, best-effort: VK_DLSS_LoadLibrary was
-	// already called earlier (see VK_SelectPhysicalDevice) so this is just
-	// checking adapter support and registering the now-created device.
-	// Both fail gracefully (VK_DLSS_Available()/VK_DLSS_Active() stay
-	// false) on any non-RTX-50 GPU or missing Streamline DLLs -- this is
-	// not a fatal path.
-	if (VK_DLSS_CheckSupport(vk_options.physicalDevice)) {
+	// DLSS (Streamline SDK) hookup, best-effort: VK_DLSS_CheckSupport already
+	// ran earlier in this function (before device extensions were finalised,
+	// see the enabledExtensions block above) -- this just registers the
+	// now-created device. VK_DLSS_Available()/VK_DLSS_Active() stay false on
+	// any non-RTX-50 GPU or missing Streamline DLLs; not a fatal path.
+	if (VK_DLSS_Available()) {
 		VK_DLSS_SetVulkanInfo(instance, vk_options.physicalDevice, vk_options.logicalDevice, VK_PhysicalDeviceGraphicsQueueFamilyIndex(), 0);
 	}
 

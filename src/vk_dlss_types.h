@@ -262,6 +262,43 @@ typedef struct sl_constants_s {
 	float minRelativeLinearDepthObjectSeparation;
 } sl_constants_t;
 
+// Mirrors sl::Version (sl_core_types.h) -- plain aggregate, no base fields.
+typedef struct sl_version_s {
+	uint32_t major, minor, build;
+} sl_version_t;
+
+// Mirrors sl::FeatureRequirements (sl_core_types.h, StructVersion2) -- what
+// slGetFeatureRequirements returns for a given feature, listing the Vulkan
+// instance/device extensions and 1.2/1.3 core features that feature needs
+// enabled on the VkDevice BEFORE it's created. This project currently
+// creates its VkDevice without consulting this (see VK_DLSS_LoadLibrary's
+// header comment in vk_dlss.c for the known consequence), so this mirror
+// exists for VK_DLSS_GetRequiredDeviceExtensions to use, called from
+// vk_physical_devices.c before VK_CreateLogicalDevice's vkCreateDevice call.
+typedef struct sl_feature_requirements_s {
+	SL_BASE_STRUCTURE_FIELDS;
+	uint32_t flags;
+	uint32_t maxNumCPUThreads;
+	uint32_t maxNumViewports;
+	uint32_t numRequiredTags;
+	const sl_buffer_type_t* requiredTags;
+	sl_version_t osVersionDetected;
+	sl_version_t osVersionRequired;
+	sl_version_t driverVersionDetected;
+	sl_version_t driverVersionRequired;
+	uint32_t vkNumComputeQueuesRequired;
+	uint32_t vkNumGraphicsQueuesRequired;
+	uint32_t vkNumDeviceExtensions;
+	const char** vkDeviceExtensions;
+	uint32_t vkNumInstanceExtensions;
+	const char** vkInstanceExtensions;
+	uint32_t vkNumFeatures12;
+	const char** vkFeatures12;
+	uint32_t vkNumFeatures13;
+	const char** vkFeatures13;
+	uint32_t vkNumOpticalFlowQueuesRequired;
+} sl_feature_requirements_t;
+
 // Mirrors sl::ViewportHandle (sl_core_types.h, StructVersion1) -- normally
 // constructed via a uint32_t-taking C++ constructor; this project fills the
 // base fields with SL_INIT_BASE_STRUCTURE below instead.
