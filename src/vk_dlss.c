@@ -382,9 +382,31 @@ void VK_DLSS_AdvanceFrame(void)
 	++vk_dlss_frameIndex;
 }
 
+// NOT YET CALLED from anywhere in the render loop -- see the TODO at the
+// bottom of this file's header comment area for exactly what's needed to
+// wire this in. Written and compiles clean, but wiring it in requires
+// restructuring where in the frame this runs: slEvaluateFeature is a
+// compute dispatch and, like vkCmdUpdateBuffer/vkCmdCopyImage elsewhere in
+// this codebase, cannot run inside an active render pass instance -- so
+// this must be called from vk_main.c's VK_EndWorldPassAndComposite
+// alongside VK_UpscaleUpdateMatrices/VK_UpscaleUpdateHistory (both already
+// run outside any render pass there), NOT from inside VK_UpscaleComposite
+// (which always runs inside the composite render pass). Also needs: (1) a
+// dedicated DLSS output image (DLSS writes via compute/UAV into
+// VK_IMAGE_LAYOUT_GENERAL, not through a graphics pipeline draw into the
+// render pass's color attachment the way EASU+RCAS does), which then has
+// to be blitted/copied into the actual composite framebuffer target after
+// slEvaluateFeature returns; and (2) VK_MotionVectorsComposite (see
+// vk_motion_vectors.frag) called first to populate the motion-vector
+// buffer this function tags, itself needing its own small render pass/
+// pipeline (same fullscreen-triangle pattern as VK_UpscaleCreatePipeline,
+// but writing vk_motion_vectors_frag_spv into a dedicated R16G16_SFLOAT
+// target at sceneSize instead of vk_upscale_frag_spv into the swapchain).
+//
 // Tags the resources DLSS needs (depth, motion vectors, low-res input
-// color, native-res output color) and evaluates the feature -- replaces
-// VK_UpscaleComposite's EASU+RCAS draw call when VK_DLSS_Active(). Reuses
+// color, native-res output color) and evaluates the feature -- intended to
+// replace VK_UpscaleComposite's EASU+RCAS draw call when VK_DLSS_Active(),
+// once the restructuring above is done. Reuses
 // the SAME reconstructed motion vectors and depth this project's FSR2-style
 // temporal path already computes (see vk_upscale.c/vk_upscale.frag's
 // ReprojectToPreviousFrame) -- DLSS doesn't care how the motion-vector

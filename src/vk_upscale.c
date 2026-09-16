@@ -1,34 +1,28 @@
-// Vulkan renderer: spatial upscale pass (FSR2-style EASU+RCAS), used by
-// VK_PostProcessComposite (vk_draw.c) in place of a plain blit when the
-// scene is rendered at less than native resolution (vid_vulkan_renderscale
-// < 1, see VK_ResolveSceneSize in vk_swapchain.c).
+// Vulkan renderer: upscale pass, used by VK_PostProcessComposite (vk_draw.c)
+// in place of a plain blit when the scene is rendered at less than native
+// resolution (vid_vulkan_renderscale < 1, see VK_ResolveSceneSize in
+// vk_swapchain.c). Two backends, selected by vid_vulkan_upscaler:
 //
-// This is deliberately named/structured to eventually host DLSS too (see
-// vid_vulkan_upscaler), but only the FSR2-style spatial path is implemented
-// here -- true temporal FSR2/DLSS need per-pixel motion vectors and a
-// jittered projection matrix threaded through every 3D draw call
-// (world/aliasmodel/sprite3d/particles), which this renderer doesn't
-// produce yet. vk_upscale.frag's header comment has the full reasoning.
-// DLSS additionally needs NVIDIA's proprietary NGX SDK (binary DLLs +
-// developer registration), which isn't vendored in this tree, so
-// vid_vulkan_upscaler 2 currently just runs the same FSR2-style shader
-// (VK_UpscaleActive doesn't distinguish 1 vs 2) until real NGX integration
-// lands.
+//   1 (FSR2-style): EASU+RCAS spatial upscale (vk_upscale.frag's Easu/Rcas)
+//      plus a real temporal path (ReprojectToPreviousFrame + history blend,
+//      same file) once VK_TemporalUpscaleActive's conditions are met. Fully
+//      implemented and live-tested by the project owner.
 //
-// Future integration candidates named by the project owner (not vendored or
-// inspected here -- verify licensing/API shape before pulling either in):
-//   - https://github.com/GPUOpen-Effects/FidelityFX-FSR2 (real temporal
-//     FSR2 -- swap in once motion vectors + jittered projection exist)
-//   - https://github.com/NIGos/dlss5-bridge (proposed DLSS integration path
-//     for vid_vulkan_upscaler 2)
-//   - https://github.com/NVIDIA/DLSS (official NGX SDK, needs vendoring +
-//     dev registration)
-//   - https://github.com/nvpro-samples/vk_streamline (NVIDIA's reference
-//     Vulkan integration of DLSS/Reflex -- closest existing example of how
-//     the NGX calls should plug into a Vulkan frame loop like this one's)
-//   - https://github.com/NVIDIA-RTX/Streamline (current umbrella SDK:
-//     DLSS + Reflex + XeSS behind one plugin API -- likely the actual
-//     integration point rather than raw NGX, worth evaluating first)
+//   2 (DLSS): real NVIDIA DLSS via the Streamline SDK (vk_dlss.c,
+//      external/streamline/) -- only usable on RTX 50-series+ with a
+//      current driver; VK_DLSS_Active() gates it off everywhere else,
+//      falling back to the FSR2-style path. VK_MotionVectorsComposite
+//      below produces the real sampleable R16G16_SFLOAT motion-vector
+//      buffer DLSS needs to tag (the FSR2 path above computes the
+//      equivalent reprojection inline in its own shader instead, no
+//      separate buffer needed there).
+//
+// Both paths share the same reprojection matrices UBO (matricesBuffers[],
+// updated by VK_UpscaleUpdateMatrices) and the same camera-reprojection
+// motion-vector algorithm (vk_upscale.frag's ReprojectToPreviousFrame and
+// vk_motion_vectors.frag are the identical algorithm, kept in sync
+// manually since GLSL has no #include across these two entry points in
+// this project's build).
 
 #include "quakedef.h"
 #include "tr_types.h"
