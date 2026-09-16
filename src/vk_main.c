@@ -1004,7 +1004,21 @@ void VK_EndWorldPassAndComposite(void)
 			// written. Falls through to the normal EASU+RCAS render-pass
 			// path below if any step fails (DLSS unavailable this frame,
 			// e.g. right after vid_restart before its resources exist).
-			if (!skipTemporalUpdate && VK_DLSS_Active() &&
+			//
+			// vk_force_clear_frames_remaining > 0 additionally means the
+			// swapchain image itself may still be VK_IMAGE_LAYOUT_UNDEFINED
+			// (freshly created/resized, never rendered to) -- the EASU+RCAS
+			// render pass below handles that safely because a VkRenderPass's
+			// own attachment transition doesn't care what layout the image
+			// was actually in (only its declared initialLayout, which the
+			// vk_force_clear_frames_remaining-selected pass variant sets
+			// correctly). VK_DLSS_CopyOutputTo has no such render pass --
+			// it's a raw vkCmdCopyImage with an explicit barrier that
+			// hardcodes oldLayout=PRESENT_SRC_KHR (see the call below), which
+			// would be a real lie to the driver on a genuinely fresh image.
+			// Skip DLSS for those frames; the EASU+RCAS path already needs to
+			// run through them anyway to establish the image's real layout.
+			if (vk_force_clear_frames_remaining == 0 && !skipTemporalUpdate && VK_DLSS_Active() &&
 				VK_MotionVectorsComposite(commandBuffer, vk_options.frame.imageIndex)) {
 				float dlssInvViewProj[16];
 
