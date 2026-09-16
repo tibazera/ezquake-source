@@ -422,8 +422,25 @@ static VkExtent2D VK_ResolveSceneSize(void)
 	extern cvar_t vid_vulkan_renderscale, vid_vulkan_upscaler;
 	VkExtent2D size = vk_options.swapChain.imageSize;
 	float scale;
+	uint32_t dlssWidth, dlssHeight;
 
 	if (vid_vulkan_upscaler.integer == 0) {
+		return size;
+	}
+
+	// DLSS mode: ask Streamline for its own recommended render resolution
+	// for the configured quality preset (SL_DLSS_MODE_BALANCED, see
+	// VK_DLSS_GetOptimalRenderSize) instead of reusing vid_vulkan_renderscale
+	// -- DLSS's evaluate call tags the scene-size extent it was given
+	// (VK_DLSS_Composite's sceneExtent), so rendering at a size that
+	// doesn't match what DLSS itself asked for is a real input mismatch,
+	// not just a quality suggestion. Falls back to the FSR2-style
+	// renderscale math below when DLSS isn't active/available yet (e.g.
+	// right after vid_restart before slInit has run for this frame).
+	if (vid_vulkan_upscaler.integer == 2 &&
+		VK_DLSS_GetOptimalRenderSize(vk_options.swapChain.imageSize.width, vk_options.swapChain.imageSize.height, &dlssWidth, &dlssHeight)) {
+		size.width = max(1u, dlssWidth);
+		size.height = max(1u, dlssHeight);
 		return size;
 	}
 
