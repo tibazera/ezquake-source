@@ -534,6 +534,7 @@ if(RENDERER_VULKAN)
             ${SOURCE_DIR}/vk_sprite3d.c
             ${SOURCE_DIR}/vk_swapchain.c
             ${SOURCE_DIR}/vk_texture.c
+            ${SOURCE_DIR}/vk_dlss.c
             ${SOURCE_DIR}/vk_upscale.c
             ${SOURCE_DIR}/vk_vao.c
             ${SOURCE_DIR}/vk_window_surface.c
@@ -956,6 +957,21 @@ target_include_directories(ezquake PRIVATE
         ${SOURCE_DIR}/qwprot/src
         ${EZQUAKE_MINIZIP_INCLUDE_DIR}
 )
+
+# NVIDIA Streamline SDK (vk_dlss.c) -- DLLs are copied next to the exe so
+# VK_DLSS_LoadLibrary's relative "external/streamline/bin/sl.interposer.dll"
+# lookup finds them; loaded dynamically at runtime, so the build succeeds
+# and runs fine even without this step, DLSS just stays unavailable
+# (VK_DLSS_Available() false) if the DLLs aren't present.
+if(RENDERER_VULKAN AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/streamline/bin")
+    add_custom_command(TARGET ezquake POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:ezquake>/external/streamline/bin"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${CMAKE_CURRENT_SOURCE_DIR}/external/streamline/bin"
+                "$<TARGET_FILE_DIR:ezquake>/external/streamline/bin"
+        COMMENT "Copying Streamline SDK runtime DLLs"
+    )
+endif()
 
 target_compile_definitions(ezquake PRIVATE
         BUILDSTRING="${CMAKE_SYSTEM_NAME}"

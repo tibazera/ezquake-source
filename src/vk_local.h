@@ -167,6 +167,21 @@ void VK_UpscaleForgetDescriptorSets(void);
 qbool VK_UpscaleUpdateMatrices(VkCommandBuffer commandBuffer);
 void VK_UpscaleUpdateHistory(VkCommandBuffer commandBuffer, uint32_t imageIndex);
 
+// vk_dlss.c -- real NVIDIA DLSS via Streamline SDK, only actually usable on
+// RTX 50-series+ with a current driver. Every entry point fails gracefully
+// when unavailable; see vk_dlss.c's own header comment for the full design.
+qbool VK_DLSS_LoadLibrary(void);
+qbool VK_DLSS_CheckSupport(VkPhysicalDevice physicalDevice);
+qbool VK_DLSS_SetVulkanInfo(VkInstance instance, VkPhysicalDevice physicalDevice, VkDevice device, uint32_t graphicsQueueFamily, uint32_t graphicsQueueIndex);
+qbool VK_DLSS_Available(void);
+qbool VK_DLSS_Active(void);
+qbool VK_DLSS_GetOptimalRenderSize(uint32_t outputWidth, uint32_t outputHeight, uint32_t* renderWidth, uint32_t* renderHeight);
+void VK_DLSS_AdvanceFrame(void);
+qbool VK_DLSS_Composite(VkCommandBuffer commandBuffer, VkImage sceneColorImage, VkImageView sceneColorView, VkImage sceneDepthImage, VkImageView sceneDepthView,
+	VkImage motionVectorsImage, VkImageView motionVectorsView, VkImage outputImage, VkImageView outputView,
+	VkExtent2D sceneSize, VkExtent2D outputSize, const float* invViewProj, const float* prevViewProj, qbool historyValid);
+void VK_DLSS_Shutdown(void);
+
 // vk_blending.c
 void VK_BlendingConfigure(VkPipelineColorBlendStateCreateInfo* info, VkPipelineColorBlendAttachmentState* blending, r_blendfunc_t func);
 

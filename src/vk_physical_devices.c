@@ -724,6 +724,16 @@ qbool VK_CreateLogicalDevice(VkInstance instance)
 
 	VK_LoadPipelineCache();
 
+	// DLSS (Streamline SDK) hookup, best-effort: VK_DLSS_LoadLibrary was
+	// already called earlier (see VK_SelectPhysicalDevice) so this is just
+	// checking adapter support and registering the now-created device.
+	// Both fail gracefully (VK_DLSS_Available()/VK_DLSS_Active() stay
+	// false) on any non-RTX-50 GPU or missing Streamline DLLs -- this is
+	// not a fatal path.
+	if (VK_DLSS_CheckSupport(vk_options.physicalDevice)) {
+		VK_DLSS_SetVulkanInfo(instance, vk_options.physicalDevice, vk_options.logicalDevice, VK_PhysicalDeviceGraphicsQueueFamilyIndex(), 0);
+	}
+
 	return true;
 }
 

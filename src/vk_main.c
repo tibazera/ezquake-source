@@ -768,6 +768,7 @@ void VK_BeginFrame(void)
 	// VK_AdvanceJitter snapshots whatever those still hold from the PREVIOUS
 	// frame as vk_jitter_prevViewProj before that happens.
 	VK_AdvanceJitter();
+	VK_DLSS_AdvanceFrame();
 
 	// Anti-lag / low-latency input marker: as close to the start of the
 	// frame's CPU work as we can get it, before any of the (potentially
@@ -1341,6 +1342,13 @@ qbool VK_Initialise(SDL_Window* window)
 	vk_options.window = window;
 	vk_options.clearColor[3] = 1.0f;
 
+	// Load sl.interposer.dll and call slInit as early as possible, per
+	// Streamline's own docs -- before any Vulkan instance/device exists.
+	// Best-effort: fails silently (VK_DLSS_Available() stays false) on any
+	// system without the DLLs or a supported driver, this is never fatal
+	// to Vulkan init.
+	VK_DLSS_LoadLibrary();
+
 	if (!VK_CreateInstance(window, &vk_options.instance)) {
 		return false;
 	}
@@ -1435,6 +1443,12 @@ void VK_Shutdown(r_shutdown_mode_t mode)
 		if (vk_options.logicalDevice != VK_NULL_HANDLE) {
 			vkDeviceWaitIdle(vk_options.logicalDevice);
 		}
+
+		// Per Streamline's docs: slShutdown must run before destroying the
+		// vk instance/device below. Also fine to call unconditionally --
+		// VK_DLSS_Shutdown no-ops if VK_DLSS_LoadLibrary was never called
+		// or never succeeded.
+		VK_DLSS_Shutdown();
 
 		VK_HudResourcesShutdown();
 		VK_WorldResourcesShutdown();
