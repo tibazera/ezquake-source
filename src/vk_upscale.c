@@ -67,6 +67,30 @@ extern const unsigned char vk_post_process_vert_spv[];
 extern const unsigned int vk_post_process_vert_spv_len;
 extern const unsigned char vk_upscale_frag_spv[];
 extern const unsigned int vk_upscale_frag_spv_len;
+extern const unsigned char vk_motion_vectors_frag_spv[];
+extern const unsigned int vk_motion_vectors_frag_spv_len;
+
+// Motion-vector pass state, only actually built when VK_DLSS_Active() first
+// needs it -- separate pipeline/layout/descriptor-set-layout from the
+// EASU+RCAS/history ones above since vk_motion_vectors.frag's bindings
+// (depth at 0, matrices UBO at 1) don't match vk_upscale.frag's 4-binding
+// layout (color/depth/history/matrices at 0-3).
+typedef struct vk_motion_vectors_push_s {
+	int reversedDepth;
+} vk_motion_vectors_push_t;
+
+static VkDescriptorSetLayout motionVectorsDescriptorSetLayout = VK_NULL_HANDLE;
+static VkPipelineLayout motionVectorsPipelineLayout = VK_NULL_HANDLE;
+static VkPipeline motionVectorsPipeline = VK_NULL_HANDLE;
+static VkRenderPass motionVectorsRenderPass = VK_NULL_HANDLE;
+static VkDescriptorSet* motionVectorsDescriptorSets = NULL;
+static uint32_t motionVectorsDescriptorSetCount = 0;
+static VkImage motionVectorsImage = VK_NULL_HANDLE;
+static VkDeviceMemory motionVectorsImageMemory = VK_NULL_HANDLE;
+static VkImageView motionVectorsImageView = VK_NULL_HANDLE;
+static VkFramebuffer motionVectorsFramebuffer = VK_NULL_HANDLE;
+static VkExtent2D motionVectorsImageSize;
+static void VK_MotionVectorsDestroyResources(void);
 
 static VkSampler upscaleSampler = VK_NULL_HANDLE;
 // Depth needs its own sampler (VK_FILTER_NEAREST -- bilinear-filtering a
@@ -557,7 +581,7 @@ static qbool VK_UpscaleEnsureHistoryBuffer(void)
 	return true;
 }
 
-static VkImageMemoryBarrier VK_UpscaleMakeImageBarrier(VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout, VkAccessFlags srcAccess, VkAccessFlags dstAccess)
+VkImageMemoryBarrier VK_UpscaleMakeImageBarrier(VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout, VkAccessFlags srcAccess, VkAccessFlags dstAccess)
 {
 	VkImageMemoryBarrier barrier;
 
@@ -719,9 +743,33 @@ void VK_DestroyUpscaleResources(void)
 		vkDestroySampler(vk_options.logicalDevice, upscaleDepthSampler, NULL);
 		upscaleDepthSampler = VK_NULL_HANDLE;
 	}
+
+	VK_MotionVectorsDestroyResources();
+	if (motionVectorsPipeline != VK_NULL_HANDLE) {
+		vkDestroyPipeline(vk_options.logicalDevice, motionVectorsPipeline, NULL);
+		motionVectorsPipeline = VK_NULL_HANDLE;
+	}
+	if (motionVectorsPipelineLayout != VK_NULL_HANDLE) {
+		vkDestroyPipelineLayout(vk_options.logicalDevice, motionVectorsPipelineLayout, NULL);
+		motionVectorsPipelineLayout = VK_NULL_HANDLE;
+	}
+	if (motionVectorsDescriptorSetLayout != VK_NULL_HANDLE) {
+		vkDestroyDescriptorSetLayout(vk_options.logicalDevice, motionVectorsDescriptorSetLayout, NULL);
+		motionVectorsDescriptorSetLayout = VK_NULL_HANDLE;
+	}
+	if (motionVectorsRenderPass != VK_NULL_HANDLE) {
+		vkDestroyRenderPass(vk_options.logicalDevice, motionVectorsRenderPass, NULL);
+		motionVectorsRenderPass = VK_NULL_HANDLE;
+	}
+	Q_free(motionVectorsDescriptorSets);
+	motionVectorsDescriptorSets = NULL;
+	motionVectorsDescriptorSetCount = 0;
+
 	// Descriptor sets themselves are freed when postProcessDescriptorPool is
 	// destroyed (VK_DestroyPostProcessDescriptors calls VK_UpscaleForgetDescriptorSets
 	// for the host-side tracking array); nothing else to do with them here.
+	// motionVectorsDescriptorSets above is allocated from that same pool
+	// too (see VK_MotionVectorsDescriptorSet), same reasoning.
 	VK_UpscaleForgetDescriptorSets();
 }
 
@@ -774,7 +822,13 @@ qbool VK_UpscaleUpdateMatrices(VkCommandBuffer commandBuffer)
 
 	vk_upscale_matricesUpdatedThisFrame = false;
 
-	if (!VK_TemporalUpscaleActive() || matricesBuffers[historyIndex] == VK_NULL_HANDLE) {
+	// Also runs for DLSS (VK_DLSS_Active()), not just this project's own
+	// FSR2-style temporal path (VK_TemporalUpscaleActive()) -- DLSS
+	// maintains its own internal history/reset state via
+	// sl::Constants::reset (see vk_dlss.c's VK_DLSS_Composite), it doesn't
+	// depend on this file's historyValid/historyValidFrameCount at all, so
+	// it needs these matrices from frame 1, not frame 3+.
+	if ((!VK_TemporalUpscaleActive() && !VK_DLSS_Active()) || matricesBuffers[historyIndex] == VK_NULL_HANDLE) {
 		return false;
 	}
 	if (!VK_CurrentInvViewProjMatrix(matrices.invViewProj)) {
@@ -893,3 +947,431 @@ void VK_UpscaleComposite(VkCommandBuffer commandBuffer, uint32_t imageIndex)
 	vkCmdPushConstants(commandBuffer, upscalePipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
 	vkCmdDraw(commandBuffer, 3, 1, 0, 0);
 }
+
+// ---- DLSS motion-vector buffer (vk_dlss.c's VK_DLSS_Composite input) --
+
+static void VK_MotionVectorsDestroyResources(void)
+{
+	if (motionVectorsFramebuffer != VK_NULL_HANDLE) {
+		vkDestroyFramebuffer(vk_options.logicalDevice, motionVectorsFramebuffer, NULL);
+		motionVectorsFramebuffer = VK_NULL_HANDLE;
+	}
+	if (motionVectorsImageView != VK_NULL_HANDLE) {
+		vkDestroyImageView(vk_options.logicalDevice, motionVectorsImageView, NULL);
+		motionVectorsImageView = VK_NULL_HANDLE;
+	}
+	if (motionVectorsImage != VK_NULL_HANDLE) {
+		vkDestroyImage(vk_options.logicalDevice, motionVectorsImage, NULL);
+		motionVectorsImage = VK_NULL_HANDLE;
+	}
+	if (motionVectorsImageMemory != VK_NULL_HANDLE) {
+		vkFreeMemory(vk_options.logicalDevice, motionVectorsImageMemory, NULL);
+		motionVectorsImageMemory = VK_NULL_HANDLE;
+	}
+	motionVectorsImageSize.width = motionVectorsImageSize.height = 0;
+}
+
+static qbool VK_MotionVectorsRenderPassCreate(void)
+{
+	VkAttachmentDescription colorAttachment;
+	VkAttachmentReference colorAttachmentRef;
+	VkSubpassDescription subpass;
+	VkSubpassDependency dependency;
+	VkRenderPassCreateInfo renderPassInfo;
+
+	if (motionVectorsRenderPass != VK_NULL_HANDLE) {
+		return true;
+	}
+
+	// R16G16_SFLOAT: two-component signed float, plenty of range/precision
+	// for a UV-space delta that's normally well inside [-1,1] (see
+	// sl::Constants::mvecScale in vk_dlss.c, which tells DLSS these values
+	// are in pixel space, scaled by 1/sceneSize -- so this format just
+	// needs to hold small pixel-offset magnitudes accurately, which it
+	// does far more precisely than needed).
+	VK_InitialiseStructure(colorAttachment);
+	colorAttachment.format = VK_FORMAT_R16G16_SFLOAT;
+	colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+	colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+	colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	// SHADER_READ_ONLY_OPTIMAL directly: VK_DLSS_Composite tags and reads
+	// this image via slSetTagForFrame/slEvaluateFeature right after this
+	// pass ends, no separate transition needed the way the swapchain image
+	// needs PRESENT_SRC_KHR for the WSI.
+	colorAttachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+	VK_InitialiseStructure(colorAttachmentRef);
+	colorAttachmentRef.attachment = 0;
+	colorAttachmentRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+	VK_InitialiseStructure(subpass);
+	subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+	subpass.colorAttachmentCount = 1;
+	subpass.pColorAttachments = &colorAttachmentRef;
+
+	VK_InitialiseStructure(dependency);
+	dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+	dependency.dstSubpass = 0;
+	dependency.srcStageMask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+	dependency.srcAccessMask = 0;
+	dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+	VK_InitialiseStructure(renderPassInfo);
+	renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+	renderPassInfo.attachmentCount = 1;
+	renderPassInfo.pAttachments = &colorAttachment;
+	renderPassInfo.subpassCount = 1;
+	renderPassInfo.pSubpasses = &subpass;
+	renderPassInfo.dependencyCount = 1;
+	renderPassInfo.pDependencies = &dependency;
+
+	return vkCreateRenderPass(vk_options.logicalDevice, &renderPassInfo, NULL, &motionVectorsRenderPass) == VK_SUCCESS;
+}
+
+static qbool VK_MotionVectorsEnsureImage(void)
+{
+	VkImageViewCreateInfo viewInfo;
+	VkFramebufferCreateInfo framebufferInfo;
+
+	if (motionVectorsImage != VK_NULL_HANDLE &&
+		motionVectorsImageSize.width == vk_options.swapChain.sceneSize.width &&
+		motionVectorsImageSize.height == vk_options.swapChain.sceneSize.height) {
+		return true;
+	}
+
+	VK_MotionVectorsDestroyResources();
+
+	if (!VK_MotionVectorsRenderPassCreate()) {
+		return false;
+	}
+
+	if (!VK_CreateImageResource(
+			vk_options.swapChain.sceneSize.width,
+			vk_options.swapChain.sceneSize.height,
+			1,
+			VK_SAMPLE_COUNT_1_BIT,
+			VK_FORMAT_R16G16_SFLOAT,
+			VK_IMAGE_TILING_OPTIMAL,
+			VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+			VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+			&motionVectorsImage,
+			&motionVectorsImageMemory)) {
+		return false;
+	}
+
+	VK_InitialiseStructure(viewInfo);
+	viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+	viewInfo.image = motionVectorsImage;
+	viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+	viewInfo.format = VK_FORMAT_R16G16_SFLOAT;
+	viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	viewInfo.subresourceRange.levelCount = 1;
+	viewInfo.subresourceRange.layerCount = 1;
+
+	if (vkCreateImageView(vk_options.logicalDevice, &viewInfo, NULL, &motionVectorsImageView) != VK_SUCCESS) {
+		VK_MotionVectorsDestroyResources();
+		return false;
+	}
+
+	VK_InitialiseStructure(framebufferInfo);
+	framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+	framebufferInfo.renderPass = motionVectorsRenderPass;
+	framebufferInfo.attachmentCount = 1;
+	framebufferInfo.pAttachments = &motionVectorsImageView;
+	framebufferInfo.width = vk_options.swapChain.sceneSize.width;
+	framebufferInfo.height = vk_options.swapChain.sceneSize.height;
+	framebufferInfo.layers = 1;
+
+	if (vkCreateFramebuffer(vk_options.logicalDevice, &framebufferInfo, NULL, &motionVectorsFramebuffer) != VK_SUCCESS) {
+		VK_MotionVectorsDestroyResources();
+		return false;
+	}
+
+	motionVectorsImageSize = vk_options.swapChain.sceneSize;
+	return true;
+}
+
+static qbool VK_MotionVectorsCreatePipeline(void)
+{
+	VkShaderModule vertShaderModule;
+	VkShaderModule fragShaderModule;
+	VkPipelineShaderStageCreateInfo shaderStages[2];
+	VkPipelineVertexInputStateCreateInfo vertexInputInfo;
+	VkPipelineInputAssemblyStateCreateInfo inputAssembly;
+	VkPipelineViewportStateCreateInfo viewportState;
+	VkPipelineRasterizationStateCreateInfo rasterizer;
+	VkPipelineMultisampleStateCreateInfo multisampling;
+	VkPipelineDepthStencilStateCreateInfo depthStencil;
+	VkPipelineColorBlendStateCreateInfo colorBlending;
+	VkPipelineColorBlendAttachmentState blending;
+	VkPipelineDynamicStateCreateInfo dynamicState;
+	VkDynamicState dynamicStates[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+	VkPushConstantRange pushConstantRange;
+	VkPipelineLayoutCreateInfo pipelineLayoutInfo;
+	VkGraphicsPipelineCreateInfo pipelineInfo;
+	VkDescriptorSetLayoutBinding bindings[2];
+	VkDescriptorSetLayoutCreateInfo layoutInfo;
+
+	if (motionVectorsPipeline != VK_NULL_HANDLE) {
+		return true;
+	}
+	if (!VK_MotionVectorsRenderPassCreate()) {
+		return false;
+	}
+
+	if (motionVectorsDescriptorSetLayout == VK_NULL_HANDLE) {
+		VK_InitialiseStructure(bindings[0]);
+		bindings[0].binding = 0;
+		bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+		bindings[0].descriptorCount = 1;
+		bindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+		VK_InitialiseStructure(bindings[1]);
+		bindings[1].binding = 1;
+		bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+		bindings[1].descriptorCount = 1;
+		bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+		VK_InitialiseStructure(layoutInfo);
+		layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+		layoutInfo.bindingCount = 2;
+		layoutInfo.pBindings = bindings;
+		if (vkCreateDescriptorSetLayout(vk_options.logicalDevice, &layoutInfo, NULL, &motionVectorsDescriptorSetLayout) != VK_SUCCESS) {
+			return false;
+		}
+	}
+
+	vertShaderModule = VK_HudCreateShaderModule(vk_post_process_vert_spv, vk_post_process_vert_spv_len);
+	fragShaderModule = VK_HudCreateShaderModule(vk_motion_vectors_frag_spv, vk_motion_vectors_frag_spv_len);
+	if (vertShaderModule == VK_NULL_HANDLE || fragShaderModule == VK_NULL_HANDLE) {
+		if (vertShaderModule != VK_NULL_HANDLE) {
+			vkDestroyShaderModule(vk_options.logicalDevice, vertShaderModule, NULL);
+		}
+		if (fragShaderModule != VK_NULL_HANDLE) {
+			vkDestroyShaderModule(vk_options.logicalDevice, fragShaderModule, NULL);
+		}
+		return false;
+	}
+
+	VK_InitialiseStructure(shaderStages[0]);
+	shaderStages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	shaderStages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+	shaderStages[0].module = vertShaderModule;
+	shaderStages[0].pName = "main";
+
+	VK_InitialiseStructure(shaderStages[1]);
+	shaderStages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+	shaderStages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+	shaderStages[1].module = fragShaderModule;
+	shaderStages[1].pName = "main";
+
+	VK_InitialiseStructure(vertexInputInfo);
+	vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+	VK_InitialiseStructure(inputAssembly);
+	inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+	inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+	VK_InitialiseStructure(viewportState);
+	viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+	viewportState.viewportCount = 1;
+	viewportState.scissorCount = 1;
+
+	VK_InitialiseStructure(rasterizer);
+	rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+	rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+	rasterizer.lineWidth = 1.0f;
+	rasterizer.cullMode = VK_CULL_MODE_NONE;
+	rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
+
+	VK_InitialiseStructure(multisampling);
+	multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+	multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+	VK_InitialiseStructure(depthStencil);
+	depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+	depthStencil.depthTestEnable = VK_FALSE;
+	depthStencil.depthWriteEnable = VK_FALSE;
+
+	VK_BlendingConfigure(&colorBlending, &blending, r_blendfunc_overwrite);
+
+	VK_InitialiseStructure(dynamicState);
+	dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+	dynamicState.dynamicStateCount = sizeof(dynamicStates) / sizeof(dynamicStates[0]);
+	dynamicState.pDynamicStates = dynamicStates;
+
+	if (motionVectorsPipelineLayout == VK_NULL_HANDLE) {
+		VK_InitialiseStructure(pushConstantRange);
+		pushConstantRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+		pushConstantRange.offset = 0;
+		pushConstantRange.size = sizeof(vk_motion_vectors_push_t);
+
+		VK_InitialiseStructure(pipelineLayoutInfo);
+		pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+		pipelineLayoutInfo.setLayoutCount = 1;
+		pipelineLayoutInfo.pSetLayouts = &motionVectorsDescriptorSetLayout;
+		pipelineLayoutInfo.pushConstantRangeCount = 1;
+		pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
+		if (vkCreatePipelineLayout(vk_options.logicalDevice, &pipelineLayoutInfo, NULL, &motionVectorsPipelineLayout) != VK_SUCCESS) {
+			vkDestroyShaderModule(vk_options.logicalDevice, fragShaderModule, NULL);
+			vkDestroyShaderModule(vk_options.logicalDevice, vertShaderModule, NULL);
+			return false;
+		}
+	}
+
+	VK_InitialiseStructure(pipelineInfo);
+	pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+	pipelineInfo.stageCount = 2;
+	pipelineInfo.pStages = shaderStages;
+	pipelineInfo.pVertexInputState = &vertexInputInfo;
+	pipelineInfo.pInputAssemblyState = &inputAssembly;
+	pipelineInfo.pViewportState = &viewportState;
+	pipelineInfo.pRasterizationState = &rasterizer;
+	pipelineInfo.pMultisampleState = &multisampling;
+	pipelineInfo.pDepthStencilState = &depthStencil;
+	pipelineInfo.pColorBlendState = &colorBlending;
+	pipelineInfo.pDynamicState = &dynamicState;
+	pipelineInfo.layout = motionVectorsPipelineLayout;
+	pipelineInfo.renderPass = motionVectorsRenderPass;
+	pipelineInfo.subpass = 0;
+
+	if (vkCreateGraphicsPipelines(vk_options.logicalDevice, vk_options.pipelineCache, 1, &pipelineInfo, NULL, &motionVectorsPipeline) != VK_SUCCESS) {
+		motionVectorsPipeline = VK_NULL_HANDLE;
+	}
+
+	vkDestroyShaderModule(vk_options.logicalDevice, fragShaderModule, NULL);
+	vkDestroyShaderModule(vk_options.logicalDevice, vertShaderModule, NULL);
+	return motionVectorsPipeline != VK_NULL_HANDLE;
+}
+
+static VkDescriptorSet VK_MotionVectorsDescriptorSet(uint32_t imageIndex)
+{
+	VkDescriptorSet set;
+	VkDescriptorSetAllocateInfo allocInfo;
+	VkDescriptorImageInfo depthImageInfo;
+	VkDescriptorBufferInfo bufferInfo;
+	VkWriteDescriptorSet writes[2];
+
+	if (imageIndex >= vk_options.swapChain.imageCount || vk_options.swapChain.sceneDepthImageView == VK_NULL_HANDLE || matricesBuffers[historyIndex] == VK_NULL_HANDLE) {
+		return VK_NULL_HANDLE;
+	}
+
+	if (motionVectorsDescriptorSetCount != vk_options.swapChain.imageCount) {
+		Q_free(motionVectorsDescriptorSets);
+		motionVectorsDescriptorSets = (VkDescriptorSet*)Q_calloc(vk_options.swapChain.imageCount, sizeof(VkDescriptorSet));
+		motionVectorsDescriptorSetCount = vk_options.swapChain.imageCount;
+	}
+
+	set = motionVectorsDescriptorSets[imageIndex];
+	if (set == VK_NULL_HANDLE) {
+		VK_InitialiseStructure(allocInfo);
+		allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+		allocInfo.descriptorPool = vk_options.swapChain.postProcessDescriptorPool;
+		allocInfo.descriptorSetCount = 1;
+		allocInfo.pSetLayouts = &motionVectorsDescriptorSetLayout;
+		if (vkAllocateDescriptorSets(vk_options.logicalDevice, &allocInfo, &set) != VK_SUCCESS) {
+			return VK_NULL_HANDLE;
+		}
+		motionVectorsDescriptorSets[imageIndex] = set;
+	}
+
+	VK_InitialiseStructure(depthImageInfo);
+	depthImageInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+	depthImageInfo.imageView = vk_options.swapChain.sceneDepthImageView;
+	depthImageInfo.sampler = upscaleDepthSampler;
+
+	VK_InitialiseStructure(bufferInfo);
+	bufferInfo.buffer = matricesBuffers[historyIndex];
+	bufferInfo.offset = 0;
+	bufferInfo.range = sizeof(vk_upscale_matrices_t);
+
+	VK_InitialiseStructure(writes[0]);
+	writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	writes[0].dstSet = set;
+	writes[0].dstBinding = 0;
+	writes[0].descriptorCount = 1;
+	writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	writes[0].pImageInfo = &depthImageInfo;
+
+	VK_InitialiseStructure(writes[1]);
+	writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	writes[1].dstSet = set;
+	writes[1].dstBinding = 1;
+	writes[1].descriptorCount = 1;
+	writes[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+	writes[1].pBufferInfo = &bufferInfo;
+
+	vkUpdateDescriptorSets(vk_options.logicalDevice, 2, writes, 0, NULL);
+	return set;
+}
+
+// Renders this frame's motion vectors into motionVectorsImage (sceneSize,
+// R16G16_SFLOAT) -- must run in its own render pass instance, so like
+// VK_UpscaleUpdateMatrices/VK_UpscaleUpdateHistory this has to be called
+// from vk_main.c's VK_EndWorldPassAndComposite (outside the composite
+// render pass), BEFORE VK_DLSS_Composite tags and reads this image. Uses
+// matricesBuffers[historyIndex] -- the SAME slot VK_UpscaleUpdateMatrices
+// just wrote this frame (see VK_UpscaleDescriptorSet's comment on why that
+// slot, not 1-historyIndex, holds this frame's matrices) -- so this must be
+// called AFTER VK_UpscaleUpdateMatrices in the same frame, never before.
+qbool VK_MotionVectorsComposite(VkCommandBuffer commandBuffer, uint32_t imageIndex)
+{
+	VkRenderPassBeginInfo renderPassInfo;
+	VkDescriptorSet descriptorSet;
+	vk_motion_vectors_push_t push;
+
+	if (!VK_DLSS_Active()) {
+		return false;
+	}
+	if (!VK_MotionVectorsCreatePipeline() || !VK_MotionVectorsEnsureImage()) {
+		return false;
+	}
+
+	descriptorSet = VK_MotionVectorsDescriptorSet(imageIndex);
+	if (descriptorSet == VK_NULL_HANDLE) {
+		return false;
+	}
+
+	VK_InitialiseStructure(renderPassInfo);
+	renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+	renderPassInfo.renderPass = motionVectorsRenderPass;
+	renderPassInfo.framebuffer = motionVectorsFramebuffer;
+	renderPassInfo.renderArea.offset.x = 0;
+	renderPassInfo.renderArea.offset.y = 0;
+	renderPassInfo.renderArea.extent = motionVectorsImageSize;
+
+	vkCmdBeginRenderPass(commandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+	push.reversedDepth = glConfig.reversed_depth ? 1 : 0;
+
+	{
+		VkViewport viewport;
+		VkRect2D scissor;
+		VK_InitialiseStructure(viewport);
+		viewport.width = (float)motionVectorsImageSize.width;
+		viewport.height = (float)motionVectorsImageSize.height;
+		viewport.minDepth = 0.0f;
+		viewport.maxDepth = 1.0f;
+		VK_InitialiseStructure(scissor);
+		scissor.extent = motionVectorsImageSize;
+		vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+		vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+	}
+
+	vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, motionVectorsPipeline);
+	vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, motionVectorsPipelineLayout, 0, 1, &descriptorSet, 0, NULL);
+	vkCmdPushConstants(commandBuffer, motionVectorsPipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), &push);
+	vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+
+	vkCmdEndRenderPass(commandBuffer);
+
+	return true;
+}
+
+VkImage VK_MotionVectorsImage(void) { return motionVectorsImage; }
+VkImageView VK_MotionVectorsImageView(void) { return motionVectorsImageView; }
+VkExtent2D VK_MotionVectorsImageSize(void) { return motionVectorsImageSize; }

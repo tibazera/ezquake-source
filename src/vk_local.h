@@ -167,6 +167,19 @@ void VK_UpscaleForgetDescriptorSets(void);
 qbool VK_UpscaleUpdateMatrices(VkCommandBuffer commandBuffer);
 void VK_UpscaleUpdateHistory(VkCommandBuffer commandBuffer, uint32_t imageIndex);
 
+// Populates the DLSS motion-vector buffer -- must run after
+// VK_UpscaleUpdateMatrices (uses the same matricesBuffers[historyIndex]
+// slot it just wrote) and before VK_DLSS_Composite tags/reads it, all
+// outside any other render pass instance (this opens/closes its own). See
+// vk_upscale.c's own comment on the exact call-order requirement.
+qbool VK_MotionVectorsComposite(VkCommandBuffer commandBuffer, uint32_t imageIndex);
+VkImage VK_MotionVectorsImage(void);
+VkImageView VK_MotionVectorsImageView(void);
+VkExtent2D VK_MotionVectorsImageSize(void);
+// Shared image-barrier helper, used by both vk_upscale.c's own history
+// copy and vk_dlss.c's VK_DLSS_CopyOutputTo.
+VkImageMemoryBarrier VK_UpscaleMakeImageBarrier(VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout, VkAccessFlags srcAccess, VkAccessFlags dstAccess);
+
 // vk_dlss.c -- real NVIDIA DLSS via Streamline SDK, only actually usable on
 // RTX 50-series+ with a current driver. Every entry point fails gracefully
 // when unavailable; see vk_dlss.c's own header comment for the full design.
@@ -178,8 +191,15 @@ qbool VK_DLSS_Active(void);
 qbool VK_DLSS_GetOptimalRenderSize(uint32_t outputWidth, uint32_t outputHeight, uint32_t* renderWidth, uint32_t* renderHeight);
 void VK_DLSS_AdvanceFrame(void);
 qbool VK_DLSS_Composite(VkCommandBuffer commandBuffer, VkImage sceneColorImage, VkImageView sceneColorView, VkImage sceneDepthImage, VkImageView sceneDepthView,
-	VkImage motionVectorsImage, VkImageView motionVectorsView, VkImage outputImage, VkImageView outputView,
-	VkExtent2D sceneSize, VkExtent2D outputSize, const float* invViewProj, const float* prevViewProj, qbool historyValid);
+	VkImage motionVectorsImage, VkImageView motionVectorsView,
+	VkExtent2D sceneSize, VkExtent2D outputSize, const float* invViewProj, const float* prevViewProj);
+// Copies DLSS's internal output image into dstImage (typically the
+// composite pass's framebuffer target) -- call right after
+// VK_DLSS_Composite returns true. dstImageLayoutBeforeCopy/AfterCopy let
+// the caller specify what layout dstImage is actually in (this project's
+// swapchain image is PRESENT_SRC_KHR going in, same convention as
+// VK_PostProcessTransitionForSampling elsewhere).
+qbool VK_DLSS_CopyOutputTo(VkCommandBuffer commandBuffer, VkImage dstImage, VkImageLayout dstImageLayoutBeforeCopy, VkImageLayout dstImageLayoutAfterCopy);
 void VK_DLSS_Shutdown(void);
 
 // vk_blending.c

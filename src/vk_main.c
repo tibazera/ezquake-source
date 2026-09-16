@@ -983,36 +983,71 @@ void VK_EndWorldPassAndComposite(void)
 
 		if (compositeFramebuffer != VK_NULL_HANDLE) {
 			VkRenderPassBeginInfo compositePassInfo = { 0 };
+			qbool dlssHandledThisFrame = false;
 
 			VK_PostProcessTransitionForSampling(commandBuffer, vk_options.frame.imageIndex);
 			// Must run before vkCmdBeginRenderPass below -- vkCmdUpdateBuffer
 			// (what this does) can't be called inside a render pass instance.
-			// No-op when temporal upscaling isn't applicable this frame (see
-			// VK_TemporalUpscaleActive's gating conditions) or this is a
-			// later multiview pane (skipTemporalUpdate).
+			// No-op when neither this project's own temporal path nor DLSS
+			// is applicable this frame (see VK_TemporalUpscaleActive/
+			// VK_DLSS_Active's gating conditions) or this is a later
+			// multiview pane (skipTemporalUpdate).
 			if (!skipTemporalUpdate) {
 				VK_UpscaleUpdateMatrices(commandBuffer);
 			}
 
-			compositePassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-			compositePassInfo.renderPass = VK_PostProcessRenderPass();
-			compositePassInfo.framebuffer = compositeFramebuffer;
-			compositePassInfo.renderArea.offset.x = 0;
-			compositePassInfo.renderArea.offset.y = 0;
-			compositePassInfo.renderArea.extent = vk_options.swapChain.imageSize;
+			// DLSS path: entirely outside the composite render pass below
+			// (slEvaluateFeature is a compute dispatch, can't run inside
+			// one) -- populate the motion-vector buffer, evaluate DLSS into
+			// its own output image, then copy that into the swapchain
+			// image the composite render pass would otherwise have
+			// written. Falls through to the normal EASU+RCAS render-pass
+			// path below if any step fails (DLSS unavailable this frame,
+			// e.g. right after vid_restart before its resources exist).
+			if (!skipTemporalUpdate && VK_DLSS_Active() &&
+				VK_MotionVectorsComposite(commandBuffer, vk_options.frame.imageIndex)) {
+				float dlssInvViewProj[16];
 
-			vkCmdBeginRenderPass(commandBuffer, &compositePassInfo, VK_SUBPASS_CONTENTS_INLINE);
-			VK_PostProcessComposite(commandBuffer, vk_options.frame.imageIndex);
-			vkCmdEndRenderPass(commandBuffer);
+				if (VK_CurrentInvViewProjMatrix(dlssInvViewProj) && VK_PrevViewProjMatrix() != NULL) {
+					if (VK_DLSS_Composite(commandBuffer,
+							vk_options.swapChain.postProcessColorImages[vk_options.frame.imageIndex],
+							vk_options.swapChain.postProcessColorImageViews[vk_options.frame.imageIndex],
+							vk_options.swapChain.sceneDepthImage, vk_options.swapChain.sceneDepthImageView,
+							VK_MotionVectorsImage(), VK_MotionVectorsImageView(),
+							VK_SceneRenderExtent(), vk_options.swapChain.imageSize,
+							dlssInvViewProj, VK_PrevViewProjMatrix())) {
+						// Swapchain image is PRESENT_SRC_KHR going in (its
+						// layout at the top of every real frame -- same
+						// assumption VK_PostProcessTransitionForSampling
+						// above already makes about it) and must be left
+						// there afterwards for the HUD pass/present to work.
+						dlssHandledThisFrame = VK_DLSS_CopyOutputTo(commandBuffer, vk_options.swapChain.images[vk_options.frame.imageIndex],
+							VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+					}
+				}
+			}
 
-			// Must run after vkCmdEndRenderPass above (vkCmdCopyImage, same
-			// restriction as vkCmdUpdateBuffer) and before the HUD pass
-			// begins below -- copies this frame's just-finished composite
-			// output into the history buffer for next frame's temporal
-			// resolve. No-op when the upscaler isn't active or this is a
-			// later multiview pane (skipTemporalUpdate).
-			if (!skipTemporalUpdate) {
-				VK_UpscaleUpdateHistory(commandBuffer, vk_options.frame.imageIndex);
+			if (!dlssHandledThisFrame) {
+				compositePassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+				compositePassInfo.renderPass = VK_PostProcessRenderPass();
+				compositePassInfo.framebuffer = compositeFramebuffer;
+				compositePassInfo.renderArea.offset.x = 0;
+				compositePassInfo.renderArea.offset.y = 0;
+				compositePassInfo.renderArea.extent = vk_options.swapChain.imageSize;
+
+				vkCmdBeginRenderPass(commandBuffer, &compositePassInfo, VK_SUBPASS_CONTENTS_INLINE);
+				VK_PostProcessComposite(commandBuffer, vk_options.frame.imageIndex);
+				vkCmdEndRenderPass(commandBuffer);
+
+				// Must run after vkCmdEndRenderPass above (vkCmdCopyImage,
+				// same restriction as vkCmdUpdateBuffer) and before the HUD
+				// pass begins below -- copies this frame's just-finished
+				// composite output into the history buffer for next
+				// frame's temporal resolve. No-op when the upscaler isn't
+				// active or this is a later multiview pane.
+				if (!skipTemporalUpdate) {
+					VK_UpscaleUpdateHistory(commandBuffer, vk_options.frame.imageIndex);
+				}
 			}
 		}
 	}

@@ -440,7 +440,6 @@ qbool VK_CreatePostProcessResources(void)
 	VkRenderPass mainRenderPass = VK_MainRenderPass();
 	VkRenderPass compositeRenderPass = VK_PostProcessRenderPass();
 	VkRenderPass hudRenderPass = VK_HudRenderPass();
-	VkDescriptorPoolSize poolSize;
 	VkDescriptorPoolCreateInfo poolInfo;
 
 	VK_DestroyPostProcessResources();
@@ -569,22 +568,36 @@ qbool VK_CreatePostProcessResources(void)
 		}
 	}
 
-	// x2: one combined-image-sampler set per swapchain image for the plain
-	// post-process composite (postProcessDescriptorSets), plus one more per
-	// image for the upscale composite (vk_upscale.c's own descriptor sets,
-	// allocated from this same pool) -- both read the same postProcessColor
-	// image but bind through different pipeline layouts, so they need
-	// distinct descriptor sets even though only one of the two is ever
-	// actually drawn with per frame.
-	VK_InitialiseStructure(poolSize);
-	poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-	poolSize.descriptorCount = vk_options.swapChain.imageCount * 2;
+	// Descriptor pool shared by: postProcessDescriptorSets (1 combined-image-sampler
+	// set per swapchain image), vk_upscale.c's own upscale composite sets
+	// (1 set per image, but each with 3 combined-image-samplers [color/depth/
+	// history] + 1 uniform buffer [reprojection matrices]), and its motion-vectors
+	// sets for DLSS (1 set per image, 1 combined-image-sampler [depth] + 1
+	// uniform buffer [same matrices]). All read/write the same underlying
+	// resources through different pipeline layouts, so each needs its own
+	// descriptor set even though at most two of these three actually draw
+	// with per frame (spatial/temporal upscale XOR DLSS, never both).
+	//
+	// Per-image totals: combined-image-samplers = 1 (postprocess) + 3 (upscale)
+	// + 1 (motion vectors) = 5; uniform buffers = 1 (upscale) + 1 (motion
+	// vectors) = 2; sets = 1 + 1 + 1 = 3.
+	{
+		VkDescriptorPoolSize poolSizes[2];
 
-	VK_InitialiseStructure(poolInfo);
-	poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-	poolInfo.poolSizeCount = 1;
-	poolInfo.pPoolSizes = &poolSize;
-	poolInfo.maxSets = vk_options.swapChain.imageCount * 2;
+		VK_InitialiseStructure(poolSizes[0]);
+		poolSizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+		poolSizes[0].descriptorCount = vk_options.swapChain.imageCount * 5;
+
+		VK_InitialiseStructure(poolSizes[1]);
+		poolSizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+		poolSizes[1].descriptorCount = vk_options.swapChain.imageCount * 2;
+
+		VK_InitialiseStructure(poolInfo);
+		poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+		poolInfo.poolSizeCount = 2;
+		poolInfo.pPoolSizes = poolSizes;
+		poolInfo.maxSets = vk_options.swapChain.imageCount * 3;
+	}
 
 	if (vkCreateDescriptorPool(vk_options.logicalDevice, &poolInfo, NULL, &vk_options.swapChain.postProcessDescriptorPool) != VK_SUCCESS) {
 		VK_DestroyPostProcessResources();

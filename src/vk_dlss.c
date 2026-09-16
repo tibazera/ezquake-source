@@ -80,6 +80,18 @@ static qbool vk_dlss_supported;       // slIsFeatureSupported succeeded for this
 static qbool vk_dlss_initialized;     // slInit succeeded, device registered
 static uint32_t vk_dlss_frameIndex;
 static sl_viewport_handle_t vk_dlss_viewport;
+static qbool vk_dlss_historyValid;    // false for the first frame DLSS is active since vid_restart, mirrors vk_upscale.c's historyValid pattern
+
+// DLSS's own output target: DLSS writes via compute/UAV (VK_IMAGE_LAYOUT_GENERAL),
+// which a graphics-pipeline render-pass attachment can't be -- so this is a
+// separate image from postProcessColorImages/the swapchain, copied into the
+// real composite target by VK_DLSS_CopyOutputTo after slEvaluateFeature
+// returns. Sized at native (imageSize) resolution, same as historyImages in
+// vk_upscale.c.
+static VkImage vk_dlss_outputImage = VK_NULL_HANDLE;
+static VkDeviceMemory vk_dlss_outputImageMemory = VK_NULL_HANDLE;
+static VkImageView vk_dlss_outputImageView = VK_NULL_HANDLE;
+static VkExtent2D vk_dlss_outputImageSize;
 
 qbool VK_DLSS_Available(void)
 {
@@ -371,6 +383,69 @@ qbool VK_DLSS_GetOptimalRenderSize(uint32_t outputWidth, uint32_t outputHeight, 
 	return true;
 }
 
+static void VK_DLSS_DestroyOutputImage(void)
+{
+	if (vk_dlss_outputImageView != VK_NULL_HANDLE) {
+		vkDestroyImageView(vk_options.logicalDevice, vk_dlss_outputImageView, NULL);
+		vk_dlss_outputImageView = VK_NULL_HANDLE;
+	}
+	if (vk_dlss_outputImage != VK_NULL_HANDLE) {
+		vkDestroyImage(vk_options.logicalDevice, vk_dlss_outputImage, NULL);
+		vk_dlss_outputImage = VK_NULL_HANDLE;
+	}
+	if (vk_dlss_outputImageMemory != VK_NULL_HANDLE) {
+		vkFreeMemory(vk_options.logicalDevice, vk_dlss_outputImageMemory, NULL);
+		vk_dlss_outputImageMemory = VK_NULL_HANDLE;
+	}
+	vk_dlss_outputImageSize.width = vk_dlss_outputImageSize.height = 0;
+}
+
+static qbool VK_DLSS_EnsureOutputImage(VkExtent2D outputSize)
+{
+	VkImageViewCreateInfo viewInfo;
+
+	if (vk_dlss_outputImage != VK_NULL_HANDLE &&
+		vk_dlss_outputImageSize.width == outputSize.width &&
+		vk_dlss_outputImageSize.height == outputSize.height) {
+		return true;
+	}
+
+	VK_DLSS_DestroyOutputImage();
+
+	// STORAGE_BIT: DLSS writes via compute/UAV (Vulkan's storage-image
+	// equivalent), not as a graphics-pipeline render-pass color attachment.
+	// SAMPLED_BIT + TRANSFER_SRC_BIT: this project reads it back afterwards
+	// (VK_DLSS_CopyOutputTo does a vkCmdCopyImage into the real composite
+	// target -- a plain copy, not a shader sample, but SAMPLED_BIT costs
+	// nothing extra to request and keeps the option open for a future
+	// shader-based composite instead of a raw copy).
+	if (!VK_CreateImageResource(
+			outputSize.width, outputSize.height, 1, VK_SAMPLE_COUNT_1_BIT,
+			vk_options.physicalDeviceSurfaceFormat.format,
+			VK_IMAGE_TILING_OPTIMAL,
+			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+			VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+			&vk_dlss_outputImage, &vk_dlss_outputImageMemory)) {
+		return false;
+	}
+
+	VK_InitialiseStructure(viewInfo);
+	viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+	viewInfo.image = vk_dlss_outputImage;
+	viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+	viewInfo.format = vk_options.physicalDeviceSurfaceFormat.format;
+	viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	viewInfo.subresourceRange.levelCount = 1;
+	viewInfo.subresourceRange.layerCount = 1;
+	if (vkCreateImageView(vk_options.logicalDevice, &viewInfo, NULL, &vk_dlss_outputImageView) != VK_SUCCESS) {
+		VK_DLSS_DestroyOutputImage();
+		return false;
+	}
+
+	vk_dlss_outputImageSize = outputSize;
+	return true;
+}
+
 // Advances SL's frame token -- call once per real frame, same lifetime
 // spot as VK_AdvanceJitter (vk_main.c): both are per-real-frame, not
 // per-multiview-pane, state.
@@ -382,39 +457,26 @@ void VK_DLSS_AdvanceFrame(void)
 	++vk_dlss_frameIndex;
 }
 
-// NOT YET CALLED from anywhere in the render loop -- see the TODO at the
-// bottom of this file's header comment area for exactly what's needed to
-// wire this in. Written and compiles clean, but wiring it in requires
-// restructuring where in the frame this runs: slEvaluateFeature is a
-// compute dispatch and, like vkCmdUpdateBuffer/vkCmdCopyImage elsewhere in
-// this codebase, cannot run inside an active render pass instance -- so
-// this must be called from vk_main.c's VK_EndWorldPassAndComposite
-// alongside VK_UpscaleUpdateMatrices/VK_UpscaleUpdateHistory (both already
-// run outside any render pass there), NOT from inside VK_UpscaleComposite
-// (which always runs inside the composite render pass). Also needs: (1) a
-// dedicated DLSS output image (DLSS writes via compute/UAV into
-// VK_IMAGE_LAYOUT_GENERAL, not through a graphics pipeline draw into the
-// render pass's color attachment the way EASU+RCAS does), which then has
-// to be blitted/copied into the actual composite framebuffer target after
-// slEvaluateFeature returns; and (2) VK_MotionVectorsComposite (see
-// vk_motion_vectors.frag) called first to populate the motion-vector
-// buffer this function tags, itself needing its own small render pass/
-// pipeline (same fullscreen-triangle pattern as VK_UpscaleCreatePipeline,
-// but writing vk_motion_vectors_frag_spv into a dedicated R16G16_SFLOAT
-// target at sceneSize instead of vk_upscale_frag_spv into the swapchain).
+// Called from vk_main.c's VK_EndWorldPassAndComposite, OUTSIDE any render
+// pass instance (slEvaluateFeature is a compute dispatch, same restriction
+// as vkCmdUpdateBuffer/vkCmdCopyImage elsewhere in this codebase) -- right
+// after VK_UpscaleUpdateMatrices (needs that frame's matricesBuffers[historyIndex]
+// already written) and VK_MotionVectorsComposite (needs that frame's motion
+// vectors already rendered). Manages its own native-resolution output
+// image internally (VK_DLSS_EnsureOutputImage) since DLSS writes via
+// compute/UAV (VK_IMAGE_LAYOUT_GENERAL), which a graphics-pipeline render
+// pass attachment can't be -- VK_DLSS_CopyOutputTo (below) copies the
+// result into the real composite target afterwards.
 //
 // Tags the resources DLSS needs (depth, motion vectors, low-res input
-// color, native-res output color) and evaluates the feature -- intended to
-// replace VK_UpscaleComposite's EASU+RCAS draw call when VK_DLSS_Active(),
-// once the restructuring above is done. Reuses
-// the SAME reconstructed motion vectors and depth this project's FSR2-style
-// temporal path already computes (see vk_upscale.c/vk_upscale.frag's
-// ReprojectToPreviousFrame) -- DLSS doesn't care how the motion-vector
-// buffer was produced, only that it's tagged correctly and
-// Constants::cameraMotionIncluded is set to reflect that these are camera-
-// only (not per-object) vectors, same honesty this project already applies
-// to its own FSR2 path (see vk_motion_vectors.frag's header comment on why
-// per-object vectors were out of scope).
+// color, native-res output color) and evaluates the feature. Reuses the
+// SAME reconstructed motion vectors and depth this project's FSR2-style
+// temporal path already computes the algorithm for (see
+// vk_motion_vectors.frag, wired in as of this commit) -- DLSS doesn't care
+// how the motion-vector buffer was produced, only that it's tagged
+// correctly and Constants::cameraMotionIncluded is set to reflect that
+// these are camera-only (not per-object) vectors, same honesty this
+// project already applies to its own FSR2 path.
 //
 // IMPORTANT GAP (documented, not silently ignored): this does not proxy
 // vkQueuePresentKHR through sl.interposer's present hook (see this file's
@@ -428,8 +490,8 @@ void VK_DLSS_AdvanceFrame(void)
 // it, adding the present proxy is the natural next step (see
 // ProgrammingGuideManualHooking.md section 4.2).
 qbool VK_DLSS_Composite(VkCommandBuffer commandBuffer, VkImage sceneColorImage, VkImageView sceneColorView, VkImage sceneDepthImage, VkImageView sceneDepthView,
-	VkImage motionVectorsImage, VkImageView motionVectorsView, VkImage outputImage, VkImageView outputView,
-	VkExtent2D sceneSize, VkExtent2D outputSize, const float* invViewProj, const float* prevViewProj, qbool historyValid)
+	VkImage motionVectorsImage, VkImageView motionVectorsView,
+	VkExtent2D sceneSize, VkExtent2D outputSize, const float* invViewProj, const float* prevViewProj)
 {
 	sl_resource_t colorInRes, colorOutRes, depthRes, mvecRes;
 	sl_resource_tag_t tags[4];
@@ -440,6 +502,9 @@ qbool VK_DLSS_Composite(VkCommandBuffer commandBuffer, VkImage sceneColorImage, 
 	sl_result_t result;
 
 	if (!VK_DLSS_Active()) {
+		return false;
+	}
+	if (!VK_DLSS_EnsureOutputImage(outputSize)) {
 		return false;
 	}
 
@@ -472,8 +537,8 @@ qbool VK_DLSS_Composite(VkCommandBuffer commandBuffer, VkImage sceneColorImage, 
 	colorInRes.height = sceneSize.height;
 
 	colorOutRes = colorInRes;
-	colorOutRes.native = outputImage;
-	colorOutRes.view = outputView;
+	colorOutRes.native = vk_dlss_outputImage;
+	colorOutRes.view = vk_dlss_outputImageView;
 	colorOutRes.state = VK_IMAGE_LAYOUT_GENERAL; // DLSS writes via compute (UAV/storage image)
 	colorOutRes.width = outputSize.width;
 	colorOutRes.height = outputSize.height;
@@ -565,7 +630,7 @@ qbool VK_DLSS_Composite(VkCommandBuffer commandBuffer, VkImage sceneColorImage, 
 	// per-object, so DLSS knows not to expect real object-motion accuracy.
 	consts.cameraMotionIncluded = SL_TRUE;
 	consts.motionVectors3D = SL_FALSE;
-	consts.reset = historyValid ? SL_FALSE : SL_TRUE;
+	consts.reset = vk_dlss_historyValid ? SL_FALSE : SL_TRUE;
 	consts.orthographicProjection = SL_FALSE;
 	consts.motionVectorsDilated = SL_FALSE;
 	consts.motionVectorsJittered = SL_FALSE;
@@ -595,11 +660,65 @@ qbool VK_DLSS_Composite(VkCommandBuffer commandBuffer, VkImage sceneColorImage, 
 	// pipeline bind, add the restore call documented in
 	// ProgrammingGuideManualHooking.md section 7.2 here.
 
+	vk_dlss_historyValid = true;
+	return true;
+}
+
+// Copies DLSS's output image (native resolution, whatever
+// VK_DLSS_Composite just wrote) into the given destination -- called from
+// vk_main.c right after VK_DLSS_Composite returns true, so the result
+// actually lands in the swapchain-bound composite target the same way
+// VK_UpscaleComposite's EASU+RCAS draw does. A plain vkCmdCopyImage, not a
+// shader sample -- both images are the same format/size, no blend/gamma
+// step needed here (unlike VK_UpscaleComposite, DLSS already produces
+// final display-ready color, gamma/contrast are not re-applied on top).
+qbool VK_DLSS_CopyOutputTo(VkCommandBuffer commandBuffer, VkImage dstImage, VkImageLayout dstImageLayoutBeforeCopy, VkImageLayout dstImageLayoutAfterCopy)
+{
+	VkImageMemoryBarrier srcToTransferSrc;
+	VkImageMemoryBarrier dstToTransferDst;
+	VkImageMemoryBarrier srcBackToGeneral;
+	VkImageMemoryBarrier dstToFinal;
+	VkImageCopy region;
+
+	if (vk_dlss_outputImage == VK_NULL_HANDLE) {
+		return false;
+	}
+
+	srcToTransferSrc = VK_UpscaleMakeImageBarrier(vk_dlss_outputImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+	dstToTransferDst = VK_UpscaleMakeImageBarrier(dstImage, dstImageLayoutBeforeCopy, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		0, VK_ACCESS_TRANSFER_WRITE_BIT);
+	{
+		VkImageMemoryBarrier barriers[2] = { srcToTransferSrc, dstToTransferDst };
+		vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 2, barriers);
+	}
+
+	memset(&region, 0, sizeof(region));
+	region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	region.srcSubresource.layerCount = 1;
+	region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+	region.dstSubresource.layerCount = 1;
+	region.extent.width = vk_dlss_outputImageSize.width;
+	region.extent.height = vk_dlss_outputImageSize.height;
+	region.extent.depth = 1;
+	vkCmdCopyImage(commandBuffer, vk_dlss_outputImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+	srcBackToGeneral = VK_UpscaleMakeImageBarrier(vk_dlss_outputImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+		VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+	dstToFinal = VK_UpscaleMakeImageBarrier(dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, dstImageLayoutAfterCopy,
+		VK_ACCESS_TRANSFER_WRITE_BIT, 0);
+	{
+		VkImageMemoryBarrier barriers[2] = { srcBackToGeneral, dstToFinal };
+		vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 2, barriers);
+	}
+
 	return true;
 }
 
 void VK_DLSS_Shutdown(void)
 {
+	vk_dlss_historyValid = false;
+	VK_DLSS_DestroyOutputImage();
 	if (vk_dlss_initialized && p_slShutdown) {
 		p_slShutdown();
 	}
