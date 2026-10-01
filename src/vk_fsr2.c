@@ -161,12 +161,35 @@ static vk_fsr2_image_t fsr2DilatedReactiveMasks;  // low-res, RG16F
 static vk_fsr2_image_t fsr2DilatedMotionPrev;     // low-res, RG16F -- previous frame's fsr2DilatedMotion, ping-ponged by copy
 static vk_fsr2_image_t fsr2NewLocks;              // display-res, R8
 
-static vk_fsr2_image_t fsr2History[2];            // display-res, RGBA16F -- .rgb colour, .a signed temporal-reactive-factor
-static vk_fsr2_image_t fsr2LockStatus[2];         // display-res, RG16F
+// Sized to VK_MAX_FRAMES_IN_FLIGHT (3), NOT 2 -- a 2-slot ping-pong toggled
+// once per VK_Fsr2Composite call (independent of frameSlot) has a real
+// cross-command-buffer write hazard with 3 frames genuinely in flight: frame
+// N and frame N+2 would both target slot (N mod 2), but frame N+2 only waits
+// on ITS OWN frameSlot's fence (frameSlot N+2 mod 3), which is frame N-1's
+// occupant, not frame N's -- nothing guarantees frame N's GPU work finished
+// before frame N+2 submits a write to the same image. Confirmed real,
+// UPSCALING_PLAN.md Fase 1: "ping-pong de 2 imagens não é prova suficiente
+// de segurança com 3 frames em voo." Fixed by keying the slot directly off
+// frameSlot (see VK_Fsr2HistoryWriteIndex/ReadIndex below) instead of a
+// free-running counter -- frameSlot already carries the fence-backed
+// non-overlap guarantee every other per-frame-in-flight resource in this
+// file (fsr2DepthParamsBuffer et al) already relies on.
+static vk_fsr2_image_t fsr2History[VK_MAX_FRAMES_IN_FLIGHT];            // display-res, RGBA16F -- .rgb colour, .a signed temporal-reactive-factor
+static vk_fsr2_image_t fsr2LockStatus[VK_MAX_FRAMES_IN_FLIGHT];         // display-res, RG16F
 static vk_fsr2_image_t fsr2FinalOutput;           // display-res, RGBA16F -- RCAS's output (or accumulate's, if sharpening off): the public composite-ready result, DISTINCT from fsr2History (RCAS must never write into the history buffer -- sharpening would otherwise compound every frame, same reasoning as real FSR2 keeping RCAS_INPUT and the app's `output` resource separate from its own internal upscaled-colour history)
 static VkExtent2D fsr2SceneSize;
 static VkExtent2D fsr2DisplaySize;
-static int fsr2HistoryIndex; // slot WRITTEN this frame; other slot read
+
+// writeIdx = frameSlot itself; readIdx = the slot the IMMEDIATELY PRECEDING
+// frame wrote, i.e. frameSlot's predecessor mod VK_MAX_FRAMES_IN_FLIGHT --
+// not "any other slot" (that stopped being well-defined once this moved
+// past 2 slots). Correct even across vid_restart/history-invalidation: the
+// first real frame after a reset still reads last frame's slot, but
+// VK_Fsr2InvalidateHistory resetting fsr2FrameIndex to 0 is what makes the
+// accumulate shader treat that read as "no real history" (bIsResetFrame),
+// not this indexing.
+static uint32_t VK_Fsr2HistoryWriteIndex(uint32_t frameSlot) { return frameSlot % VK_MAX_FRAMES_IN_FLIGHT; }
+static uint32_t VK_Fsr2HistoryReadIndex(uint32_t frameSlot) { return (frameSlot + VK_MAX_FRAMES_IN_FLIGHT - 1) % VK_MAX_FRAMES_IN_FLIGHT; }
 
 // Ping-ponged across VK_MAX_FRAMES_IN_FLIGHT slots, indexed by frameSlot
 // (vk_options.frame.currentFrame) -- a single shared buffer here would be
@@ -458,10 +481,13 @@ static void VK_Fsr2DestroyImages(void)
 	VK_Fsr2DestroyImage(&fsr2DilatedReactiveMasks);
 	VK_Fsr2DestroyImage(&fsr2DilatedMotionPrev);
 	VK_Fsr2DestroyImage(&fsr2NewLocks);
-	VK_Fsr2DestroyImage(&fsr2History[0]);
-	VK_Fsr2DestroyImage(&fsr2History[1]);
-	VK_Fsr2DestroyImage(&fsr2LockStatus[0]);
-	VK_Fsr2DestroyImage(&fsr2LockStatus[1]);
+	{
+		uint32_t slot;
+		for (slot = 0; slot < VK_MAX_FRAMES_IN_FLIGHT; ++slot) {
+			VK_Fsr2DestroyImage(&fsr2History[slot]);
+			VK_Fsr2DestroyImage(&fsr2LockStatus[slot]);
+		}
+	}
 	VK_Fsr2DestroyImage(&fsr2FinalOutput);
 	VK_Fsr2DestroyImage(&fsr2DefaultBlack);
 	fsr2ResourcesValid = false;
@@ -511,14 +537,15 @@ static qbool VK_Fsr2EnsureImages(void)
 	if (!VK_Fsr2CreateImage(&fsr2NewLocks, displaySize.width, displaySize.height, VK_FORMAT_R8_UNORM,
 			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
 
-	if (!VK_Fsr2CreateImage(&fsr2History[0], displaySize.width, displaySize.height, VK_FORMAT_R16G16B16A16_SFLOAT,
-			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
-	if (!VK_Fsr2CreateImage(&fsr2History[1], displaySize.width, displaySize.height, VK_FORMAT_R16G16B16A16_SFLOAT,
-			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
-	if (!VK_Fsr2CreateImage(&fsr2LockStatus[0], displaySize.width, displaySize.height, VK_FORMAT_R16G16_SFLOAT,
-			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
-	if (!VK_Fsr2CreateImage(&fsr2LockStatus[1], displaySize.width, displaySize.height, VK_FORMAT_R16G16_SFLOAT,
-			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
+	{
+		uint32_t slot;
+		for (slot = 0; slot < VK_MAX_FRAMES_IN_FLIGHT; ++slot) {
+			if (!VK_Fsr2CreateImage(&fsr2History[slot], displaySize.width, displaySize.height, VK_FORMAT_R16G16B16A16_SFLOAT,
+					VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
+			if (!VK_Fsr2CreateImage(&fsr2LockStatus[slot], displaySize.width, displaySize.height, VK_FORMAT_R16G16_SFLOAT,
+					VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
+		}
+	}
 	if (!VK_Fsr2CreateImage(&fsr2FinalOutput, displaySize.width, displaySize.height, VK_FORMAT_R16G16B16A16_SFLOAT,
 			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
 
@@ -554,15 +581,30 @@ static qbool VK_Fsr2EnsureImages(void)
 	// produce a visible glitch for exactly the first frame(s) after every
 	// (re)creation, not just a one-off cosmetic non-issue.
 	{
-		VkImage allImages[] = {
-			fsr2DilatedDepth.image, fsr2DilatedMotion.image, fsr2ReconstructedPrevDepth.image,
-			fsr2LockInputLuma.image, fsr2PreparedInputColor.image, fsr2DilatedReactiveMasks.image,
-			fsr2DilatedMotionPrev.image, fsr2NewLocks.image,
-			fsr2History[0].image, fsr2History[1].image,
-			fsr2LockStatus[0].image, fsr2LockStatus[1].image,
-			fsr2FinalOutput.image,
-		};
-		VkCommandBuffer cmd = VK_BeginImmediateCommands();
+		// Fixed-size base list (8 single resources + fsr2FinalOutput) plus
+		// VK_MAX_FRAMES_IN_FLIGHT history/lock-status slots, built at runtime
+		// since a C89 array initializer can't loop -- VK_MAX_FRAMES_IN_FLIGHT
+		// changing requires updating allImagesCount's sizing below too (a
+		// compile-time array bound tied to the same constant, so a mismatch
+		// here would be a buffer overflow, not a silent skip).
+		VkImage allImages[8 + 1 + 2 * VK_MAX_FRAMES_IN_FLIGHT];
+		uint32_t allImagesCount = 0;
+		uint32_t historySlot;
+		VkCommandBuffer cmd;
+		allImages[allImagesCount++] = fsr2DilatedDepth.image;
+		allImages[allImagesCount++] = fsr2DilatedMotion.image;
+		allImages[allImagesCount++] = fsr2ReconstructedPrevDepth.image;
+		allImages[allImagesCount++] = fsr2LockInputLuma.image;
+		allImages[allImagesCount++] = fsr2PreparedInputColor.image;
+		allImages[allImagesCount++] = fsr2DilatedReactiveMasks.image;
+		allImages[allImagesCount++] = fsr2DilatedMotionPrev.image;
+		allImages[allImagesCount++] = fsr2NewLocks.image;
+		for (historySlot = 0; historySlot < VK_MAX_FRAMES_IN_FLIGHT; ++historySlot) {
+			allImages[allImagesCount++] = fsr2History[historySlot].image;
+			allImages[allImagesCount++] = fsr2LockStatus[historySlot].image;
+		}
+		allImages[allImagesCount++] = fsr2FinalOutput.image;
+		cmd = VK_BeginImmediateCommands();
 		// If this fails, every image above stays VK_IMAGE_LAYOUT_UNDEFINED
 		// (never cleared, never transitioned to GENERAL) and fsr2DefaultBlack
 		// stays unreadable -- the function used to fall through this whole
@@ -627,7 +669,6 @@ static qbool VK_Fsr2EnsureImages(void)
 
 	fsr2SceneSize = sceneSize;
 	fsr2DisplaySize = displaySize;
-	fsr2HistoryIndex = 0;
 	fsr2FrameIndex = 0;
 	fsr2ResourcesValid = true;
 	return true;
@@ -792,8 +833,8 @@ static VkDescriptorImageInfo VK_Fsr2StorageInfo(VkImageView view)
 static qbool VK_Fsr2UpdateDescriptorSets(uint32_t frameSlot, VkImageView sceneColorView, VkImageView sceneDepthView, VkImageView motionVectorsView)
 {
 	VkDescriptorSetAllocateInfo allocInfo;
-	int readIdx = 1 - fsr2HistoryIndex;
-	int writeIdx = fsr2HistoryIndex;
+	uint32_t readIdx = VK_Fsr2HistoryReadIndex(frameSlot);
+	uint32_t writeIdx = VK_Fsr2HistoryWriteIndex(frameSlot);
 
 	if (!VK_Fsr2CreateDescriptorPool()) {
 		return false;
@@ -983,7 +1024,7 @@ qbool VK_Fsr2Composite(VkCommandBuffer commandBuffer, uint32_t frameSlot, VkImag
 	vk_fsr2_depth_params_t depthParams;
 	vk_fsr2_viewproj_params_t viewProjParams;
 	float jitterX, jitterY;
-	int writeIdx;
+	uint32_t writeIdx;
 	qbool sharpenEnabled;
 	VkImage finalImage;
 	VkImageBlit region;
@@ -1006,7 +1047,7 @@ qbool VK_Fsr2Composite(VkCommandBuffer commandBuffer, uint32_t frameSlot, VkImag
 		return false;
 	}
 
-	writeIdx = fsr2HistoryIndex;
+	writeIdx = VK_Fsr2HistoryWriteIndex(frameSlot);
 
 	VK_JitterPixelOffset(&jitterX, &jitterY);
 
@@ -1222,7 +1263,6 @@ qbool VK_Fsr2Composite(VkCommandBuffer commandBuffer, uint32_t frameSlot, VkImag
 		}
 	}
 
-	fsr2HistoryIndex = 1 - fsr2HistoryIndex;
 	++fsr2FrameIndex;
 
 	return true;

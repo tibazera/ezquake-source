@@ -1,5 +1,57 @@
 # Onde paramos — Vulkan renderer / SDL3 port
 
+## Checkpoint 2026-10-01 (parte 8) — bug de concorrência real corrigido: 2 slots de history vs 3 frames em voo
+
+**Último item de Fase 1 fechado nesta sessão.** `fsr2History[2]`/
+`fsr2LockStatus[2]` ping-pongavam via `fsr2HistoryIndex`, um contador global
+incrementado 1x por `VK_Fsr2Composite` -- período 2, INDEPENDENTE do
+`frameSlot` real (`vk_options.frame.currentFrame`, período 3, já que
+`VK_MAX_FRAMES_IN_FLIGHT=3`). Com períodos diferentes, frame N e frame N+2
+escrevem o MESMO slot de history (`N mod 2 == (N+2) mod 2`), mas o fence que
+`VK_BeginFrame` espera antes de reusar um frameSlot é o fence DAQUELE
+frameSlot (frame N+2 espera o fence de frame N-1, que também usa frameSlot
+N+2 mod 3 -- não o de frame N). Nada garante que a GPU terminou de escrever
+no slot de history do frame N antes do frame N+2 submeter outra escrita no
+mesmo slot. Hazard de write-after-write cross-command-buffer real, exatamente
+o que a Fase 1 avisava ("ping-pong de 2 imagens não é prova suficiente de
+segurança com 3 frames em voo").
+
+**Corrigido** (`src/vk_fsr2.c`): `fsr2History`/`fsr2LockStatus` redimensionados
+pra `VK_MAX_FRAMES_IN_FLIGHT` slots (não mais fixo em 2). Índice de escrita
+agora é o `frameSlot` direto (`VK_Fsr2HistoryWriteIndex`), índice de leitura é
+o slot do frame imediatamente anterior (`VK_Fsr2HistoryReadIndex`,
+`(frameSlot + N - 1) % N`) -- mesma garantia de fence que todo outro recurso
+per-frame-in-flight deste arquivo já usa (`fsr2DepthParamsBuffer` etc).
+Refatorado: criação/destruição em loop (`VK_MAX_FRAMES_IN_FLIGHT` iterações),
+`allImages[]` (array de clear-na-criação) construído em runtime com contador
+em vez de inicializador estático (C89 não tem loop em inicializador), todo
+`fsr2HistoryIndex` removido.
+
+Build limpo confirmado do zero (exit 0, sem warning novo), hash
+`5d4f3751916b4bcfbddda7934e8a77dd927b0ac94930faa82bd4665233647aa0`.
+
+**Mesmo padrão de bug existe em `vk_upscale.c`** (`historyIndex`/
+`historyImages[2]`/`matricesBuffers[2]`, caminho DLSS/espacial mais antigo) --
+NÃO tocado nesta sessão, fora do escopo que a Fase 1 catalogou (só cita
+`vk_fsr2.c` explicitamente). Registrar como possível investigação futura se
+alguém for mexer no caminho DLSS/espacial.
+
+**Com isso, todos os itens de Fase 1 do plano foram revisados** -- 6 bugs
+reais confirmados e corrigidos nesta sessão (sampler/R32_UINT, usage flags,
+gate do motion-vector, copy/formato RGBA16F->BGRA8, falha silenciosa de
+immediate commands, race de 2-slot vs 3-frame), 2 itens já estavam corretos.
+Fase 2 (SDK oficial) também avançou: SDK vendorizada, shim C++/C com dispatch
+real, 2 bugs pegos e corrigidos no próprio shim antes de qualquer teste ao
+vivo (mesma classe dos bugs do hand-port: formato de copy, agora também
+corrigido lá). Nenhuma validação visual ainda -- só leitura de código, build
+limpo e um smoke test inconclusivo (sem crash, sem log capturado).
+
+**Próxima ação real**: Fase 3 (entradas temporais corretas) do plano, ou
+aguardar o Tiago testar visualmente os fixes já feitos antes de ir mais
+fundo -- a lista de bugs corrigidos sem validação visual já é grande o
+suficiente que mais mudança sem feedback real aumenta risco de acumular
+erro sobre erro não detectado.
+
 ## Checkpoint 2026-10-01 (parte 7) — bug real corrigido: falha de immediate commands reportava sucesso (hand-port)
 
 `VK_Fsr2EnsureImages` (`src/vk_fsr2.c`) chamava `VK_BeginImmediateCommands()`

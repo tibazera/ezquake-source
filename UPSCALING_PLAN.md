@@ -120,8 +120,26 @@ dos shaders próprios podem ser eliminados pela substituição oficial, sem retr
   ignorado. Confirmado por leitura completa da função.
 - [ ] Tamanho zero, resize e descriptor sets referenciando recursos substituídos:
   ainda não auditado -- pendente.
-- [ ] Auditar barreiras entre frames e acessos a intermediários compartilhados.
-  Ping-pong de 2 imagens não é prova suficiente de segurança com 3 frames em voo.
+- [x] CONFIRMADO E CORRIGIDO -- bug de concorrência real, não suspeita.
+  `fsr2History[2]`/`fsr2LockStatus[2]` usavam um contador global
+  (`fsr2HistoryIndex`) incrementado uma vez por `VK_Fsr2Composite`,
+  INDEPENDENTE do `frameSlot` (`vk_options.frame.currentFrame`, período 3).
+  Com período 2 (ping-pong) vs período 3 (frames em voo reais,
+  `VK_MAX_FRAMES_IN_FLIGHT=3`), frame N e frame N+2 escrevem o MESMO slot de
+  history, mas frame N+2 só espera o fence do SEU PRÓPRIO frameSlot (que
+  pertence a frame N-1, não frame N) -- nada garante que o trabalho de GPU
+  do frame N tenha terminado antes do frame N+2 submeter escrita na mesma
+  imagem. Hazard de write-after-write cross-command-buffer real.
+  Corrigido: `fsr2History`/`fsr2LockStatus` agora têm `VK_MAX_FRAMES_IN_FLIGHT`
+  slots (não mais fixo em 2), índice de escrita = `frameSlot` diretamente,
+  índice de leitura = `frameSlot` anterior (`(frameSlot + N - 1) % N`) --
+  mesma garantia de fence que todo outro recurso per-frame-in-flight deste
+  arquivo (`fsr2DepthParamsBuffer` etc) já usa. Build limpo confirmado, hash
+  `5d4f3751916b4bcfbddda7934e8a77dd927b0ac94930faa82bd4665233647aa0`.
+  **Mesmo padrão existe em `vk_upscale.c`** (`historyIndex`/`historyImages[2]`,
+  caminho DLSS/espacial antigo) -- NÃO corrigido nesta sessão (fora do escopo
+  catalogado pela Fase 1, que só cita `vk_fsr2.c`); registrar como pendência
+  separada se for investigar DLSS/caminho espacial depois.
 
 ## Fase 2 — SDK oficial AMD
 
