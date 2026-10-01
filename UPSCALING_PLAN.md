@@ -52,8 +52,13 @@ dos shaders próprios podem ser eliminados pela substituição oficial, sem retr
 - [ ] `vk_fsr2.c:726`: pool reserva 19 samplers/frame; bindings usados totalizam 20.
 - [ ] `vk_fsr2.c:483–514`: várias imagens sem TRANSFER_DST são limpas em :580;
   motion dilatado é copiado como source sem TRANSFER_SRC. Verificar todos os usos.
-- [ ] `vk_fsr2_depthclip.comp:19`: sampler2D lê R32_UINT; requer recurso inteiro e
-  conversão dos bits, conforme upstream. Pode desaparecer com SDK oficial.
+- [x] `vk_fsr2_depthclip.comp` (hand-port): `reconstructedPrevDepth` lia R32_UINT
+  via `sampler2D`/`texelFetch(...).r` tratado direto como float -- format/sampler
+  mismatch real (reconstruct/lock escrevem via `uimage2D r32ui` com bits crus,
+  depthclip lia como se já fosse float decodificado). Corrigido: binding 4 agora
+  `usampler2D`, 4 sites de leitura (`ComputeDepthClip`, `EvaluateSurface`)
+  envolvidos em `uintBitsToFloat()`. Compila limpo (ver CONTINUE.md 2026-10-01).
+  Só afeta o hand-port (`==1`); caminho da SDK oficial (`==3`) não usa este shader.
 - [ ] `VK_Fsr2SamplerInfo` usa GENERAL para todas as imagens; confrontar layouts reais
   de scene color, depth, motion e imagem preta (esta é SHADER_READ_ONLY).
 - [ ] `vk_fsr2.c:1151`: copy RGBA16F para swapchain BGRA8 é incompatível;

@@ -1,5 +1,31 @@
 # Onde paramos — Vulkan renderer / SDL3 port
 
+## Checkpoint 2026-10-01 (parte 3) — bug real corrigido no hand-port: sampler2D/R32_UINT mismatch
+
+Fase 1 do plano catalogava (`vk_fsr2_depthclip.comp:19`, referência de linha já
+desatualizada por edições anteriores, mas o bug era real): `reconstructedPrevDepth`
+é escrito pelos passes reconstruct/lock como `uimage2D` (r32ui), guardando o bit
+pattern cru de um float (`floatBitsToUint`) -- técnica padrão do FSR2 real para
+`imageAtomicMax` sobre um valor de profundidade (não há atomic max de float em
+GLSL). O pass depthclip lia esse mesmo recurso via `sampler2D`/`texelFetch(...).r`
+e usava o resultado DIRETO como float, sem `uintBitsToFloat` -- mismatch de
+formato/tipo de sampler real (R32_UINT com sampler float é erro de validação/
+comportamento indefinido no Vulkan, não só um warning cosmético).
+
+**Corrigido** (`src/vulkan_shaders/vk_fsr2_depthclip.comp`): binding 4 mudado de
+`sampler2D` para `usampler2D`; os 4 sites de leitura (`ComputeDepthClip`'s loop
+bilinear, `EvaluateSurface`'s 3 amostras verticais) agora decodificam com
+`uintBitsToFloat()` antes de passar para `GetViewSpaceDepth`. Compilação
+confirmada limpa (316/316, exit 0, sem warning novo) -- hash do exe
+`1d6c30da18faa9126bf307d227a753ccafc4354221bc677110a5ed0adf5cdccb`. **Não
+testado visualmente** (mesma limitação de automação de input desta sessão) --
+mas o bug era um mismatch de tipo real que o compilador de shader teria
+recusado se a sintaxe estivesse errada, e a leitura/escrita agora batem de
+verdade com o padrão já comprovado nos outros 2 shaders que tocam esse recurso.
+
+Afeta só o hand-port (`vid_vulkan_upscaler==1`) -- a SDK oficial (`==3`) nunca
+usa `vk_fsr2_depthclip.comp`, tem seu próprio shader interno já testado pela AMD.
+
 ## Checkpoint 2026-10-01 (parte 2) — shim C++/C do SDK FSR2 oficial, caminho novo e paralelo, compila limpo
 
 Leia `AGENTS.md` e `UPSCALING_PLAN.md` primeiro. Continuação da sessão abaixo

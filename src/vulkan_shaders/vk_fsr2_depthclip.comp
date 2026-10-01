@@ -16,7 +16,15 @@ layout(binding = 0) uniform sampler2D sceneColor;           // low-res, current
 layout(binding = 1) uniform sampler2D sceneDepth;            // low-res, current (device depth)
 layout(binding = 2) uniform sampler2D dilatedMotionVectors;  // low-res, from reconstruct pass
 layout(binding = 3) uniform sampler2D dilatedDepth;          // low-res, from reconstruct pass
-layout(binding = 4) uniform sampler2D reconstructedPrevDepth; // low-res, atomic-max target from reconstruct pass, reversed-depth-aware "nearest wins"
+// r32ui, matching the reconstruct pass's imageAtomicMax target (binding 7 in
+// vk_fsr2_reconstruct.comp) exactly -- the atomic max writes the raw bit
+// pattern of the depth float (floatBitsToUint), so reads here must come back
+// through an integer sampler and be decoded with uintBitsToFloat at each use
+// site, not treated as an already-decoded float. A plain sampler2D over an
+// R32_UINT image is a format/sampler-type mismatch (undefined behaviour /
+// validation error under Vulkan), confirmed against this project's own
+// UPSCALING_PLAN.md Fase 1 catalogued bug for this exact resource.
+layout(binding = 4) uniform usampler2D reconstructedPrevDepth; // low-res, atomic-max target from reconstruct pass, reversed-depth-aware "nearest wins"
 layout(binding = 5) uniform sampler2D reactiveMask;          // low-res, engine-provided (particles/alpha), 0 if none
 layout(binding = 6) uniform sampler2D compositionMask;       // low-res, engine-provided (translucency/composite), 0 if none
 layout(binding = 7) uniform sampler2D previousDilatedMotionVectors; // low-res, previous frame's dilated MV (ping-ponged)
@@ -125,7 +133,7 @@ float ComputeDepthClip(vec2 fUvSample, float fCurrentDepthSample)
 			continue;
 		}
 
-		float fPrevDepthSample = texelFetch(reconstructedPrevDepth, iSamplePos, 0).r;
+		float fPrevDepthSample = uintBitsToFloat(texelFetch(reconstructedPrevDepth, iSamplePos, 0).r);
 		float fPrevNearestDepthViewSpace = GetViewSpaceDepth(fPrevDepthSample);
 		float fDepthDiff = fCurrentDepthViewSpace - fPrevNearestDepthViewSpace;
 
@@ -154,9 +162,9 @@ float ComputeDepthClip(vec2 fUvSample, float fCurrentDepthSample)
 
 float EvaluateSurface(ivec2 iPxPos, vec2 fMotionVector)
 {
-	float d0 = GetViewSpaceDepth(texelFetch(reconstructedPrevDepth, iPxPos + ivec2(0, -1), 0).r);
-	float d1 = GetViewSpaceDepth(texelFetch(reconstructedPrevDepth, iPxPos, 0).r);
-	float d2 = GetViewSpaceDepth(texelFetch(reconstructedPrevDepth, iPxPos + ivec2(0, 1), 0).r);
+	float d0 = GetViewSpaceDepth(uintBitsToFloat(texelFetch(reconstructedPrevDepth, iPxPos + ivec2(0, -1), 0).r));
+	float d1 = GetViewSpaceDepth(uintBitsToFloat(texelFetch(reconstructedPrevDepth, iPxPos, 0).r));
+	float d2 = GetViewSpaceDepth(uintBitsToFloat(texelFetch(reconstructedPrevDepth, iPxPos + ivec2(0, 1), 0).r));
 	return 1.0 - float(((d0 - d1) > (d1 * 0.01)) && ((d1 - d2) > (d2 * 0.01)));
 }
 
