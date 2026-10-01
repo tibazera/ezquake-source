@@ -49,9 +49,18 @@ dos shaders próprios podem ser eliminados pela substituição oficial, sem retr
 
 - [ ] `vk_main.c:1042` chama `VK_MotionVectorsComposite` para FSR2, mas `vk_upscale.c:1353`
   retorna false se DLSS não estiver ativo. Rastrear também gate de atualização de matrizes.
-- [ ] `vk_fsr2.c:726`: pool reserva 19 samplers/frame; bindings usados totalizam 20.
-- [ ] `vk_fsr2.c:483–514`: várias imagens sem TRANSFER_DST são limpas em :580;
-  motion dilatado é copiado como source sem TRANSFER_SRC. Verificar todos os usos.
+- [x] `vk_fsr2.c:726`: recontado -- reconstruct(3)+depthclip(8)+lock(1)+accumulate(6)+rcas(1)=19,
+  bate exatamente com `poolSizes[0].descriptorCount = framesInFlight * 19`. Claim do
+  plano (20 usados) não reproduz no código atual; corrigido em sessão anterior ou
+  nunca foi real. Sem ação necessária.
+- [x] `vk_fsr2.c:483–523`: confirmado real -- 10 de 13 imagens em `allImages[]`
+  (limpas via `vkCmdClearColorImage` logo na criação) não tinham
+  `VK_IMAGE_USAGE_TRANSFER_DST_BIT`; `fsr2DilatedMotion` é source de
+  `vkCmdCopyImage` no ping-pong de fim de frame e não tinha `TRANSFER_SRC_BIT`.
+  Corrigido: `TRANSFER_DST_BIT` adicionado a todas (`fsr2DilatedDepth`,
+  `fsr2LockInputLuma`, `fsr2PreparedInputColor`, `fsr2DilatedReactiveMasks`,
+  `fsr2History[0/1]`, `fsr2LockStatus[0/1]`, `fsr2FinalOutput`), `TRANSFER_SRC_BIT`
+  adicionado a `fsr2DilatedMotion`. Compila limpo (ver CONTINUE.md).
 - [x] `vk_fsr2_depthclip.comp` (hand-port): `reconstructedPrevDepth` lia R32_UINT
   via `sampler2D`/`texelFetch(...).r` tratado direto como float -- format/sampler
   mismatch real (reconstruct/lock escrevem via `uimage2D r32ui` com bits crus,

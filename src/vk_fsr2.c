@@ -480,10 +480,20 @@ static qbool VK_Fsr2EnsureImages(void)
 
 	VK_Fsr2DestroyImages();
 
+	// Every image this function creates is cleared via vkCmdClearColorImage
+	// right after creation (see the allImages[] loop below) and therefore
+	// needs VK_IMAGE_USAGE_TRANSFER_DST_BIT regardless of whether anything
+	// else in the pipeline also copies into it -- confirmed missing on most
+	// of these images (UPSCALING_PLAN.md Fase 1 catalogued this).
+	// fsr2DilatedMotion is additionally the vkCmdCopyImage SOURCE for the
+	// ping-pong into fsr2DilatedMotionPrev further down in this function,
+	// so it also needs VK_IMAGE_USAGE_TRANSFER_SRC_BIT (was missing too --
+	// same bug, confirmed by reading the copy call site at the end of
+	// VK_Fsr2Composite).
 	if (!VK_Fsr2CreateImage(&fsr2DilatedDepth, sceneSize.width, sceneSize.height, VK_FORMAT_R32_SFLOAT,
-			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
+			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
 	if (!VK_Fsr2CreateImage(&fsr2DilatedMotion, sceneSize.width, sceneSize.height, VK_FORMAT_R16G16_SFLOAT,
-			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
+			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
 	// R32_UINT: imageAtomicMax needs an integer format -- the reconstruct
 	// shader stores/reads the float depth's raw bit pattern (floatBitsToUint/
 	// uintBitsToFloat), same technique real FSR2's D3D12/VK backends use for
@@ -491,26 +501,26 @@ static qbool VK_Fsr2EnsureImages(void)
 	if (!VK_Fsr2CreateImage(&fsr2ReconstructedPrevDepth, sceneSize.width, sceneSize.height, VK_FORMAT_R32_UINT,
 			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
 	if (!VK_Fsr2CreateImage(&fsr2LockInputLuma, sceneSize.width, sceneSize.height, VK_FORMAT_R16_SFLOAT,
-			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
+			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
 	if (!VK_Fsr2CreateImage(&fsr2PreparedInputColor, sceneSize.width, sceneSize.height, VK_FORMAT_R16G16B16A16_SFLOAT,
-			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
+			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
 	if (!VK_Fsr2CreateImage(&fsr2DilatedReactiveMasks, sceneSize.width, sceneSize.height, VK_FORMAT_R16G16_SFLOAT,
-			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
+			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
 	if (!VK_Fsr2CreateImage(&fsr2DilatedMotionPrev, sceneSize.width, sceneSize.height, VK_FORMAT_R16G16_SFLOAT,
 			VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
 	if (!VK_Fsr2CreateImage(&fsr2NewLocks, displaySize.width, displaySize.height, VK_FORMAT_R8_UNORM,
 			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
 
 	if (!VK_Fsr2CreateImage(&fsr2History[0], displaySize.width, displaySize.height, VK_FORMAT_R16G16B16A16_SFLOAT,
-			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
+			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
 	if (!VK_Fsr2CreateImage(&fsr2History[1], displaySize.width, displaySize.height, VK_FORMAT_R16G16B16A16_SFLOAT,
-			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
+			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
 	if (!VK_Fsr2CreateImage(&fsr2LockStatus[0], displaySize.width, displaySize.height, VK_FORMAT_R16G16_SFLOAT,
-			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
+			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
 	if (!VK_Fsr2CreateImage(&fsr2LockStatus[1], displaySize.width, displaySize.height, VK_FORMAT_R16G16_SFLOAT,
-			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
+			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
 	if (!VK_Fsr2CreateImage(&fsr2FinalOutput, displaySize.width, displaySize.height, VK_FORMAT_R16G16B16A16_SFLOAT,
-			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
+			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
 
 	if (!VK_Fsr2CreateImage(&fsr2DefaultBlack, 1, 1, VK_FORMAT_R16G16B16A16_SFLOAT,
 			VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;

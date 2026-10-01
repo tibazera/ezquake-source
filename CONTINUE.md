@@ -1,5 +1,32 @@
 # Onde paramos — Vulkan renderer / SDL3 port
 
+## Checkpoint 2026-10-01 (parte 4) — bugs reais de usage flags corrigidos (hand-port)
+
+Fase 1 catalogava: "várias imagens sem TRANSFER_DST são limpas"/"motion dilatado
+copiado sem TRANSFER_SRC". Recontei real contra `allImages[]`
+(`VK_Fsr2EnsureImages`, `src/vk_fsr2.c`) -- confirmado: só 3 das 13 imagens
+(`fsr2ReconstructedPrevDepth`, `fsr2DilatedMotionPrev`, `fsr2NewLocks`) tinham
+`VK_IMAGE_USAGE_TRANSFER_DST_BIT`, mas TODAS as 13 passam por
+`vkCmdClearColorImage` na criação (loop logo após a lista) -- usage flag ausente
+nas outras 10. Separadamente, `fsr2DilatedMotion` é source de `vkCmdCopyImage`
+no ping-pong de fim de `VK_Fsr2Composite` (copiado pra `fsr2DilatedMotionPrev`)
+mas só tinha `STORAGE_BIT|SAMPLED_BIT`, sem `TRANSFER_SRC_BIT`.
+
+**Corrigido**: `TRANSFER_DST_BIT` adicionado às 10 imagens que faltava
+(`fsr2DilatedDepth`, `fsr2DilatedMotion`, `fsr2LockInputLuma`,
+`fsr2PreparedInputColor`, `fsr2DilatedReactiveMasks`, `fsr2History[0/1]`,
+`fsr2LockStatus[0/1]`, `fsr2FinalOutput`); `TRANSFER_SRC_BIT` adicionado a
+`fsr2DilatedMotion`. Build limpo do zero confirmado (exit 0, sem warning novo),
+hash `dcccfd53912f7e5d5f497e88dade938b329ba89a146e1eb99395263d4c21106f`.
+
+Mesma ressalva das correções anteriores: validação de tipo/uso pelo driver é
+real (usage flag ausente numa operação de transferência é erro de validação
+garantido, não possibilidade), mas efeito visual (se isso causava os artefatos
+relatados) não foi testado ao vivo nesta sessão -- sem acesso seguro a teste
+interativo depois do incidente de auto-connect registrado no checkpoint anterior.
+
+Afeta só o hand-port (`vid_vulkan_upscaler==1`).
+
 ## Checkpoint 2026-10-01 (parte 3) — bug real corrigido no hand-port: sampler2D/R32_UINT mismatch
 
 Fase 1 do plano catalogava (`vk_fsr2_depthclip.comp:19`, referência de linha já
