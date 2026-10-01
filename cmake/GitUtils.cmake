@@ -6,13 +6,24 @@ function(git_refresh_submodules)
         if (GIT_SUBMODULE)
             message(STATUS "Submodule update")
             execute_process(
-                    COMMAND ${GIT_EXECUTABLE} submodule update --init --recursive
+                    # FSR2's nested submodules are sample assets/frameworks, not API dependencies.
+                    COMMAND ${GIT_EXECUTABLE} -c submodule.external/fsr2.update=none submodule update --init --recursive
                     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
                     RESULT_VARIABLE GIT_SUBMOD_RESULT
                     OUTPUT_QUIET
             )
             if (NOT GIT_SUBMOD_RESULT EQUAL "0")
                 message(FATAL_ERROR "git submodule update --init --recursive failed with ${GIT_SUBMOD_RESULT}, please checkout submodules")
+            endif()
+            if (RENDERER_VULKAN)
+                execute_process(
+                        COMMAND ${GIT_EXECUTABLE} submodule update --init -- external/fsr2
+                        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                        RESULT_VARIABLE FSR2_SUBMOD_RESULT
+                )
+                if (NOT FSR2_SUBMOD_RESULT EQUAL "0")
+                    message(FATAL_ERROR "FSR2 SDK checkout failed: ${FSR2_SUBMOD_RESULT}")
+                endif()
             endif()
         endif()
     endif()
