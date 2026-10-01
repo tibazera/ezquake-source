@@ -159,21 +159,29 @@ dos shaders próprios podem ser eliminados pela substituição oficial, sem retr
   possibilidade de teste ao vivo em sequência (muita mudança sem validação
   acumulando risco).
 
-  **Escopo real é maior do que só essas 2 imagens**: ao investigar o fix,
-  percebi que TODAS as 8 imagens "scratch" de baixa resolução
-  (`fsr2DilatedDepth`, `fsr2ReconstructedPrevDepth`, `fsr2LockInputLuma`,
-  `fsr2PreparedInputColor`, `fsr2DilatedReactiveMasks`, `fsr2NewLocks`, além
-  das 2 já citadas) são instâncias ÚNICAS, sem slot algum, escritas e lidas
-  dentro do mesmo command buffer de um frame -- mas nada impede o command
-  buffer do frame N+1 começar a escrever nelas enquanto o command buffer do
-  frame N ainda está executando na GPU (frames em voo reais). A barreira
-  intra-CB (`VK_Fsr2Barrier`) ordena corretamente os passes DENTRO de um
-  frame, mas não impede sobreposição ENTRE command buffers diferentes.
-  Investigação completa (quais dessas são genuinamente só-leitura-mesmo-frame
-  vs quais têm alguma dependência cross-frame como `fsr2ReconstructedPrevDepth`/
-  `fsr2DilatedMotion`) é trabalho não trivial, precisa de atenção dedicada --
-  registrado aqui como a pendência mais importante da Fase 1 ainda aberta,
-  maior que qualquer item individual já corrigido nesta sessão.
+  **CORRIGIDO** (sessão seguinte): escopo real era maior do que só essas 2
+  imagens -- as 8 imagens "scratch" de baixa resolução (`fsr2DilatedDepth`,
+  `fsr2DilatedMotion`, `fsr2ReconstructedPrevDepth`, `fsr2LockInputLuma`,
+  `fsr2PreparedInputColor`, `fsr2DilatedReactiveMasks`, `fsr2DilatedMotionPrev`,
+  `fsr2NewLocks`) eram todas instâncias ÚNICAS sem slot algum. Investigação
+  completa de cada uma (rastreando produtor/consumidor em `vk_fsr2_reconstruct.comp`/
+  `vk_fsr2_depthclip.comp`/`vk_fsr2_lock.comp` na ordem real de dispatch) achou
+  2 categorias: (a) scratch puramente intra-frame -- `fsr2DilatedDepth`,
+  `fsr2DilatedMotion`, `fsr2LockInputLuma`, `fsr2PreparedInputColor`,
+  `fsr2DilatedReactiveMasks`, `fsr2NewLocks` -- escritas e totalmente consumidas
+  dentro do MESMO dispatch, nenhum frame posterior lê o CONTEÚDO; e (b) estado
+  cross-frame real -- `fsr2DilatedMotionPrev` (copiado no fim de um frame, lido
+  no início do próximo) e, de forma sutil, `fsr2ReconstructedPrevDepth` (que
+  apesar do nome é MAIORIA intra-frame: reconstruct escreve via atomic max,
+  depthclip lê poucos passes depois NO MESMO dispatch, lock reseta pro valor
+  far-plane no fim -- só "cross-frame" no sentido de que o reset de um frame
+  prepara o próximo USO DO MESMO SLOT, 3 frames depois, não um frame
+  imediatamente seguinte). Todas as 8 convertidas pra arrays
+  `[VK_MAX_FRAMES_IN_FLIGHT]`; categoria (a) indexada só por `frameSlot`;
+  categoria (b) usa `frameSlot` pra escrita e `VK_Fsr2HistoryReadIndex`/
+  `frameSlot` conforme a semântica real de cada uma (documentado inline em
+  cada descriptor write). Build limpo confirmado do zero, hash
+  `d454de1df0c40a92e334bdeefb312c67b6e66081034744cf9c2ffb4cb1ac306d`.
 
 ## Fase 2 — SDK oficial AMD
 

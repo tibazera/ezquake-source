@@ -1,5 +1,67 @@
 # Onde paramos — Vulkan renderer / SDL3 port
 
+## Checkpoint 2026-10-01 (parte 9) — maior pendência de Fase 1 corrigida: 8 imagens scratch sem slot per-frame-in-flight
+
+Continuação direta da parte 8. As 8 imagens "scratch" de baixa resolução do
+hand-port (`fsr2DilatedDepth`, `fsr2DilatedMotion`, `fsr2ReconstructedPrevDepth`,
+`fsr2LockInputLuma`, `fsr2PreparedInputColor`, `fsr2DilatedReactiveMasks`,
+`fsr2DilatedMotionPrev`, `fsr2NewLocks`) eram instâncias ÚNICAS sem slot
+per-frame-in-flight nenhum, só protegidas por barreira INTRA-command-buffer
+(`VK_Fsr2Barrier`) -- nada impedia o command buffer do frame N+1 escrever
+nelas enquanto o do frame N ainda rodava na GPU (confirmado real lendo
+`vk_main.c`'s padrão de 1 CB por frame com fence só por frameSlot).
+
+**Investigação completa feita antes de corrigir** (rastreando cada imagem nos
+3 shaders que a tocam, na ordem real de dispatch reconstruct->depthclip->lock->
+accumulate->rcas): 2 categorias diferentes, tratamento diferente pra cada:
+
+- **Scratch puramente intra-frame** (`fsr2DilatedDepth`, `fsr2DilatedMotion`,
+  `fsr2LockInputLuma`, `fsr2PreparedInputColor`, `fsr2DilatedReactiveMasks`,
+  `fsr2NewLocks`): escritas e totalmente consumidas dentro do MESMO dispatch,
+  nenhum frame posterior lê o conteúdo. Indexadas só por `frameSlot`, sem
+  precisar de "read previous".
+- **Estado cross-frame real**: `fsr2DilatedMotionPrev` é genuinamente
+  copiado no fim de um frame e lido no início do próximo (igual history) --
+  usa `frameSlot` pra escrita, `readIdx` (via `VK_Fsr2HistoryReadIndex`) pra
+  leitura. `fsr2ReconstructedPrevDepth` é mais sutil: apesar do nome, é
+  MAIORIA intra-frame -- reconstruct escreve via `imageAtomicMax`, depthclip
+  lê poucos passes depois NO MESMO dispatch, lock reseta pro far-plane
+  sentinel no FIM do mesmo dispatch. O "previous" no nome só significa que o
+  reset de um frame prepara o PRÓXIMO USO DO MESMO SLOT (3 frames depois,
+  não o frame imediatamente seguinte) -- por isso usa `frameSlot` em TODOS os
+  3 pontos de acesso (reconstruct write, depthclip read, lock reset-write),
+  não `readIdx`. Essa distinção só ficou clara lendo os 3 shaders na ordem
+  real, não seria óbvia só olhando o nome da variável.
+
+**Corrigido**: todas as 8 viraram arrays `[VK_MAX_FRAMES_IN_FLIGHT]`.
+`VK_Fsr2EnsureImages`/`VK_Fsr2DestroyImages` unificados num loop único por
+slot (10 imagens por iteração: as 8 + `fsr2History`/`fsr2LockStatus`
+reaproveitando o mesmo loop). `allImages[]` (lista de clear-na-criação)
+recalculada pro tamanho certo (`10 * VK_MAX_FRAMES_IN_FLIGHT + 1`), incluindo
+a checagem especial do far-plane sentinel do `fsr2ReconstructedPrevDepth`
+ajustada pra comparar contra todos os N slots. `VK_Fsr2UpdateDescriptorSets`
+e `VK_Fsr2Composite` (barreiras + dispatch) atualizados em cada um dos ~25
+pontos de acesso identificados.
+
+Build limpo confirmado do zero (exit 0, sem warning novo), hash
+`d454de1df0c40a92e334bdeefb312c67b6e66081034744cf9c2ffb4cb1ac306d`.
+
+**Com isso, a maior pendência técnica de Fase 1 identificada nesta sessão
+está corrigida.** Resumo total da sessão: 7 bugs reais confirmados e
+corrigidos (sampler/R32_UINT, usage flags, gate do motion-vector, copy/formato
+RGBA16F->BGRA8, falha silenciosa de immediate commands, race de history
+2-vs-3, race das 8 imagens scratch), SDK oficial AMD vendorizada e com
+dispatch real funcionando como caminho paralelo. **Nenhuma validação visual
+ainda** -- toda correção é por leitura cuidadosa de código + build limpo,
+sem acesso confiável a teste interativo neste ambiente.
+
+**Próxima ação real**: parar aqui e aguardar validação visual do Tiago antes
+de continuar mexendo em código sem feedback -- o volume de mudança não
+testada já é grande. Se for continuar sem ele, Fase 3 (entradas temporais:
+mapear convenções de jitter/motion/depth, teste matemático executável) é o
+próximo item do plano, mas é trabalho que se beneficia MUITO mais de
+validação visual intermediária do que leitura de código pura.
+
 ## Checkpoint 2026-10-01 (parte 8) — bug de concorrência real corrigido: 2 slots de history vs 3 frames em voo
 
 **Último item de Fase 1 fechado nesta sessão.** `fsr2History[2]`/

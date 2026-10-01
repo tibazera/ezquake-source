@@ -152,14 +152,32 @@ typedef struct vk_fsr2_image_s {
 	VkImageView view;
 } vk_fsr2_image_t;
 
-static vk_fsr2_image_t fsr2DilatedDepth;          // low-res, R32F
-static vk_fsr2_image_t fsr2DilatedMotion;         // low-res, RG16F
-static vk_fsr2_image_t fsr2ReconstructedPrevDepth; // low-res, R32UI (atomic max target)
-static vk_fsr2_image_t fsr2LockInputLuma;         // low-res, R16F
-static vk_fsr2_image_t fsr2PreparedInputColor;    // low-res, RGBA16F
-static vk_fsr2_image_t fsr2DilatedReactiveMasks;  // low-res, RG16F
-static vk_fsr2_image_t fsr2DilatedMotionPrev;     // low-res, RG16F -- previous frame's fsr2DilatedMotion, ping-ponged by copy
-static vk_fsr2_image_t fsr2NewLocks;              // display-res, R8
+// Sized to VK_MAX_FRAMES_IN_FLIGHT, same reasoning as fsr2History/fsr2LockStatus
+// below: these used to be single instances with no per-frame-in-flight slot
+// at all, only an INTRA-command-buffer barrier (VK_Fsr2Barrier) ordering the
+// 5 passes within one frame -- nothing stopped frame N+1's command buffer
+// from writing them while frame N's was still executing on the GPU (3
+// command buffers can genuinely be in flight concurrently, confirmed by
+// reading vk_main.c's single-CB-per-frame vkQueueSubmit/fence-per-frameSlot
+// pattern). UPSCALING_PLAN.md Fase 1 flagged this as the largest remaining
+// item. fsr2DilatedDepth/fsr2LockInputLuma/fsr2PreparedInputColor/
+// fsr2DilatedReactiveMasks/fsr2NewLocks/fsr2DilatedMotion are pure
+// intra-frame scratch (written and fully consumed within the SAME
+// VK_Fsr2Composite call, confirmed by reading every reference -- no later
+// frame's dispatch ever reads their CONTENTS), so they only need a distinct
+// slot per frameSlot (write-indexed, no "read previous" needed).
+// fsr2ReconstructedPrevDepth and fsr2DilatedMotionPrev are different: they
+// carry real cross-frame state (atomic-max persistence / previous frame's
+// motion vectors) and use the same write=frameSlot/read=previous-frameSlot
+// scheme as fsr2History (VK_Fsr2HistoryWriteIndex/ReadIndex, reused here).
+static vk_fsr2_image_t fsr2DilatedDepth[VK_MAX_FRAMES_IN_FLIGHT];          // low-res, R32F
+static vk_fsr2_image_t fsr2DilatedMotion[VK_MAX_FRAMES_IN_FLIGHT];         // low-res, RG16F
+static vk_fsr2_image_t fsr2ReconstructedPrevDepth[VK_MAX_FRAMES_IN_FLIGHT]; // low-res, R32UI (atomic max target) -- real cross-frame state, see above
+static vk_fsr2_image_t fsr2LockInputLuma[VK_MAX_FRAMES_IN_FLIGHT];         // low-res, R16F
+static vk_fsr2_image_t fsr2PreparedInputColor[VK_MAX_FRAMES_IN_FLIGHT];    // low-res, RGBA16F
+static vk_fsr2_image_t fsr2DilatedReactiveMasks[VK_MAX_FRAMES_IN_FLIGHT];  // low-res, RG16F
+static vk_fsr2_image_t fsr2DilatedMotionPrev[VK_MAX_FRAMES_IN_FLIGHT];     // low-res, RG16F -- previous frame's fsr2DilatedMotion, real cross-frame state, see above
+static vk_fsr2_image_t fsr2NewLocks[VK_MAX_FRAMES_IN_FLIGHT];              // display-res, R8
 
 // Sized to VK_MAX_FRAMES_IN_FLIGHT (3), NOT 2 -- a 2-slot ping-pong toggled
 // once per VK_Fsr2Composite call (independent of frameSlot) has a real
@@ -473,17 +491,17 @@ static qbool VK_Fsr2CreatePipelines(void)
 
 static void VK_Fsr2DestroyImages(void)
 {
-	VK_Fsr2DestroyImage(&fsr2DilatedDepth);
-	VK_Fsr2DestroyImage(&fsr2DilatedMotion);
-	VK_Fsr2DestroyImage(&fsr2ReconstructedPrevDepth);
-	VK_Fsr2DestroyImage(&fsr2LockInputLuma);
-	VK_Fsr2DestroyImage(&fsr2PreparedInputColor);
-	VK_Fsr2DestroyImage(&fsr2DilatedReactiveMasks);
-	VK_Fsr2DestroyImage(&fsr2DilatedMotionPrev);
-	VK_Fsr2DestroyImage(&fsr2NewLocks);
 	{
 		uint32_t slot;
 		for (slot = 0; slot < VK_MAX_FRAMES_IN_FLIGHT; ++slot) {
+			VK_Fsr2DestroyImage(&fsr2DilatedDepth[slot]);
+			VK_Fsr2DestroyImage(&fsr2DilatedMotion[slot]);
+			VK_Fsr2DestroyImage(&fsr2ReconstructedPrevDepth[slot]);
+			VK_Fsr2DestroyImage(&fsr2LockInputLuma[slot]);
+			VK_Fsr2DestroyImage(&fsr2PreparedInputColor[slot]);
+			VK_Fsr2DestroyImage(&fsr2DilatedReactiveMasks[slot]);
+			VK_Fsr2DestroyImage(&fsr2DilatedMotionPrev[slot]);
+			VK_Fsr2DestroyImage(&fsr2NewLocks[slot]);
 			VK_Fsr2DestroyImage(&fsr2History[slot]);
 			VK_Fsr2DestroyImage(&fsr2LockStatus[slot]);
 		}
@@ -516,30 +534,29 @@ static qbool VK_Fsr2EnsureImages(void)
 	// so it also needs VK_IMAGE_USAGE_TRANSFER_SRC_BIT (was missing too --
 	// same bug, confirmed by reading the copy call site at the end of
 	// VK_Fsr2Composite).
-	if (!VK_Fsr2CreateImage(&fsr2DilatedDepth, sceneSize.width, sceneSize.height, VK_FORMAT_R32_SFLOAT,
-			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
-	if (!VK_Fsr2CreateImage(&fsr2DilatedMotion, sceneSize.width, sceneSize.height, VK_FORMAT_R16G16_SFLOAT,
-			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
-	// R32_UINT: imageAtomicMax needs an integer format -- the reconstruct
-	// shader stores/reads the float depth's raw bit pattern (floatBitsToUint/
-	// uintBitsToFloat), same technique real FSR2's D3D12/VK backends use for
-	// InterlockedMax on a depth value (see ReconstructPrevDepth's comment).
-	if (!VK_Fsr2CreateImage(&fsr2ReconstructedPrevDepth, sceneSize.width, sceneSize.height, VK_FORMAT_R32_UINT,
-			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
-	if (!VK_Fsr2CreateImage(&fsr2LockInputLuma, sceneSize.width, sceneSize.height, VK_FORMAT_R16_SFLOAT,
-			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
-	if (!VK_Fsr2CreateImage(&fsr2PreparedInputColor, sceneSize.width, sceneSize.height, VK_FORMAT_R16G16B16A16_SFLOAT,
-			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
-	if (!VK_Fsr2CreateImage(&fsr2DilatedReactiveMasks, sceneSize.width, sceneSize.height, VK_FORMAT_R16G16_SFLOAT,
-			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
-	if (!VK_Fsr2CreateImage(&fsr2DilatedMotionPrev, sceneSize.width, sceneSize.height, VK_FORMAT_R16G16_SFLOAT,
-			VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
-	if (!VK_Fsr2CreateImage(&fsr2NewLocks, displaySize.width, displaySize.height, VK_FORMAT_R8_UNORM,
-			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
-
 	{
 		uint32_t slot;
 		for (slot = 0; slot < VK_MAX_FRAMES_IN_FLIGHT; ++slot) {
+			if (!VK_Fsr2CreateImage(&fsr2DilatedDepth[slot], sceneSize.width, sceneSize.height, VK_FORMAT_R32_SFLOAT,
+					VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
+			if (!VK_Fsr2CreateImage(&fsr2DilatedMotion[slot], sceneSize.width, sceneSize.height, VK_FORMAT_R16G16_SFLOAT,
+					VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
+			// R32_UINT: imageAtomicMax needs an integer format -- the reconstruct
+			// shader stores/reads the float depth's raw bit pattern (floatBitsToUint/
+			// uintBitsToFloat), same technique real FSR2's D3D12/VK backends use for
+			// InterlockedMax on a depth value (see ReconstructPrevDepth's comment).
+			if (!VK_Fsr2CreateImage(&fsr2ReconstructedPrevDepth[slot], sceneSize.width, sceneSize.height, VK_FORMAT_R32_UINT,
+					VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
+			if (!VK_Fsr2CreateImage(&fsr2LockInputLuma[slot], sceneSize.width, sceneSize.height, VK_FORMAT_R16_SFLOAT,
+					VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
+			if (!VK_Fsr2CreateImage(&fsr2PreparedInputColor[slot], sceneSize.width, sceneSize.height, VK_FORMAT_R16G16B16A16_SFLOAT,
+					VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
+			if (!VK_Fsr2CreateImage(&fsr2DilatedReactiveMasks[slot], sceneSize.width, sceneSize.height, VK_FORMAT_R16G16_SFLOAT,
+					VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
+			if (!VK_Fsr2CreateImage(&fsr2DilatedMotionPrev[slot], sceneSize.width, sceneSize.height, VK_FORMAT_R16G16_SFLOAT,
+					VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
+			if (!VK_Fsr2CreateImage(&fsr2NewLocks[slot], displaySize.width, displaySize.height, VK_FORMAT_R8_UNORM,
+					VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
 			if (!VK_Fsr2CreateImage(&fsr2History[slot], displaySize.width, displaySize.height, VK_FORMAT_R16G16B16A16_SFLOAT,
 					VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT)) return false;
 			if (!VK_Fsr2CreateImage(&fsr2LockStatus[slot], displaySize.width, displaySize.height, VK_FORMAT_R16G16_SFLOAT,
@@ -581,27 +598,25 @@ static qbool VK_Fsr2EnsureImages(void)
 	// produce a visible glitch for exactly the first frame(s) after every
 	// (re)creation, not just a one-off cosmetic non-issue.
 	{
-		// Fixed-size base list (8 single resources + fsr2FinalOutput) plus
-		// VK_MAX_FRAMES_IN_FLIGHT history/lock-status slots, built at runtime
-		// since a C89 array initializer can't loop -- VK_MAX_FRAMES_IN_FLIGHT
-		// changing requires updating allImagesCount's sizing below too (a
-		// compile-time array bound tied to the same constant, so a mismatch
-		// here would be a buffer overflow, not a silent skip).
-		VkImage allImages[8 + 1 + 2 * VK_MAX_FRAMES_IN_FLIGHT];
+		// All 10 per-frame-in-flight resources plus fsr2FinalOutput, built at
+		// runtime since a C89 array initializer can't loop -- VK_MAX_FRAMES_IN_FLIGHT
+		// changing requires updating allImages' compile-time bound below too
+		// (a mismatch here would be a buffer overflow, not a silent skip).
+		VkImage allImages[10 * VK_MAX_FRAMES_IN_FLIGHT + 1];
 		uint32_t allImagesCount = 0;
-		uint32_t historySlot;
+		uint32_t slot;
 		VkCommandBuffer cmd;
-		allImages[allImagesCount++] = fsr2DilatedDepth.image;
-		allImages[allImagesCount++] = fsr2DilatedMotion.image;
-		allImages[allImagesCount++] = fsr2ReconstructedPrevDepth.image;
-		allImages[allImagesCount++] = fsr2LockInputLuma.image;
-		allImages[allImagesCount++] = fsr2PreparedInputColor.image;
-		allImages[allImagesCount++] = fsr2DilatedReactiveMasks.image;
-		allImages[allImagesCount++] = fsr2DilatedMotionPrev.image;
-		allImages[allImagesCount++] = fsr2NewLocks.image;
-		for (historySlot = 0; historySlot < VK_MAX_FRAMES_IN_FLIGHT; ++historySlot) {
-			allImages[allImagesCount++] = fsr2History[historySlot].image;
-			allImages[allImagesCount++] = fsr2LockStatus[historySlot].image;
+		for (slot = 0; slot < VK_MAX_FRAMES_IN_FLIGHT; ++slot) {
+			allImages[allImagesCount++] = fsr2DilatedDepth[slot].image;
+			allImages[allImagesCount++] = fsr2DilatedMotion[slot].image;
+			allImages[allImagesCount++] = fsr2ReconstructedPrevDepth[slot].image;
+			allImages[allImagesCount++] = fsr2LockInputLuma[slot].image;
+			allImages[allImagesCount++] = fsr2PreparedInputColor[slot].image;
+			allImages[allImagesCount++] = fsr2DilatedReactiveMasks[slot].image;
+			allImages[allImagesCount++] = fsr2DilatedMotionPrev[slot].image;
+			allImages[allImagesCount++] = fsr2NewLocks[slot].image;
+			allImages[allImagesCount++] = fsr2History[slot].image;
+			allImages[allImagesCount++] = fsr2LockStatus[slot].image;
 		}
 		allImages[allImagesCount++] = fsr2FinalOutput.image;
 		cmd = VK_BeginImmediateCommands();
@@ -641,8 +656,20 @@ static qbool VK_Fsr2EnsureImages(void)
 				// matching real FSR2's own ClearResourcesForNextFrame
 				// (ffx_fsr2_lock.h): 0x0 when reversed-depth (this engine's
 				// default, where far=0.0), 0x3f800000 (= 1.0f) otherwise.
-				if (allImages[i] == fsr2ReconstructedPrevDepth.image && !glConfig.reversed_depth) {
-					thisClear.uint32[0] = 0x3f800000u;
+				// Checked against all VK_MAX_FRAMES_IN_FLIGHT slots now that
+				// this is an array, not a single image.
+				{
+					uint32_t checkSlot;
+					qbool isReconstructedPrevDepth = false;
+					for (checkSlot = 0; checkSlot < VK_MAX_FRAMES_IN_FLIGHT; ++checkSlot) {
+						if (allImages[i] == fsr2ReconstructedPrevDepth[checkSlot].image) {
+							isReconstructedPrevDepth = true;
+							break;
+						}
+					}
+					if (isReconstructedPrevDepth && !glConfig.reversed_depth) {
+						thisClear.uint32[0] = 0x3f800000u;
+					}
 				}
 				vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toGeneral);
 				vkCmdClearColorImage(cmd, allImages[i], VK_IMAGE_LAYOUT_GENERAL, &thisClear, 1, &range);
@@ -864,11 +891,21 @@ static qbool VK_Fsr2UpdateDescriptorSets(uint32_t frameSlot, VkImageView sceneCo
 		VkDescriptorImageInfo colorInfo = VK_Fsr2SamplerInfo(sceneColorView, fsr2LinearSampler);
 		VkDescriptorImageInfo depthInfo = VK_Fsr2SamplerInfo(sceneDepthView, fsr2NearestSampler);
 		VkDescriptorImageInfo mvecInfo = VK_Fsr2SamplerInfo(motionVectorsView, fsr2NearestSampler);
-		VkDescriptorImageInfo dilatedDepthImg = VK_Fsr2StorageInfo(fsr2DilatedDepth.view);
-		VkDescriptorImageInfo dilatedMotionImg = VK_Fsr2StorageInfo(fsr2DilatedMotion.view);
-		VkDescriptorImageInfo lockLumaImg = VK_Fsr2StorageInfo(fsr2LockInputLuma.view);
+		VkDescriptorImageInfo dilatedDepthImg = VK_Fsr2StorageInfo(fsr2DilatedDepth[frameSlot].view);
+		VkDescriptorImageInfo dilatedMotionImg = VK_Fsr2StorageInfo(fsr2DilatedMotion[frameSlot].view);
+		VkDescriptorImageInfo lockLumaImg = VK_Fsr2StorageInfo(fsr2LockInputLuma[frameSlot].view);
 		VkDescriptorBufferInfo depthParamsBuf = { fsr2DepthParamsBuffer[frameSlot], 0, sizeof(vk_fsr2_depth_params_t) };
-		VkDescriptorImageInfo prevDepthAtomicImg = VK_Fsr2StorageInfo(fsr2ReconstructedPrevDepth.view);
+		// fsr2ReconstructedPrevDepth[frameSlot] throughout (reconstruct write,
+		// depthclip read, lock reset-write all below) -- NOT readIdx. Despite
+		// the name, this is intra-frame: reconstruct's imageAtomicMax
+		// accumulates into it, depthclip reads that same accumulation a few
+		// passes later in the SAME dispatch, and lock resets it to the
+		// far-plane sentinel at the end, preparing it for the NEXT time this
+		// same frameSlot is used (3 frames later) -- never read across a
+		// frameSlot boundary. Confirmed by reading vk_fsr2_reconstruct.comp's
+		// imageAtomicMax call, vk_fsr2_depthclip.comp's texelFetch reads, and
+		// vk_fsr2_lock.comp's imageStore reset, in pass order.
+		VkDescriptorImageInfo prevDepthAtomicImg = VK_Fsr2StorageInfo(fsr2ReconstructedPrevDepth[frameSlot].view);
 		VkWriteDescriptorSet writes[8];
 		int i;
 		for (i = 0; i < 8; ++i) { VK_InitialiseStructure(writes[i]); writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[i].dstSet = fsr2ReconstructSet[frameSlot]; writes[i].descriptorCount = 1; }
@@ -887,9 +924,9 @@ static qbool VK_Fsr2UpdateDescriptorSets(uint32_t frameSlot, VkImageView sceneCo
 	{
 		VkDescriptorImageInfo colorInfo = VK_Fsr2SamplerInfo(sceneColorView, fsr2LinearSampler);
 		VkDescriptorImageInfo depthInfo = VK_Fsr2SamplerInfo(sceneDepthView, fsr2NearestSampler);
-		VkDescriptorImageInfo dilatedMvInfo = VK_Fsr2SamplerInfo(fsr2DilatedMotion.view, fsr2NearestSampler);
-		VkDescriptorImageInfo dilatedDepthInfo = VK_Fsr2SamplerInfo(fsr2DilatedDepth.view, fsr2NearestSampler);
-		VkDescriptorImageInfo prevDepthInfo = VK_Fsr2SamplerInfo(fsr2ReconstructedPrevDepth.view, fsr2NearestSampler);
+		VkDescriptorImageInfo dilatedMvInfo = VK_Fsr2SamplerInfo(fsr2DilatedMotion[frameSlot].view, fsr2NearestSampler);
+		VkDescriptorImageInfo dilatedDepthInfo = VK_Fsr2SamplerInfo(fsr2DilatedDepth[frameSlot].view, fsr2NearestSampler);
+		VkDescriptorImageInfo prevDepthInfo = VK_Fsr2SamplerInfo(fsr2ReconstructedPrevDepth[frameSlot].view, fsr2NearestSampler);
 		// fsr2DefaultBlack is SHADER_READ_ONLY_OPTIMAL, not GENERAL like every
 		// other sampled image here -- it's sampled-only, cleared once via
 		// vkCmdClearColorImage at creation (see VK_Fsr2EnsureImages), never
@@ -899,9 +936,13 @@ static qbool VK_Fsr2UpdateDescriptorSets(uint32_t frameSlot, VkImageView sceneCo
 		VkDescriptorImageInfo compositionInfo = VK_Fsr2SamplerInfo(fsr2DefaultBlack.view, fsr2NearestSampler);
 		reactiveInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 		compositionInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-		VkDescriptorImageInfo prevDilatedMvInfo = VK_Fsr2SamplerInfo(fsr2DilatedMotionPrev.view, fsr2NearestSampler);
-		VkDescriptorImageInfo preparedOutImg = VK_Fsr2StorageInfo(fsr2PreparedInputColor.view);
-		VkDescriptorImageInfo dilatedReactiveOutImg = VK_Fsr2StorageInfo(fsr2DilatedReactiveMasks.view);
+		// fsr2DilatedMotionPrev[readIdx], NOT frameSlot -- this one IS genuinely
+		// cross-frame: the end of VK_Fsr2Composite copies THIS frame's
+		// fsr2DilatedMotion into fsr2DilatedMotionPrev for the NEXT frame to
+		// read here. Same read-previous-frame's-slot semantics as fsr2History.
+		VkDescriptorImageInfo prevDilatedMvInfo = VK_Fsr2SamplerInfo(fsr2DilatedMotionPrev[readIdx].view, fsr2NearestSampler);
+		VkDescriptorImageInfo preparedOutImg = VK_Fsr2StorageInfo(fsr2PreparedInputColor[frameSlot].view);
+		VkDescriptorImageInfo dilatedReactiveOutImg = VK_Fsr2StorageInfo(fsr2DilatedReactiveMasks[frameSlot].view);
 		VkDescriptorBufferInfo depthParamsBuf = { fsr2DepthParamsBuffer[frameSlot], 0, sizeof(vk_fsr2_depth_params_t) };
 		VkDescriptorBufferInfo viewProjParamsBuf = { fsr2ViewProjParamsBuffer[frameSlot], 0, sizeof(vk_fsr2_viewproj_params_t) };
 		VkWriteDescriptorSet writes[12];
@@ -924,9 +965,9 @@ static qbool VK_Fsr2UpdateDescriptorSets(uint32_t frameSlot, VkImageView sceneCo
 
 	// -- lock: 0 lockInputLuma 1 newLocksOut(i) 2 reconstructedPrevDepthOut(i)
 	{
-		VkDescriptorImageInfo lumaInfo = VK_Fsr2SamplerInfo(fsr2LockInputLuma.view, fsr2NearestSampler);
-		VkDescriptorImageInfo newLocksImg = VK_Fsr2StorageInfo(fsr2NewLocks.view);
-		VkDescriptorImageInfo prevDepthImg = VK_Fsr2StorageInfo(fsr2ReconstructedPrevDepth.view);
+		VkDescriptorImageInfo lumaInfo = VK_Fsr2SamplerInfo(fsr2LockInputLuma[frameSlot].view, fsr2NearestSampler);
+		VkDescriptorImageInfo newLocksImg = VK_Fsr2StorageInfo(fsr2NewLocks[frameSlot].view);
+		VkDescriptorImageInfo prevDepthImg = VK_Fsr2StorageInfo(fsr2ReconstructedPrevDepth[frameSlot].view);
 		VkWriteDescriptorSet writes[3];
 		int i;
 		for (i = 0; i < 3; ++i) { VK_InitialiseStructure(writes[i]); writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[i].dstSet = fsr2LockSet[frameSlot]; writes[i].descriptorCount = 1; }
@@ -938,15 +979,15 @@ static qbool VK_Fsr2UpdateDescriptorSets(uint32_t frameSlot, VkImageView sceneCo
 
 	// -- accumulate: 0 prepared 1 dilatedReactive 2 lockInputLuma 3 dilatedMotion(HR-sampled-as-LR) 4 history(read) 5 lockStatus(read) | 6 upscaledOut(i) 7 lockStatusOut(i) | 8 newLocks
 	{
-		VkDescriptorImageInfo preparedInfo = VK_Fsr2SamplerInfo(fsr2PreparedInputColor.view, fsr2LinearSampler);
-		VkDescriptorImageInfo dilatedReactiveInfo = VK_Fsr2SamplerInfo(fsr2DilatedReactiveMasks.view, fsr2LinearSampler);
-		VkDescriptorImageInfo lumaInfo = VK_Fsr2SamplerInfo(fsr2LockInputLuma.view, fsr2NearestSampler);
-		VkDescriptorImageInfo dilatedMotionInfo = VK_Fsr2SamplerInfo(fsr2DilatedMotion.view, fsr2NearestSampler);
+		VkDescriptorImageInfo preparedInfo = VK_Fsr2SamplerInfo(fsr2PreparedInputColor[frameSlot].view, fsr2LinearSampler);
+		VkDescriptorImageInfo dilatedReactiveInfo = VK_Fsr2SamplerInfo(fsr2DilatedReactiveMasks[frameSlot].view, fsr2LinearSampler);
+		VkDescriptorImageInfo lumaInfo = VK_Fsr2SamplerInfo(fsr2LockInputLuma[frameSlot].view, fsr2NearestSampler);
+		VkDescriptorImageInfo dilatedMotionInfo = VK_Fsr2SamplerInfo(fsr2DilatedMotion[frameSlot].view, fsr2NearestSampler);
 		VkDescriptorImageInfo historyInfo = VK_Fsr2SamplerInfo(fsr2History[readIdx].view, fsr2LinearSampler);
 		VkDescriptorImageInfo lockStatusInfo = VK_Fsr2SamplerInfo(fsr2LockStatus[readIdx].view, fsr2LinearSampler);
 		VkDescriptorImageInfo upscaledOutImg = VK_Fsr2StorageInfo(fsr2History[writeIdx].view);
 		VkDescriptorImageInfo lockStatusOutImg = VK_Fsr2StorageInfo(fsr2LockStatus[writeIdx].view);
-		VkDescriptorImageInfo newLocksInfo = VK_Fsr2SamplerInfo(fsr2NewLocks.view, fsr2NearestSampler);
+		VkDescriptorImageInfo newLocksInfo = VK_Fsr2SamplerInfo(fsr2NewLocks[frameSlot].view, fsr2NearestSampler);
 		VkWriteDescriptorSet writes[9];
 		int i;
 		for (i = 0; i < 9; ++i) { VK_InitialiseStructure(writes[i]); writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; writes[i].dstSet = fsr2AccumulateSet[frameSlot]; writes[i].descriptorCount = 1; }
@@ -1110,7 +1151,7 @@ qbool VK_Fsr2Composite(VkCommandBuffer commandBuffer, uint32_t frameSlot, VkImag
 	// requirement real FSR2's own firstExecution/resetAccumulation clear
 	// jobs satisfy) --
 	{
-		VkImageMemoryBarrier toTransferDst = VK_UpscaleMakeImageBarrier(fsr2NewLocks.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+		VkImageMemoryBarrier toTransferDst = VK_UpscaleMakeImageBarrier(fsr2NewLocks[frameSlot].image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
 		VkImageMemoryBarrier backToGeneral;
 		VkClearColorValue clearColor = { { 0 } };
 		VkImageSubresourceRange range;
@@ -1120,8 +1161,8 @@ qbool VK_Fsr2Composite(VkCommandBuffer commandBuffer, uint32_t frameSlot, VkImag
 		range.layerCount = 1;
 
 		vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &toTransferDst);
-		vkCmdClearColorImage(commandBuffer, fsr2NewLocks.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearColor, 1, &range);
-		backToGeneral = VK_UpscaleMakeImageBarrier(fsr2NewLocks.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
+		vkCmdClearColorImage(commandBuffer, fsr2NewLocks[frameSlot].image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearColor, 1, &range);
+		backToGeneral = VK_UpscaleMakeImageBarrier(fsr2NewLocks[frameSlot].image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
 		vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &backToGeneral);
 	}
 
@@ -1235,8 +1276,13 @@ qbool VK_Fsr2Composite(VkCommandBuffer commandBuffer, uint32_t frameSlot, VkImag
 
 	// -- ping-pong for next frame --
 	{
-		VkImageMemoryBarrier copySrcToTransferSrc = VK_UpscaleMakeImageBarrier(fsr2DilatedMotion.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-		VkImageMemoryBarrier copyDstToTransferDst = VK_UpscaleMakeImageBarrier(fsr2DilatedMotionPrev.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+		// fsr2DilatedMotion[frameSlot] (this frame's own) copied into
+		// fsr2DilatedMotionPrev[frameSlot] -- the NEXT frame reads it via
+		// readIdx = that frame's (frameSlot - 1), which equals THIS frame's
+		// frameSlot, so writing to the same index here is correct (not a
+		// mistake that should've been writeIdx/readIdx-styled differently).
+		VkImageMemoryBarrier copySrcToTransferSrc = VK_UpscaleMakeImageBarrier(fsr2DilatedMotion[frameSlot].image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+		VkImageMemoryBarrier copyDstToTransferDst = VK_UpscaleMakeImageBarrier(fsr2DilatedMotionPrev[frameSlot].image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
 		VkImageMemoryBarrier copySrcBack, copyDstBack;
 		VkImageCopy mvCopyRegion;
 
@@ -1253,10 +1299,10 @@ qbool VK_Fsr2Composite(VkCommandBuffer commandBuffer, uint32_t frameSlot, VkImag
 		mvCopyRegion.extent.width = fsr2SceneSize.width;
 		mvCopyRegion.extent.height = fsr2SceneSize.height;
 		mvCopyRegion.extent.depth = 1;
-		vkCmdCopyImage(commandBuffer, fsr2DilatedMotion.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, fsr2DilatedMotionPrev.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &mvCopyRegion);
+		vkCmdCopyImage(commandBuffer, fsr2DilatedMotion[frameSlot].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, fsr2DilatedMotionPrev[frameSlot].image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &mvCopyRegion);
 
-		copySrcBack = VK_UpscaleMakeImageBarrier(fsr2DilatedMotion.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
-		copyDstBack = VK_UpscaleMakeImageBarrier(fsr2DilatedMotionPrev.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+		copySrcBack = VK_UpscaleMakeImageBarrier(fsr2DilatedMotion[frameSlot].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
+		copyDstBack = VK_UpscaleMakeImageBarrier(fsr2DilatedMotionPrev[frameSlot].image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
 		{
 			VkImageMemoryBarrier barriers[2] = { copySrcBack, copyDstBack };
 			vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 0, NULL, 2, barriers);
