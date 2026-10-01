@@ -37,7 +37,7 @@ Não atualizar SDKs automaticamente para master: documentar revisão e justifica
 
 - [x] Identificar worktree correto e comparar hash remoto da baseline.
 - [x] Registrar regras persistentes em AGENTS.md e este plano.
-- [ ] Registrar build baseline com exit code, warnings, hash do exe e configuração.
+- [x] Registrar build baseline com exit code, warnings, hash do exe e configuração. Ver `CONTINUE.md`, sessão 2026-10-01.
 - [ ] Registrar cenário offline reproduzível: dm3, câmera parada, giro, centro/paredes, partículas.
 - [ ] Confirmar backend realmente executado; hoje modo FSR2 pode cair no código antigo.
 - [ ] Registrar evidência visual/log fresca dos artefatos sem atribuir causa por suposição.

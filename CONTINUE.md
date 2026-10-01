@@ -1,5 +1,43 @@
 # Onde paramos — Vulkan renderer / SDL3 port
 
+## Checkpoint 2026-10-01 — SDK FSR2 oficial AMD compila limpo, baseline registrada
+
+Leia `AGENTS.md` e `UPSCALING_PLAN.md` primeiro. Trabalho prévio não commitado (submodule
+`external/fsr2` pinned em `v2.2.1`/`1680d1edd5c034f88ebbbb793d8b88f8842cf804`, `cmake/fsr2/CMakeLists.txt`,
+gate condicional em `CMakeLists.txt`, `tools/build-upscaling.cmd`, `cmake/GitUtils.cmake` com
+submodule update seletivo) estava correto e completo — build real confirma.
+
+**Build baseline real executado**: `tools\build-upscaling.cmd` (preset `msvc-x64`,
+config `RelWithDebInfo`, Ninja), exit code real **0** (não filtrado, não `tail`).
+316/316 alvos. Log completo salvo em
+`C:\Users\Tiago\AppData\Local\Temp\claude\E--Projetos-Linux-ezquake-sdl3-vulkan-pr\e44e1012-7f5e-410c-97a8-3986308e6eb5\tasks\bvcla2nze.output`.
+
+- SDK FSR2 oficial AMD (core `ffx_fsr2_api_x64.lib` + backend Vulkan `ffx_fsr2_api_vk_x64.lib`)
+  compilou e linkou sem erro. 316 permutações de shader geradas (GLSL→header, várias com
+  dezenas de duplicatas detectadas pelo próprio gerador AMD — comportamento esperado do SDK,
+  não bug nosso).
+- Warnings presentes são todos pré-existentes, em arquivos não tocados por este trabalho
+  (`cmodel.c`, `pr2_cmds.c`, `sv_demo_misc.c`, `vm.c`, `demo_extension.c`, `ez_controls.c`,
+  `ez_button.c`, `vid_sdl.c`, `gl_drawcall_wrappers.c` — C4267/C5286/C5287/C4090). Nenhum
+  warning novo de ABI/protótipo/formato/ponteiro introduzido pela integração FSR2.
+- `src/vk_fsr2.c.obj` ainda compila a partir do shim antigo (reimplementação própria,
+  não ligado à API oficial ainda) — confirma que Fase 2 (shim C mínimo chamando
+  `ffxFsr2GetInterfaceVK`/`ffxFsr2ContextCreate`/`ffxFsr2ContextDispatch`) é o próximo passo
+  real, ainda não feito.
+- Exe gerado: `build-msvc-x64/RelWithDebInfo/ezquake.exe`,
+  sha256 `1321df985278da198f4861e52d8d1fcb62a60542cdea7654793463f34662b9fb`.
+  **Não deployado** em `C:\ezquake\ezquakefsrtest.exe` — não autorizado ainda nesta sessão,
+  e o shim ainda não usa o SDK oficial, então não há nada novo pra validar visualmente.
+- Fase 0 do checklist: baseline de build marcada `[x]`. Cenário offline reproduzível (dm3
+  parado/giro/centro/partículas) e confirmação de qual backend está de fato executando
+  continuam pendentes — não tocados nesta etapa.
+
+**Próxima ação real**: Fase 2 — criar o shim C mínimo (`vk_fsr2.c` reescrito) que chama as
+interfaces oficiais do SDK agora compilado, substituindo a reimplementação própria descrita
+na Fase 1 do plano. Rastrear primeiro os problemas de recurso/layout/pool já catalogados em
+`UPSCALING_PLAN.md` Fase 1 antes de religar o dispatch, já que o shim antigo tem bugs
+confirmados (gate de motion vectors, pool de sampler, layouts, teardown ausente).
+
 ## Checkpoint 2026-09-30 — revisão Codex e plano de recuperação
 
 Leia `AGENTS.md` e `UPSCALING_PLAN.md` antes de continuar. Eles prevalecem sobre
