@@ -46,11 +46,29 @@ vivo (mesma classe dos bugs do hand-port: formato de copy, agora também
 corrigido lá). Nenhuma validação visual ainda -- só leitura de código, build
 limpo e um smoke test inconclusivo (sem crash, sem log capturado).
 
-**Próxima ação real**: Fase 3 (entradas temporais corretas) do plano, ou
-aguardar o Tiago testar visualmente os fixes já feitos antes de ir mais
-fundo -- a lista de bugs corrigidos sem validação visual já é grande o
-suficiente que mais mudança sem feedback real aumenta risco de acumular
-erro sobre erro não detectado.
+**Investigação adicional (sem fix ainda)**: ao revisar o fix de history,
+encontrei um achado maior -- as 8 imagens "scratch" de baixa resolução do
+hand-port (`fsr2DilatedDepth`, `fsr2DilatedMotion`, `fsr2ReconstructedPrevDepth`,
+`fsr2LockInputLuma`, `fsr2PreparedInputColor`, `fsr2DilatedReactiveMasks`,
+`fsr2DilatedMotionPrev`, `fsr2NewLocks`) são instâncias ÚNICAS sem slot
+per-frame-in-flight nenhum. Confirmei no `vk_main.c` que o motor realmente
+pode ter até 3 command buffers distintos executando CONCORRENTEMENTE na GPU
+(`vkQueueSubmit` 1x por frame, cada frameSlot só espera o PRÓPRIO fence antes
+de regravar) -- então nada impede o command buffer do frame N+1 escrever
+nessas imagens enquanto o do frame N ainda está rodando. Documentado em
+`UPSCALING_PLAN.md` como a maior pendência real de Fase 1, NÃO corrigido --
+afeta potencialmente mais do que o bug de history já corrigido, mas precisa
+de investigação cuidadosa pra separar o que é dependência cross-frame real
+(tipo `fsr2ReconstructedPrevDepth`) do que é scratch puramente intra-frame,
+decisão melhor tomada com o Tiago podendo validar visualmente em sequência.
+
+**Próxima ação real**: investigar e corrigir a race das 8 imagens scratch
+acima (maior pendência técnica aberta), OU parar pra validação visual real
+antes de continuar -- a lista de bugs corrigidos sem nenhum teste visual já
+é grande (6 bugs confirmados/corrigidos + este achado novo não corrigido)
+o suficiente que mais mudança sem feedback real aumenta risco de acumular
+erro sobre erro não detectado. Fase 3 (entradas temporais corretas) do plano
+continua sem começar.
 
 ## Checkpoint 2026-10-01 (parte 7) — bug real corrigido: falha de immediate commands reportava sucesso (hand-port)
 
