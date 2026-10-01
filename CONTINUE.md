@@ -37,11 +37,29 @@ precisa ser refeito agora que o gate está corrigido -- e com um
 basedir/config isolado, para não repetir o auto-connect relatado na mesma
 parte 2.
 
-**Próxima ação real**: refazer o smoke test (`vid_vulkan_upscaler 3`,
-`-dev -condebug`, basedir isolado desta vez) e desta vez procurar de verdade
-por `vulkan: FSR2 SDK diagnostic` (sucesso ou falha) e por VUID novos
-específicos do dispatch oficial no log -- esses sinais só existem agora que
-o gate deixa o código rodar.
+**Smoke test refeito com o gate corrigido, em diretório isolado** (`id1` copiado,
+sem `ezquake/configs`, sem autoexec -- evitou o auto-connect da parte 2):
+`-dev -condebug +set vid_renderer 2 +set vid_vulkan_upscaler 3
++set vid_vulkan_renderscale 0.66 +map dm3`. Processo ficou vivo ~35s, memória
+estável, `qw/vulkan/pipeline_cache.bin` escrito (pipelines compilaram),
+encerramento limpo via `taskkill` sem `/F` (sem crash, sem dialog de erro).
+**Mas**: `-condebug` não gerou `qw/qconsole.log` neste ambiente isolado (sem
+config pessoal talvez falte algo que normalmente cria o diretório `logs/` ou
+ativa o log) -- não consegui capturar o texto real do console, incluindo se
+`vulkan: FSR2 SDK diagnostic` apareceu ou não, nem VUIDs específicos do
+dispatch oficial. Evidência indireta (não crashou, não travou, pipeline cache
+escrito) é positiva mas não conclusiva -- mesma limitação de automação já
+registrada em sessões anteriores (`project_desktop_screen_capture_technique.md`,
+notas de sessão 2026-08-05 sobre `SendKeys`/injeção de comando não funcionar
+neste ambiente).
+
+**Próxima ação real**: validação visual real precisa do Tiago olhando a tela
+ao vivo (mesmo protocolo já estabelecido em sessões anteriores) -- captura de
+log automatizada não está resolvida neste ambiente de teste isolado. Enquanto
+isso, próximo trabalho seguro sem precisar de teste ao vivo: continuar a
+auditoria dos itens restantes de Fase 1 do hand-port por leitura de código
+(VK_Fsr2DestroyResources sem caller, immediate commands sem checagem de
+retorno, barreiras entre frames).
 
 ## Checkpoint 2026-10-01 (parte 4) — bugs reais de usage flags corrigidos (hand-port)
 
