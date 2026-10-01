@@ -159,6 +159,22 @@ dos shaders próprios podem ser eliminados pela substituição oficial, sem retr
   possibilidade de teste ao vivo em sequência (muita mudança sem validação
   acumulando risco).
 
+  **Escopo real é maior do que só essas 2 imagens**: ao investigar o fix,
+  percebi que TODAS as 8 imagens "scratch" de baixa resolução
+  (`fsr2DilatedDepth`, `fsr2ReconstructedPrevDepth`, `fsr2LockInputLuma`,
+  `fsr2PreparedInputColor`, `fsr2DilatedReactiveMasks`, `fsr2NewLocks`, além
+  das 2 já citadas) são instâncias ÚNICAS, sem slot algum, escritas e lidas
+  dentro do mesmo command buffer de um frame -- mas nada impede o command
+  buffer do frame N+1 começar a escrever nelas enquanto o command buffer do
+  frame N ainda está executando na GPU (frames em voo reais). A barreira
+  intra-CB (`VK_Fsr2Barrier`) ordena corretamente os passes DENTRO de um
+  frame, mas não impede sobreposição ENTRE command buffers diferentes.
+  Investigação completa (quais dessas são genuinamente só-leitura-mesmo-frame
+  vs quais têm alguma dependência cross-frame como `fsr2ReconstructedPrevDepth`/
+  `fsr2DilatedMotion`) é trabalho não trivial, precisa de atenção dedicada --
+  registrado aqui como a pendência mais importante da Fase 1 ainda aberta,
+  maior que qualquer item individual já corrigido nesta sessão.
+
 ## Fase 2 — SDK oficial AMD
 
 - [x] Incorporar dependência fixada com licença, instrução de build e hashes.
