@@ -229,6 +229,22 @@ void VK_Fsr2InvalidateHistory(void);
 qbool VK_Fsr2Composite(VkCommandBuffer commandBuffer, uint32_t frameSlot, VkImageView sceneColorView, VkImageView sceneDepthView, VkImageView motionVectorsView,
 	VkImage dstImage, VkImageLayout dstImageLayoutBeforeCopy, VkImageLayout dstImageLayoutAfterCopy);
 
+// vk_fsr2_sdk_bridge.c / vk_fsr2_sdk.cpp -- official AMD FSR2 SDK
+// (external/fsr2, pinned v2.2.1), a separate opt-in path from vk_fsr2.c's
+// hand-port -- see vid_vulkan_upscaler==3. The actual SDK calls live in
+// vk_fsr2_sdk.cpp (pure C++, no engine headers -- see its own header
+// comment for why); this file's bridge (vk_fsr2_sdk_bridge.c) gathers
+// engine state and exposes the usual C ABI used by every other call site.
+// NOT validated live yet; do not treat as the recommended FSR2 path until
+// UPSCALING_PLAN.md Fase 7 is met.
+qbool VK_Fsr2SdkCreateResources(void);
+void VK_Fsr2SdkDestroyResourcesWrapper(void);
+void VK_Fsr2SdkInvalidateHistoryWrapper(void);
+qbool VK_Fsr2SdkCompositeWrapper(VkCommandBuffer commandBuffer, VkImage sceneColorImage, VkImageView sceneColorView,
+	VkImage sceneDepthImage, VkImageView sceneDepthView, VkImage motionVectorsImage, VkImageView motionVectorsView,
+	VkExtent2D sceneSize, VkExtent2D displaySize, float jitterX, float jitterY,
+	VkImage dstImage, VkImageLayout dstImageLayoutBeforeCopy, VkImageLayout dstImageLayoutAfterCopy);
+
 // vk_blending.c
 void VK_BlendingConfigure(VkPipelineColorBlendStateCreateInfo* info, VkPipelineColorBlendAttachmentState* blending, r_blendfunc_t func);
 

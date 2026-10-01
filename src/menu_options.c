@@ -463,7 +463,8 @@ const char* vid_software_palette_enum[] = {
 const char* vid_vulkan_upscaler_enum[] = {
 	"off", "0",
 	"FSR2", "1",
-	"DLSS (not yet implemented, uses FSR2)", "2"
+	"DLSS (not yet implemented, uses FSR2)", "2",
+	"FSR2 (official SDK, experimental)", "3"
 };
 
 #ifdef EZ_MULTIPLE_RENDERERS

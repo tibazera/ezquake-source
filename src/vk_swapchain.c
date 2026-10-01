@@ -1108,6 +1108,7 @@ qbool VK_CreateSwapChainFramebuffers(void)
 void VK_DestroySwapChainFramebuffers(void)
 {
 	VK_Fsr2DestroyResources();
+	VK_Fsr2SdkDestroyResourcesWrapper();
 	VK_DestroyUpscaleResources();
 	VK_DestroyPostProcessResources();
 	VK_DestroyWorldNormalsResources();

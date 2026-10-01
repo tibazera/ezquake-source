@@ -67,19 +67,37 @@ dos shaders próprios podem ser eliminados pela substituição oficial, sem retr
 
 ## Fase 2 — SDK oficial AMD
 
-- [ ] Incorporar dependência fixada com licença, instrução de build e hashes.
-- [ ] Compilar core/backend Vulkan e shaders oficiais; habilitar C++ só onde necessário.
-- [ ] Criar shim C mínimo: create, dispatch, destroy e acesso ao jitter oficial.
-- [ ] Criar contexto com flags de depth invertido/infinito, HDR e motion vectors
-  coerentes com os recursos reais. Verificar recursos/features necessários no device.
-- [ ] Chamar ffxFsr2GetInterfaceVK e gerir scratch/context conforme headers da revisão.
-- [ ] Dispatch via ffxFsr2ContextDispatch com color, depth, motion, output,
+- [x] Incorporar dependência fixada com licença, instrução de build e hashes.
+  Ver `CONTINUE.md` sessão 2026-10-01: submodule `external/fsr2` em v2.2.1.
+- [x] Compilar core/backend Vulkan e shaders oficiais; habilitar C++ só onde necessário.
+- [x] Criar shim C mínimo: create, dispatch, destroy e acesso ao jitter oficial.
+  `src/vk_fsr2_sdk.cpp` (C++ puro, sem headers do motor -- ver comentário do
+  próprio arquivo) + `src/vk_fsr2_sdk_bridge.c` (ABI C, reúne estado do motor).
+  Caminho novo e PARALELO ao hand-port (`vid_vulkan_upscaler==3`), hand-port
+  original (`==1`) intacto -- nenhuma substituição silenciosa.
+- [x] Criar contexto com flags de depth invertido/infinito, HDR e motion vectors
+  coerentes com os recursos reais. `FFX_FSR2_ENABLE_DEPTH_INVERTED` condicional a
+  `glConfig.reversed_depth`; `FFX_FSR2_ENABLE_AUTO_EXPOSURE` sempre ligado (motor
+  não fornece exposure externo); sem `DEPTH_INFINITE` (far plane sempre finito,
+  `R_FarPlaneZ`). Features/extensões de device NÃO auditadas ainda contra
+  `ffxFsr2GetDeviceCapabilitiesVK` -- pendência real.
+- [x] Chamar ffxFsr2GetInterfaceVK e gerir scratch/context conforme headers da revisão.
+- [x] Dispatch via ffxFsr2ContextDispatch com color, depth, motion, output,
   renderSize, jitter, motionVectorScale, cameraNear/Far/FOV, frameTimeDelta em ms,
-  preExposure/exposure, reset e sharpness corretos.
+  preExposure/exposure, reset e sharpness corretos. Compilação confirmada
+  (ver checkpoint); valores corretos (sinais, convenções) NÃO confirmados
+  visualmente -- só verificados contra comentários/fórmulas já usadas pelo
+  hand-port (vk_fsr2.c) e vk_dlss.c, não testados ao vivo.
 - [ ] Usar ffxFsr2GetJitterPhaseCount/GetJitterOffset; remover tabela fixa de 8 fases
-  e garantir mesma amostra/signo no desenho e no dispatch.
+  e garantir mesma amostra/signo no desenho e no dispatch. NÃO feito -- este
+  caminho ainda reusa `VK_JitterPixelOffset` (tabela Halton-8 fixa do motor,
+  mesma do hand-port), não a sequência própria do SDK oficial.
 - [ ] Usar luminance pyramid/locks/luma history do SDK, sem substituir por luma direta.
+  Delegado inteiramente ao SDK (dispatch único, sem acesso a passes internos) --
+  não há substituição por luma direta neste caminho, mas também não auditado.
 - [ ] Remover cinco shaders próprios e referências de CMake após caminho oficial compilar.
+  NÃO remover ainda -- caminho oficial compila mas não foi validado visualmente;
+  remover o hand-port agora seria a "substituição silenciosa" que AGENTS.md proíbe.
 - [ ] Remover fallback EASU/TAA ou identificá-lo explicitamente como fallback espacial.
 
 ## Fase 3 — entradas temporais corretas

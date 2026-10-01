@@ -546,6 +546,8 @@ if(RENDERER_VULKAN)
             ${SOURCE_DIR}/vk_texture.c
             ${SOURCE_DIR}/vk_dlss.c
             ${SOURCE_DIR}/vk_fsr2.c
+            ${SOURCE_DIR}/vk_fsr2_sdk.cpp
+            ${SOURCE_DIR}/vk_fsr2_sdk_bridge.c
             ${SOURCE_DIR}/vk_upscale.c
             ${SOURCE_DIR}/vk_vao.c
             ${SOURCE_DIR}/vk_window_surface.c
@@ -1066,6 +1068,13 @@ endif()
 
 if(RENDERER_VULKAN)
     target_link_libraries(ezquake PRIVATE Vulkan::Vulkan)
+    # Official AMD FSR2 SDK (vk_fsr2_sdk.cpp, vid_vulkan_upscaler==3) --
+    # targets only exist when cmake/fsr2's add_subdirectory ran (see the
+    # RENDERER_VULKAN/WIN32/MSVC/x64 gate near the top of this file).
+    if(TARGET ffx_fsr2_api_vk_x64)
+        target_include_directories(ezquake PRIVATE ${PROJECT_SOURCE_DIR}/external/fsr2/src/ffx-fsr2-api)
+        target_link_libraries(ezquake PRIVATE ffx_fsr2_api_vk_x64 ffx_fsr2_api_x64)
+    endif()
 endif()
 
 if(MATH)

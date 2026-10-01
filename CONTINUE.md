@@ -1,6 +1,75 @@
 # Onde paramos — Vulkan renderer / SDL3 port
 
-## Checkpoint 2026-10-01 — SDK FSR2 oficial AMD compila limpo, baseline registrada
+## Checkpoint 2026-10-01 (parte 2) — shim C++/C do SDK FSR2 oficial, caminho novo e paralelo, compila limpo
+
+Leia `AGENTS.md` e `UPSCALING_PLAN.md` primeiro. Continuação da sessão abaixo
+("SDK FSR2 oficial AMD compila limpo, baseline registrada").
+
+**O que foi feito**: dispatch real contra a API oficial do FSR2 (`ffxFsr2ContextCreate`/
+`ffxFsr2ContextDispatch`/`ffxFsr2ContextDestroy`), não apenas a SDK vendorizada --
+isso é Fase 2 do plano, não Fase 0/1. Dois arquivos novos:
+
+- `src/vk_fsr2_sdk.cpp`: C++ puro, só inclui `<vulkan/vulkan.h>` e os headers da
+  SDK FSR2 -- NENHUM header do motor. Motivo real, não estético: `q_shared.h` faz
+  `#undef true/false` + `typedef enum {false,true} qbool`, que não compila como
+  C++ (testado ao vivo, build quebrou com ~100 erros em cascata na 1ª tentativa
+  até isolar a causa). Expõe ABI C pura (`VK_Fsr2SdkInit`, `VK_Fsr2SdkComposite`,
+  etc) recebendo só tipos Vulkan/primitivos, nunca tipos do motor.
+- `src/vk_fsr2_sdk_bridge.c`: C normal, inclui `quakedef.h`/`vk_local.h` como
+  qualquer outro arquivo do backend Vulkan, reúne cvars/câmera/frametime e chama
+  as funções do `.cpp` acima. É o único arquivo que conhece os dois mundos.
+
+**Caminho NOVO e PARALELO**, não substitui nada: `vid_vulkan_upscaler==3` ("FSR2
+(official SDK, experimental)" no menu), `==1` (hand-port, `vk_fsr2.c`) continua
+intacto e é o default recomendado até este caminho passar por Fase 7. Integrado
+em `vk_main.c` no mesmo ponto dos outros dois caminhos (fora do render pass
+principal, mesmo padrão de invalidação de histórico cruzada entre os 3 caminhos
+agora -- hand-port, SDK oficial, DLSS -- cada um invalida os outros dois quando
+vence o frame). Teardown ligado em `VK_DestroySwapChainFramebuffers`.
+
+**2 bugs reais corrigidos durante a integração, ambos confirmados por erro real
+do compilador** (não suposição):
+1. Primeira versão do `.cpp` incluía `quakedef.h`/`vk_local.h` direto (como
+   `vk_dlss.c` faz, mas aquele é `.c`, não `.cpp`) -- gerou ~100 erros em cascata
+   a partir de `q_shared.h`'s `qbool`. Corrigido isolando o `.cpp` de qualquer
+   header do motor (ver acima).
+2. `cl.frametime` não existe -- `cl` é `clientState_t` (`client.h:619-847`);
+   `frametime` pertence a `clientPersistent_t cls` (`client.h:439-582`, campo na
+   linha 452). Erro do MSVC apontou a declaração errada até eu contar chaves
+   manualmente linha por linha para achar o struct certo. Corrigido para
+   `cls.frametime`.
+
+**Build confirmado limpo do zero** (objetos dos 5 arquivos tocados apagados e
+reconstruídos): exit code real 0, sem warning novo. Log em
+`C:\Users\Tiago\AppData\Local\Temp\claude\E--Projetos-Linux-ezquake-sdl3-vulkan-pr\e44e1012-7f5e-410c-97a8-3986308e6eb5\tasks\bpb7lhjrg.output`.
+Hash do exe: `94f151fe8e5dad4d93395a7abc788e54c072bbef169954a41fdb4c2f90003c65`.
+
+**Verificado contra upstream, não suposto**: `FFX_RESOURCE_STATE_UNORDERED_ACCESS`
+mapeia para `VK_IMAGE_LAYOUT_GENERAL` no backend VK oficial (conferido lendo
+`external/fsr2/src/ffx-fsr2-api/vk/ffx_fsr2_vk.cpp:357-359`), não assumido por
+analogia com o hand-port -- a barreira do output image em `vk_fsr2_sdk.cpp` usa
+essa transição confirmada.
+
+**NÃO testado ao vivo, NÃO validar como pronto**: compila e linka, nada mais.
+Pendências reais e específicas (ver `UPSCALING_PLAN.md` Fase 2 atualizada):
+- Jitter: reusa a tabela Halton-8 fixa do motor (`VK_JitterPixelOffset`), não
+  `ffxFsr2GetJitterPhaseCount`/`GetJitterOffset` do SDK oficial -- o plano pede
+  isso explicitamente e não foi feito.
+- Capacidades de device (`ffxFsr2GetDeviceCapabilitiesVK`) não auditadas contra
+  o que a GPU/driver realmente oferece.
+- Sinais/convenções de jitter, motion vector scale, depth params -- só
+  verificados por leitura de fórmula, nunca em tela.
+- RCAS da SDK oficial habilitado via `enableSharpening`, nunca visto rodando.
+- vid_restart, resize, troca de preset em runtime -- não exercitados neste
+  caminho ainda (hand-port já passou por isso, este não).
+
+**Próxima ação real**: testar ao vivo com `vid_vulkan_upscaler 3` + `vid_restart`,
+mesmo protocolo dm3/giro/paredes/partículas da Fase 7, procurando especificamente
+por crash imediato (erro de API mal-formado) antes de qualquer julgamento de
+qualidade visual. Se crashar, capturar log com `-dev` (validation layers) antes
+de tentar debugar sem evidência.
+
+## Checkpoint 2026-10-01 (parte 1) — SDK FSR2 oficial AMD compila limpo, baseline registrada
 
 Leia `AGENTS.md` e `UPSCALING_PLAN.md` primeiro. Trabalho prévio não commitado (submodule
 `external/fsr2` pinned em `v2.2.1`/`1680d1edd5c034f88ebbbb793d8b88f8842cf804`, `cmake/fsr2/CMakeLists.txt`,

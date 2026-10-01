@@ -73,6 +73,7 @@ static uint32_t vk_force_clear_frames_remaining;
 extern cvar_t gl_clear;
 extern cvar_t cl_multiview;
 extern cvar_t v_contrast;
+extern cvar_t vid_vulkan_upscaler;
 
 
 void VK_DrawImage(float x, float y, float width, float height, float tex_s, float tex_t, float tex_width, float tex_height, byte* color, int flags);
@@ -1053,6 +1054,28 @@ void VK_EndWorldPassAndComposite(void)
 				// invalidates this path's history when DLSS handles a frame.
 				if (fsr2HandledThisFrame) {
 					VK_DLSS_InvalidateHistory();
+					VK_Fsr2SdkInvalidateHistoryWrapper();
+				}
+			}
+
+			// Official FSR2 SDK path (vid_vulkan_upscaler==3): separate opt-in
+			// from the hand-port above, see vk_fsr2_sdk.cpp's own header
+			// comment. Not validated live yet -- UPSCALING_PLAN.md Fase 7.
+			if (!fsr2HandledThisFrame && vk_force_clear_frames_remaining == 0 && !skipTemporalUpdate && VK_UpscaleActive() &&
+				vid_vulkan_upscaler.integer == 3 && VK_MotionVectorsComposite(commandBuffer, vk_options.frame.imageIndex)) {
+				float sdkJitterX, sdkJitterY;
+				VK_JitterPixelOffset(&sdkJitterX, &sdkJitterY);
+				fsr2HandledThisFrame = VK_Fsr2SdkCompositeWrapper(commandBuffer,
+					vk_options.swapChain.postProcessColorImages[vk_options.frame.imageIndex],
+					vk_options.swapChain.postProcessColorImageViews[vk_options.frame.imageIndex],
+					vk_options.swapChain.sceneDepthImage, vk_options.swapChain.sceneDepthImageView,
+					VK_MotionVectorsImage(), VK_MotionVectorsImageView(),
+					VK_SceneRenderExtent(), vk_options.swapChain.imageSize, sdkJitterX, sdkJitterY,
+					vk_options.swapChain.images[vk_options.frame.imageIndex],
+					VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+				if (fsr2HandledThisFrame) {
+					VK_DLSS_InvalidateHistory();
+					VK_Fsr2InvalidateHistory();
 				}
 			}
 
@@ -1104,6 +1127,7 @@ void VK_EndWorldPassAndComposite(void)
 						// 1) doesn't blend against a stale pre-DLSS frame.
 						if (dlssHandledThisFrame) {
 							VK_UpscaleInvalidateHistory();
+							VK_Fsr2SdkInvalidateHistoryWrapper();
 						}
 					}
 				}
@@ -1123,6 +1147,7 @@ void VK_EndWorldPassAndComposite(void)
 				if (!skipTemporalUpdate) {
 					VK_DLSS_InvalidateHistory();
 					VK_Fsr2InvalidateHistory();
+					VK_Fsr2SdkInvalidateHistoryWrapper();
 				}
 
 				compositePassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
