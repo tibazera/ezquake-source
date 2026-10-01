@@ -1,5 +1,49 @@
 # Onde paramos — Vulkan renderer / SDL3 port
 
+## Checkpoint 2026-10-01 (parte 6) — bug real corrigido: copy RGBA16F->BGRA8 incompatível (hand-port E shim da SDK)
+
+Fase 1 catalogava `vk_fsr2.c:1151`: `vkCmdCopyImage` do `finalImage` (sempre
+RGBA16F, necessário internamente pro acumulate/RCAS) direto pro swapchain
+(`VK_FORMAT_B8G8R8A8_UNORM`). `vkCmdCopyImage` é cópia crua de bits, exige
+formatos compatíveis em TAMANHO DE TEXEL (8 bytes/texel vs 4) -- violação de
+spec garantida (`VUID-vkCmdCopyImage-srcImage-01548`), não um "pode dar
+errado". Confirmado comparando contra `vk_dlss.c`, que usa o MESMO padrão de
+cópia mas cria sua imagem de output já no formato do swapchain
+(`vk_options.physicalDeviceSurfaceFormat.format`) -- único motivo de nunca
+ter quebrado lá.
+
+**Corrigido no hand-port**: `vkCmdCopyImage` -> `vkCmdBlitImage`
+(`src/vk_fsr2.c`), que faz conversão de formato de verdade. Extents src/dst
+idênticos (`fsr2DisplaySize` nos dois lados, não há upscale nessa cópia --
+o upscale real já aconteceu no pass accumulate antes), então
+`VK_FILTER_NEAREST` é exato, não perda de qualidade.
+
+**Mesmo bug encontrado no próprio shim novo desta sessão** (`vk_fsr2_sdk.cpp`):
+a imagem de output da SDK oficial também era criada sempre em RGBA16F,
+copiada via `vkCmdCopyImage` pro swapchain -- bug recém-introduzido, pego
+antes de qualquer teste ao vivo. Corrigido diferente do hand-port: em vez de
+trocar pra blit, o formato da imagem de output passou a ser o formato real
+do swapchain (`outputFormat`, novo parâmetro threaded de
+`vk_fsr2_sdk_bridge.c` -> `vk_fsr2_sdk.cpp`, `CreateContextLocked` e
+`ffxGetTextureResourceVK` do registro de output usam esse formato agora) --
+`vkCmdCopyImage` continua válido porque os formatos passam a bater de
+verdade. Abordagem diferente do hand-port porque aqui a imagem de output é
+só um buffer de transporte pro SDK (não precisa ser HDR internamente como
+o `fsr2History` do hand-port, que participa do próprio acumulate matemático).
+
+Build limpo confirmado (exit 0, sem warning novo), hash
+`c7ce323864fe948403aa79b34ea0e8dcd0f063c2645cb398c7481fee2a2d3805`.
+Gamma/contrast/FXAA/HUD preservados -- mudança só no mecanismo de cópia
+final, nenhuma etapa de pipeline removida ou reordenada.
+
+Com este fix, TODOS os itens da Fase 1 catalogados no plano foram revisados:
+4 bugs reais confirmados e corrigidos (sampler/R32_UINT, usage flags,
+gate do motion-vector que travava os dois caminhos FSR2, e este de
+copy/formato), 2 itens já estavam corretos (descriptor pool sizing,
+`VK_Fsr2DestroyResources` já tinha caller + GPU idle confirmado). Restam da
+Fase 1: auditoria de imediate commands/retorno ignorado/resize, e auditoria
+de barreiras entre frames -- ambos exigem leitura mais extensa, próximos.
+
 ## Checkpoint 2026-10-01 (parte 5) — bug GRAVE corrigido: FSR2 nunca disparava fora do modo DLSS; CORREÇÃO da parte 2 deste checkpoint
 
 **Achado mais sério desta sessão.** `UPSCALING_PLAN.md` Fase 1 já catalogava

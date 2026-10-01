@@ -972,7 +972,7 @@ qbool VK_Fsr2Composite(VkCommandBuffer commandBuffer, uint32_t frameSlot, VkImag
 	int writeIdx;
 	qbool sharpenEnabled;
 	VkImage finalImage;
-	VkImageCopy region;
+	VkImageBlit region;
 	VkImageMemoryBarrier srcToTransferSrc, dstToTransferDst, srcBackToGeneral, dstToFinal;
 
 	if (frameSlot >= VK_MAX_FRAMES_IN_FLIGHT) {
@@ -1150,15 +1150,26 @@ qbool VK_Fsr2Composite(VkCommandBuffer commandBuffer, uint32_t frameSlot, VkImag
 		vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 2, barriers);
 	}
 
+	// vkCmdBlitImage, not vkCmdCopyImage -- finalImage is RGBA16F (needed
+	// internally for the temporal accumulate/RCAS math) but dstImage is the
+	// swapchain's VK_FORMAT_B8G8R8A8_UNORM. vkCmdCopyImage is a raw bit copy
+	// and requires texel-size-compatible formats (8 bytes/texel vs 4 here --
+	// a real spec violation, UPSCALING_PLAN.md Fase 1 catalogued this).
+	// vkCmdBlitImage performs the format conversion; same extent on both
+	// sides (no actual scaling), so VK_FILTER_NEAREST is exact, not a
+	// quality compromise.
 	VK_InitialiseStructure(region);
 	region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 	region.srcSubresource.layerCount = 1;
+	region.srcOffsets[1].x = (int32_t)fsr2DisplaySize.width;
+	region.srcOffsets[1].y = (int32_t)fsr2DisplaySize.height;
+	region.srcOffsets[1].z = 1;
 	region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 	region.dstSubresource.layerCount = 1;
-	region.extent.width = fsr2DisplaySize.width;
-	region.extent.height = fsr2DisplaySize.height;
-	region.extent.depth = 1;
-	vkCmdCopyImage(commandBuffer, finalImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+	region.dstOffsets[1].x = (int32_t)fsr2DisplaySize.width;
+	region.dstOffsets[1].y = (int32_t)fsr2DisplaySize.height;
+	region.dstOffsets[1].z = 1;
+	vkCmdBlitImage(commandBuffer, finalImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_NEAREST);
 
 	srcBackToGeneral = VK_UpscaleMakeImageBarrier(finalImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
 	dstToFinal = VK_UpscaleMakeImageBarrier(dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, dstImageLayoutAfterCopy, VK_ACCESS_TRANSFER_WRITE_BIT, 0);

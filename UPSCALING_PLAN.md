@@ -83,10 +83,29 @@ dos shaders próprios podem ser eliminados pela substituição oficial, sem retr
   Só afeta o hand-port (`==1`); caminho da SDK oficial (`==3`) não usa este shader.
 - [ ] `VK_Fsr2SamplerInfo` usa GENERAL para todas as imagens; confrontar layouts reais
   de scene color, depth, motion e imagem preta (esta é SHADER_READ_ONLY).
-- [ ] `vk_fsr2.c:1151`: copy RGBA16F para swapchain BGRA8 é incompatível;
-  compor por shader/conversão validada, preservando gamma/contrast/FXAA e HUD.
-- [ ] `VK_Fsr2DestroyResources` não tem caller. Ligar ao teardown do swapchain
-  com GPU sincronizada e conferir init parcial/recriação/device antigo.
+- [x] `vk_fsr2.c` (hand-port): confirmado real -- `vkCmdCopyImage` de
+  `finalImage` (RGBA16F, necessário internamente pro acumulate/RCAS) direto
+  pro swapchain (BGRA8) é cópia de bits crus, exige formatos compatíveis em
+  tamanho de texel (8 vs 4 bytes) -- violação de spec garantida, não suposição.
+  Corrigido: trocado por `vkCmdBlitImage` (faz conversão de formato de
+  verdade), `VK_FILTER_NEAREST` já que extents são idênticos (sem scaling
+  real, só conversão). Mesmo bug existia no shim da SDK oficial recém-criado
+  (`vk_fsr2_sdk.cpp`, criava a imagem de output sempre em RGBA16F) --
+  corrigido junto: formato da imagem de output agora recebe o formato real
+  do swapchain (`vk_options.physicalDeviceSurfaceFormat.format`), passado
+  pela bridge, copy continua `vkCmdCopyImage` ali porque os formatos agora
+  batem de verdade (sem precisar de blit nesse caminho). Build limpo
+  confirmado, hash `c7ce323864fe948403aa79b34ea0e8dcd0f063c2645cb398c7481fee2a2d3805`.
+  Composição por gamma/contrast/FXAA/HUD preservada -- não mexi na ordem de
+  pipeline, só no mecanismo de cópia/conversão final.
+- [x] `VK_Fsr2DestroyResources` já tem caller (`VK_DestroySwapChainFramebuffers`,
+  `vk_swapchain.c:1110`) -- corrigido em sessão anterior (checkpoint 2026-09-15,
+  "teardown FSR2 chamado por VK_DestroySwapChainFramebuffers"). Confirmado
+  ainda presente. GPU sincronizada: confirmado -- os 2 call sites reais de
+  teardown de swapchain (`VK_RecreateSwapChain` e o shutdown final,
+  `vk_main.c:474`/`1601`) chamam `vkDeviceWaitIdle` ANTES de
+  `VK_DestroySwapChain()` -> `VK_DestroySwapChainFramebuffers()` ->
+  `VK_Fsr2DestroyResources()`. Item completo, sem ação necessária.
 - [ ] Verificar falha de immediate commands, recursos parcialmente criados, retorno
   ignorado, tamanho zero, resize e descriptor sets referenciando recursos substituídos.
 - [ ] Auditar barreiras entre frames e acessos a intermediários compartilhados.

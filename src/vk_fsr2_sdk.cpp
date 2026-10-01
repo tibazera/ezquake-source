@@ -142,7 +142,7 @@ void DestroyContextLocked()
 	g_displaySize = { 0, 0 };
 }
 
-bool CreateContextLocked(VkExtent2D sceneSize, VkExtent2D displaySize, int reversedDepth)
+bool CreateContextLocked(VkExtent2D sceneSize, VkExtent2D displaySize, int reversedDepth, VkFormat outputFormat)
 {
 	FfxFsr2ContextDescription desc;
 	size_t scratchSize;
@@ -182,7 +182,17 @@ bool CreateContextLocked(VkExtent2D sceneSize, VkExtent2D displaySize, int rever
 	}
 	g_contextValid = true;
 
-	if (!CreateOutputImage(displaySize, VK_FORMAT_R16G16B16A16_SFLOAT)) {
+	// Output image format must match dstImage's (the swapchain image,
+	// VK_FORMAT_B8G8R8A8_UNORM in this project) -- vkCmdCopyImage is a raw
+	// bit copy, not a format conversion, and requires texel-size-compatible
+	// formats between source and destination (Vulkan spec
+	// VUID-vkCmdCopyImage-srcImage-01548 family). Using the SDK's own HDR
+	// RGBA16F internally and copying straight to an 8-bit swapchain would be
+	// the exact format/size mismatch vk_fsr2.c's hand-port has (see
+	// UPSCALING_PLAN.md Fase 1, "copy RGBA16F para swapchain BGRA8 é
+	// incompatível") -- avoided here by creating the output image at the
+	// destination's own format instead.
+	if (!CreateOutputImage(displaySize, outputFormat)) {
 		DestroyContextLocked();
 		return false;
 	}
@@ -219,6 +229,7 @@ vk_fsr2_sdk_bool VK_Fsr2SdkComposite(
 	VkImage sceneColorImage, VkImageView sceneColorView, VkFormat sceneColorFormat,
 	VkImage sceneDepthImage, VkImageView sceneDepthView,
 	VkImage motionVectorsImage, VkImageView motionVectorsView,
+	VkFormat outputFormat,
 	uint32_t sceneWidth, uint32_t sceneHeight,
 	uint32_t displayWidth, uint32_t displayHeight,
 	float jitterX, float jitterY,
@@ -242,7 +253,7 @@ vk_fsr2_sdk_bool VK_Fsr2SdkComposite(
 
 	if (!g_contextValid || g_sceneSize.width != sceneWidth || g_sceneSize.height != sceneHeight ||
 		g_displaySize.width != displayWidth || g_displaySize.height != displayHeight) {
-		if (!CreateContextLocked(sceneSize, displaySize, reversedDepth)) {
+		if (!CreateContextLocked(sceneSize, displaySize, reversedDepth, outputFormat)) {
 			return 0;
 		}
 	}
@@ -256,7 +267,7 @@ vk_fsr2_sdk_bool VK_Fsr2SdkComposite(
 	dispatch.motionVectors = ffxGetTextureResourceVK(&g_context, motionVectorsImage, motionVectorsView, sceneWidth, sceneHeight,
 		VK_FORMAT_R16G16_SFLOAT, nullptr, FFX_RESOURCE_STATE_COMPUTE_READ);
 	dispatch.output = ffxGetTextureResourceVK(&g_context, g_outputImage, g_outputImageView, displayWidth, displayHeight,
-		VK_FORMAT_R16G16B16A16_SFLOAT, nullptr, FFX_RESOURCE_STATE_UNORDERED_ACCESS);
+		outputFormat, nullptr, FFX_RESOURCE_STATE_UNORDERED_ACCESS);
 	dispatch.jitterOffset.x = jitterX;
 	dispatch.jitterOffset.y = jitterY;
 	dispatch.motionVectorScale.x = 1.0f;
