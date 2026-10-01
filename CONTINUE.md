@@ -50,7 +50,28 @@ mapeia para `VK_IMAGE_LAYOUT_GENERAL` no backend VK oficial (conferido lendo
 analogia com o hand-port -- a barreira do output image em `vk_fsr2_sdk.cpp` usa
 essa transição confirmada.
 
-**NÃO testado ao vivo, NÃO validar como pronto**: compila e linka, nada mais.
+**Smoke test real feito, interrompido por risco de segurança, não por bug desta
+sessão**: lançado `C:\ezquake\ezquakefsrtest.exe -dev -condebug +set vid_renderer 2
++set vid_vulkan_upscaler 3 +set vid_vulkan_renderscale 0.66 +map dm3`. Log
+confirmou `vulkan: upscaler diagnostic -- native=1920x1080 scene=1267x712
+upscaleActive=1` (o gate do modo 3 foi alcançado), processo ficou vivo ~25s,
+sem diagnóstico de falha do SDK FSR2 (`vulkan: FSR2 SDK diagnostic -- ...` não
+apareceu) e sem crash. **Mas** a pasta `C:\ezquake` tem config pessoal do Tiago
+(`ezquake/configs/config.cfg`/outros) que auto-conecta a um servidor QW real ao
+iniciar -- `connect qw.qlash.com.br:28501` disparou sozinho, log mostrou "tiba
+entered the game" num servidor público de verdade. Processo morto imediatamente
+(`taskkill /F`) ao ser notado. **Não foi causado por este trabalho** -- é
+comportamento pré-existente da pasta de teste, já apontado como risco conhecido
+em memória de sessão anterior (`project_incident_2026-09-15_live_match_log.md`).
+Nenhum crash/erro de validação apareceu antes da desconexão forçada, mas a
+janela de observação foi curta e nenhuma validação visual foi feita.
+
+**Próxima tentativa deve usar basedir/config isolados** (ex. `-basedir` separado
+sem os `.cfg` pessoais, ou um perfil QW limpo) para evitar reconectar a um
+servidor real antes de poder observar o jogo rodando offline por mais tempo.
+
+**NÃO validar como pronto**: compila, linka, sobrevive aos primeiros ~25s sem
+crash/erro de validação visível -- nada além disso foi confirmado.
 Pendências reais e específicas (ver `UPSCALING_PLAN.md` Fase 2 atualizada):
 - Jitter: reusa a tabela Halton-8 fixa do motor (`VK_JitterPixelOffset`), não
   `ffxFsr2GetJitterPhaseCount`/`GetJitterOffset` do SDK oficial -- o plano pede
