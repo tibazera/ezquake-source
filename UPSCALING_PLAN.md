@@ -140,6 +140,24 @@ dos shaders próprios podem ser eliminados pela substituição oficial, sem retr
   caminho DLSS/espacial antigo) -- NÃO corrigido nesta sessão (fora do escopo
   catalogado pela Fase 1, que só cita `vk_fsr2.c`); registrar como pendência
   separada se for investigar DLSS/caminho espacial depois.
+- [ ] NOVO achado, ainda NÃO corrigido (fora do escopo do item acima, caso
+  diferente e potencialmente pior): `fsr2DilatedMotion`/`fsr2DilatedMotionPrev`
+  (`vk_fsr2.c`) são imagens ÚNICAS compartilhadas, SEM nenhum slot
+  per-frame-in-flight -- toda chamada de `VK_Fsr2Composite` escreve
+  `fsr2DilatedMotion` (pass reconstruct) e copia pro `fsr2DilatedMotionPrev`
+  no fim do mesmo command buffer, só com barreira INTRA-command-buffer
+  (`VK_Fsr2Barrier`). Não há fence/semáforo cross-command-buffer nenhum
+  protegendo essas duas imagens entre frames -- se o frame N+1 começar a
+  escrever `fsr2DilatedMotion` enquanto o command buffer do frame N ainda
+  está executando na GPU (cenário real com `VK_MAX_FRAMES_IN_FLIGHT=3`),
+  é hazard de verdade, sem nenhuma barreira entre comandos de command
+  buffers diferentes pra evitar. Mesma classe do bug de history já corrigido
+  acima, mas essas duas imagens não têm NENHUM array de slots -- corrigir
+  exigiria o mesmo tratamento (`VK_MAX_FRAMES_IN_FLIGHT` cópias de cada),
+  mudança de escopo maior. NÃO corrigido nesta sessão -- achado durante
+  revisão do fix de history, registrado aqui em vez de corrigido sem
+  possibilidade de teste ao vivo em sequência (muita mudança sem validação
+  acumulando risco).
 
 ## Fase 2 — SDK oficial AMD
 
