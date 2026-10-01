@@ -1350,7 +1350,22 @@ qbool VK_MotionVectorsComposite(VkCommandBuffer commandBuffer, uint32_t imageInd
 	VkDescriptorSet descriptorSet;
 	vk_motion_vectors_push_t push;
 
-	if (!VK_DLSS_Active()) {
+	// NOT just VK_DLSS_Active() -- this file's own header comment is stale:
+	// it originally described a world where only DLSS sampled this buffer
+	// (the old vk_upscale.c EASU+RCAS path computed reprojection inline).
+	// That stopped being true once vk_fsr2.c's real hand-port was added:
+	// it samples this exact buffer as an input texture (binding 2,
+	// motionVectorsView in VK_Fsr2UpdateDescriptorSets), not an inline
+	// recomputation -- and vk_fsr2_sdk.cpp's official-SDK path does too.
+	// Gating on VK_DLSS_Active() alone meant every caller in vk_main.c
+	// that does `vid_vulkan_upscaler.integer == 1/3 && VK_MotionVectorsComposite(...)`
+	// always short-circuited to false outside DLSS mode -- both FSR2 paths
+	// never actually dispatched (UPSCALING_PLAN.md Fase 1's first catalogued
+	// bug, confirmed real by reading this gate against its 3 call sites in
+	// vk_main.c). VK_UpscaleActive() is the same "scene is rendered below
+	// native res" gate every other upscaler entry point in this project
+	// uses; false here only when upscaling is off entirely.
+	if (!VK_UpscaleActive()) {
 		return false;
 	}
 	if (!VK_MotionVectorsCreatePipeline() || !VK_MotionVectorsEnsureImage()) {

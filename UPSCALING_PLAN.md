@@ -47,8 +47,21 @@ Não atualizar SDKs automaticamente para master: documentar revisão e justifica
 Tratar o port próprio como transição. Corrigir infraestrutura reaproveitável; problemas
 dos shaders próprios podem ser eliminados pela substituição oficial, sem retrabalhá-los.
 
-- [ ] `vk_main.c:1042` chama `VK_MotionVectorsComposite` para FSR2, mas `vk_upscale.c:1353`
-  retorna false se DLSS não estiver ativo. Rastrear também gate de atualização de matrizes.
+- [x] CONFIRMADO E CORRIGIDO -- bug real e grave, não suspeita. `VK_MotionVectorsComposite`
+  (`vk_upscale.c`) tinha `if (!VK_DLSS_Active()) return false;` como primeira linha.
+  Os 3 call sites em `vk_main.c` (hand-port `==1`, SDK oficial `==3`, DLSS `==2`)
+  fazem `vid_vulkan_upscaler.integer == N && VK_MotionVectorsComposite(...)` --
+  ou seja, FORA do modo DLSS, a função sempre retornava false e **nem o hand-port
+  nem o caminho da SDK oficial jamais disparavam o dispatch real**, mesmo com
+  `vid_vulkan_upscaler 1` ou `3` selecionado -- caíam direto no fallback antigo
+  de render-pass sem nenhum erro visível (silêncio, não crash). Corrigido:
+  gate trocado para `VK_UpscaleActive()` (mesmo gate que todo outro ponto de
+  entrada de upscaler já usa), estritamente mais permissivo que o antigo --
+  `VK_DLSS_Active()` já exige `VK_UpscaleActive()` como primeira condição, então
+  DLSS continua funcionando, hand-port e SDK oficial passam a disparar de verdade.
+  **Isso invalida a conclusão anterior desta sessão de que o smoke test da SDK
+  oficial "sobreviveu sem erro"** -- o dispatch real nunca rodou naquele teste;
+  ver CONTINUE.md para a nota de correção.
 - [x] `vk_fsr2.c:726`: recontado -- reconstruct(3)+depthclip(8)+lock(1)+accumulate(6)+rcas(1)=19,
   bate exatamente com `poolSizes[0].descriptorCount = framesInFlight * 19`. Claim do
   plano (20 usados) não reproduz no código atual; corrigido em sessão anterior ou

@@ -1,5 +1,48 @@
 # Onde paramos — Vulkan renderer / SDL3 port
 
+## Checkpoint 2026-10-01 (parte 5) — bug GRAVE corrigido: FSR2 nunca disparava fora do modo DLSS; CORREÇÃO da parte 2 deste checkpoint
+
+**Achado mais sério desta sessão.** `UPSCALING_PLAN.md` Fase 1 já catalogava
+isso como suspeita ("vk_main.c:1042 chama VK_MotionVectorsComposite para FSR2,
+mas vk_upscale.c:1353 retorna false se DLSS não estiver ativo") -- confirmei
+que é real e grave, não um detalhe: `VK_MotionVectorsComposite` (`vk_upscale.c`)
+tinha `if (!VK_DLSS_Active()) return false;` como primeira linha. Os 3 pontos
+de chamada em `vk_main.c` (hand-port `vid_vulkan_upscaler==1`, SDK oficial `==3`,
+DLSS `==2`) todos fazem `vid_vulkan_upscaler.integer==N && VK_MotionVectorsComposite(...)`
+-- fora do modo DLSS, essa função sempre retornava false, então **nem o
+hand-port nem o caminho da SDK oficial (a integração inteira desta sessão)
+jamais chegavam a disparar o dispatch real**, mesmo com `vid_vulkan_upscaler 1`
+ou `3` selecionados -- caía direto no fallback antigo de render-pass, sem
+nenhum erro ou log visível (falha silenciosa, exatamente o tipo de coisa que
+AGENTS.md pede pra nunca acontecer -- "falha não pode se tornar substituição
+silenciosa").
+
+**Corrigido** (`src/vk_upscale.c`, `VK_MotionVectorsComposite`): gate trocado
+de `VK_DLSS_Active()` para `VK_UpscaleActive()` (mesmo gate que todo outro
+ponto de entrada de upscaler já usa neste arquivo). Estritamente mais
+permissivo, sem regressão: `VK_DLSS_Active()` já exige `VK_UpscaleActive()`
+como primeira condição própria, então o caminho DLSS continua funcionando
+exatamente como antes; hand-port e SDK oficial passam a receber o buffer de
+motion vectors de verdade. Build limpo confirmado (exit 0, sem warning novo),
+hash `c4b97cc8b93747858c685df3fa8c7282ecaf0f87774fee3f8ec4fdbdce529884`.
+
+**CORREÇÃO IMPORTANTE à "parte 2" deste mesmo checkpoint** (smoke test da SDK
+oficial, registrado antes deste fix): o teste que relatei como "sobreviveu
+~25s sem erro de validação" **não prova nada sobre a SDK oficial** -- com o
+bug acima ainda presente naquele momento, `vid_vulkan_upscaler 3` nunca de
+fato chamava `VK_Fsr2SdkCompositeWrapper`, caía no fallback antigo o tempo
+todo. A ausência de erro era esperada independente de a integração da SDK
+estar certa ou errada. O smoke test NÃO valida o dispatch da SDK oficial;
+precisa ser refeito agora que o gate está corrigido -- e com um
+basedir/config isolado, para não repetir o auto-connect relatado na mesma
+parte 2.
+
+**Próxima ação real**: refazer o smoke test (`vid_vulkan_upscaler 3`,
+`-dev -condebug`, basedir isolado desta vez) e desta vez procurar de verdade
+por `vulkan: FSR2 SDK diagnostic` (sucesso ou falha) e por VUID novos
+específicos do dispatch oficial no log -- esses sinais só existem agora que
+o gate deixa o código rodar.
+
 ## Checkpoint 2026-10-01 (parte 4) — bugs reais de usage flags corrigidos (hand-port)
 
 Fase 1 catalogava: "várias imagens sem TRANSFER_DST são limpas"/"motion dilatado
