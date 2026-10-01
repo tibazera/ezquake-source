@@ -1,5 +1,27 @@
 # Onde paramos — Vulkan renderer / SDL3 port
 
+## Checkpoint 2026-10-01 (parte 7) — bug real corrigido: falha de immediate commands reportava sucesso (hand-port)
+
+`VK_Fsr2EnsureImages` (`src/vk_fsr2.c`) chamava `VK_BeginImmediateCommands()`
+e só usava o `cmd` dentro de `if (cmd != VK_NULL_HANDLE)`. Se essa chamada
+falhasse (device perdido, memória de command pool esgotada, etc -- condição
+rara mas real, é exatamente o tipo de falha que essa API pode retornar), o
+bloco inteiro de clear + transição de layout das 13 imagens + `fsr2DefaultBlack`
+era silenciosamente pulado, mas a função seguia até `fsr2ResourcesValid = true;
+return true;` -- reportando sucesso com toda imagem ainda em `UNDEFINED`,
+preparando o próximo `VK_Fsr2Composite` pra amostrar memória de GPU
+genuinamente indefinida através de descriptors já escritos como
+`VK_IMAGE_LAYOUT_GENERAL`.
+
+**Corrigido**: falha de `VK_BeginImmediateCommands` agora chama
+`VK_Fsr2DestroyImages()` (desfaz o que foi criado) e retorna `false`, mesmo
+padrão de toda outra falha de criação de recurso nessa função. Build limpo
+confirmado, hash `ffa3937d990ec6f4acc7de9702a3bf0ff5dc3c42c9d6bdea82bbcd515397a6a8`.
+
+Também confirmado por leitura completa: nenhum retorno de
+`VK_Fsr2CreateImage`/`VK_CreateBufferResource` é ignorado nesta função --
+item correspondente da Fase 1 já estava satisfeito, sem ação necessária.
+
 ## Checkpoint 2026-10-01 (parte 6) — bug real corrigido: copy RGBA16F->BGRA8 incompatível (hand-port E shim da SDK)
 
 Fase 1 catalogava `vk_fsr2.c:1151`: `vkCmdCopyImage` do `finalImage` (sempre

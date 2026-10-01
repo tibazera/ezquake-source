@@ -563,7 +563,21 @@ static qbool VK_Fsr2EnsureImages(void)
 			fsr2FinalOutput.image,
 		};
 		VkCommandBuffer cmd = VK_BeginImmediateCommands();
-		if (cmd != VK_NULL_HANDLE) {
+		// If this fails, every image above stays VK_IMAGE_LAYOUT_UNDEFINED
+		// (never cleared, never transitioned to GENERAL) and fsr2DefaultBlack
+		// stays unreadable -- the function used to fall through this whole
+		// block silently and still report success (fsr2ResourcesValid = true,
+		// return true), which would make the next VK_Fsr2Composite dispatch
+		// sample genuinely undefined GPU memory through descriptors already
+		// written against VK_IMAGE_LAYOUT_GENERAL (UPSCALING_PLAN.md Fase 1:
+		// "verificar falha de immediate commands ... retorno ignorado").
+		// Destroy what was created and report failure instead, matching
+		// every other resource-creation failure path in this function.
+		if (cmd == VK_NULL_HANDLE) {
+			VK_Fsr2DestroyImages();
+			return false;
+		}
+		{
 			uint32_t i;
 			VkImageMemoryBarrier blackToTransferDst;
 			VkClearColorValue clearColor = { { 0 } };

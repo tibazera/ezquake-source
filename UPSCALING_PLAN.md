@@ -106,8 +106,20 @@ dos shaders próprios podem ser eliminados pela substituição oficial, sem retr
   `vk_main.c:474`/`1601`) chamam `vkDeviceWaitIdle` ANTES de
   `VK_DestroySwapChain()` -> `VK_DestroySwapChainFramebuffers()` ->
   `VK_Fsr2DestroyResources()`. Item completo, sem ação necessária.
-- [ ] Verificar falha de immediate commands, recursos parcialmente criados, retorno
-  ignorado, tamanho zero, resize e descriptor sets referenciando recursos substituídos.
+- [x] Falha de immediate commands: CONFIRMADO E CORRIGIDO. `VK_Fsr2EnsureImages`
+  chamava `VK_BeginImmediateCommands()` e só usava o resultado dentro de
+  `if (cmd != VK_NULL_HANDLE)` -- se falhasse, o bloco inteiro (clear +
+  transição de layout de todas as 13 imagens + `fsr2DefaultBlack`) era pulado
+  em silêncio, mas a função continuava até `fsr2ResourcesValid = true; return true;`,
+  reportando sucesso com toda imagem ainda em `UNDEFINED`. Corrigido: falha de
+  `VK_BeginImmediateCommands` agora destrói o que foi criado e retorna `false`,
+  mesmo padrão de toda outra falha de criação de recurso nesta função.
+- [x] Recursos parcialmente criados / retorno ignorado: já tratado -- toda
+  chamada a `VK_Fsr2CreateImage`/`VK_CreateBufferResource` em
+  `VK_Fsr2EnsureImages` já segue `if (!X(...)) return false;`, sem retorno
+  ignorado. Confirmado por leitura completa da função.
+- [ ] Tamanho zero, resize e descriptor sets referenciando recursos substituídos:
+  ainda não auditado -- pendente.
 - [ ] Auditar barreiras entre frames e acessos a intermediários compartilhados.
   Ping-pong de 2 imagens não é prova suficiente de segurança com 3 frames em voo.
 
