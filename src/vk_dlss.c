@@ -90,9 +90,19 @@ static qbool vk_dlss_historyValid;    // false for the first frame DLSS is activ
 // real composite target by VK_DLSS_CopyOutputTo after slEvaluateFeature
 // returns. Sized at native (imageSize) resolution, same as historyImages in
 // vk_upscale.c.
-static VkImage vk_dlss_outputImage = VK_NULL_HANDLE;
-static VkDeviceMemory vk_dlss_outputImageMemory = VK_NULL_HANDLE;
-static VkImageView vk_dlss_outputImageView = VK_NULL_HANDLE;
+// Sized to VK_MAX_FRAMES_IN_FLIGHT, NOT a single image -- this is pure
+// intra-frame scratch (slEvaluateFeature writes it, VK_DLSS_CopyOutputTo
+// reads it, both within the SAME frame's command buffer, same category as
+// vk_fsr2.c's fsr2DilatedDepth et al), but a single shared instance would
+// still race: nothing stops frame N+1's command buffer writing it via
+// slEvaluateFeature while frame N's command buffer is still executing its
+// own write+copy on the GPU (same bug class found and fixed across
+// vk_fsr2.c and vk_upscale.c this session). Indexed by
+// vk_options.frame.currentFrame directly in both VK_DLSS_Composite and
+// VK_DLSS_CopyOutputTo.
+static VkImage vk_dlss_outputImage[VK_MAX_FRAMES_IN_FLIGHT];
+static VkDeviceMemory vk_dlss_outputImageMemory[VK_MAX_FRAMES_IN_FLIGHT];
+static VkImageView vk_dlss_outputImageView[VK_MAX_FRAMES_IN_FLIGHT];
 static VkExtent2D vk_dlss_outputImageSize;
 
 qbool VK_DLSS_Available(void)
@@ -464,17 +474,20 @@ qbool VK_DLSS_GetOptimalRenderSize(uint32_t outputWidth, uint32_t outputHeight, 
 
 static void VK_DLSS_DestroyOutputImage(void)
 {
-	if (vk_dlss_outputImageView != VK_NULL_HANDLE) {
-		vkDestroyImageView(vk_options.logicalDevice, vk_dlss_outputImageView, NULL);
-		vk_dlss_outputImageView = VK_NULL_HANDLE;
-	}
-	if (vk_dlss_outputImage != VK_NULL_HANDLE) {
-		vkDestroyImage(vk_options.logicalDevice, vk_dlss_outputImage, NULL);
-		vk_dlss_outputImage = VK_NULL_HANDLE;
-	}
-	if (vk_dlss_outputImageMemory != VK_NULL_HANDLE) {
-		vkFreeMemory(vk_options.logicalDevice, vk_dlss_outputImageMemory, NULL);
-		vk_dlss_outputImageMemory = VK_NULL_HANDLE;
+	uint32_t slot;
+	for (slot = 0; slot < VK_MAX_FRAMES_IN_FLIGHT; ++slot) {
+		if (vk_dlss_outputImageView[slot] != VK_NULL_HANDLE) {
+			vkDestroyImageView(vk_options.logicalDevice, vk_dlss_outputImageView[slot], NULL);
+			vk_dlss_outputImageView[slot] = VK_NULL_HANDLE;
+		}
+		if (vk_dlss_outputImage[slot] != VK_NULL_HANDLE) {
+			vkDestroyImage(vk_options.logicalDevice, vk_dlss_outputImage[slot], NULL);
+			vk_dlss_outputImage[slot] = VK_NULL_HANDLE;
+		}
+		if (vk_dlss_outputImageMemory[slot] != VK_NULL_HANDLE) {
+			vkFreeMemory(vk_options.logicalDevice, vk_dlss_outputImageMemory[slot], NULL);
+			vk_dlss_outputImageMemory[slot] = VK_NULL_HANDLE;
+		}
 	}
 	vk_dlss_outputImageSize.width = vk_dlss_outputImageSize.height = 0;
 }
@@ -482,8 +495,9 @@ static void VK_DLSS_DestroyOutputImage(void)
 static qbool VK_DLSS_EnsureOutputImage(VkExtent2D outputSize)
 {
 	VkImageViewCreateInfo viewInfo;
+	uint32_t slot;
 
-	if (vk_dlss_outputImage != VK_NULL_HANDLE &&
+	if (vk_dlss_outputImage[0] != VK_NULL_HANDLE &&
 		vk_dlss_outputImageSize.width == outputSize.width &&
 		vk_dlss_outputImageSize.height == outputSize.height) {
 		return true;
@@ -491,34 +505,37 @@ static qbool VK_DLSS_EnsureOutputImage(VkExtent2D outputSize)
 
 	VK_DLSS_DestroyOutputImage();
 
-	// STORAGE_BIT: DLSS writes via compute/UAV (Vulkan's storage-image
-	// equivalent), not as a graphics-pipeline render-pass color attachment.
-	// SAMPLED_BIT + TRANSFER_SRC_BIT: this project reads it back afterwards
-	// (VK_DLSS_CopyOutputTo does a vkCmdCopyImage into the real composite
-	// target -- a plain copy, not a shader sample, but SAMPLED_BIT costs
-	// nothing extra to request and keeps the option open for a future
-	// shader-based composite instead of a raw copy).
-	if (!VK_CreateImageResource(
-			outputSize.width, outputSize.height, 1, VK_SAMPLE_COUNT_1_BIT,
-			vk_options.physicalDeviceSurfaceFormat.format,
-			VK_IMAGE_TILING_OPTIMAL,
-			VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-			VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-			&vk_dlss_outputImage, &vk_dlss_outputImageMemory)) {
-		return false;
-	}
+	for (slot = 0; slot < VK_MAX_FRAMES_IN_FLIGHT; ++slot) {
+		// STORAGE_BIT: DLSS writes via compute/UAV (Vulkan's storage-image
+		// equivalent), not as a graphics-pipeline render-pass color attachment.
+		// SAMPLED_BIT + TRANSFER_SRC_BIT: this project reads it back afterwards
+		// (VK_DLSS_CopyOutputTo does a vkCmdCopyImage into the real composite
+		// target -- a plain copy, not a shader sample, but SAMPLED_BIT costs
+		// nothing extra to request and keeps the option open for a future
+		// shader-based composite instead of a raw copy).
+		if (!VK_CreateImageResource(
+				outputSize.width, outputSize.height, 1, VK_SAMPLE_COUNT_1_BIT,
+				vk_options.physicalDeviceSurfaceFormat.format,
+				VK_IMAGE_TILING_OPTIMAL,
+				VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+				VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+				&vk_dlss_outputImage[slot], &vk_dlss_outputImageMemory[slot])) {
+			VK_DLSS_DestroyOutputImage();
+			return false;
+		}
 
-	VK_InitialiseStructure(viewInfo);
-	viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-	viewInfo.image = vk_dlss_outputImage;
-	viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-	viewInfo.format = vk_options.physicalDeviceSurfaceFormat.format;
-	viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-	viewInfo.subresourceRange.levelCount = 1;
-	viewInfo.subresourceRange.layerCount = 1;
-	if (vkCreateImageView(vk_options.logicalDevice, &viewInfo, NULL, &vk_dlss_outputImageView) != VK_SUCCESS) {
-		VK_DLSS_DestroyOutputImage();
-		return false;
+		VK_InitialiseStructure(viewInfo);
+		viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+		viewInfo.image = vk_dlss_outputImage[slot];
+		viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+		viewInfo.format = vk_options.physicalDeviceSurfaceFormat.format;
+		viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		viewInfo.subresourceRange.levelCount = 1;
+		viewInfo.subresourceRange.layerCount = 1;
+		if (vkCreateImageView(vk_options.logicalDevice, &viewInfo, NULL, &vk_dlss_outputImageView[slot]) != VK_SUCCESS) {
+			VK_DLSS_DestroyOutputImage();
+			return false;
+		}
 	}
 
 	vk_dlss_outputImageSize = outputSize;
@@ -616,8 +633,8 @@ qbool VK_DLSS_Composite(VkCommandBuffer commandBuffer, VkImage sceneColorImage, 
 	colorInRes.height = sceneSize.height;
 
 	colorOutRes = colorInRes;
-	colorOutRes.native = vk_dlss_outputImage;
-	colorOutRes.view = vk_dlss_outputImageView;
+	colorOutRes.native = vk_dlss_outputImage[vk_options.frame.currentFrame];
+	colorOutRes.view = vk_dlss_outputImageView[vk_options.frame.currentFrame];
 	colorOutRes.state = VK_IMAGE_LAYOUT_GENERAL; // DLSS writes via compute (UAV/storage image)
 	colorOutRes.width = outputSize.width;
 	colorOutRes.height = outputSize.height;
@@ -785,11 +802,11 @@ qbool VK_DLSS_CopyOutputTo(VkCommandBuffer commandBuffer, VkImage dstImage, VkIm
 	VkImageMemoryBarrier dstToFinal;
 	VkImageCopy region;
 
-	if (vk_dlss_outputImage == VK_NULL_HANDLE) {
+	if (vk_dlss_outputImage[vk_options.frame.currentFrame] == VK_NULL_HANDLE) {
 		return false;
 	}
 
-	srcToTransferSrc = VK_UpscaleMakeImageBarrier(vk_dlss_outputImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	srcToTransferSrc = VK_UpscaleMakeImageBarrier(vk_dlss_outputImage[vk_options.frame.currentFrame], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 		VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
 	dstToTransferDst = VK_UpscaleMakeImageBarrier(dstImage, dstImageLayoutBeforeCopy, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 		0, VK_ACCESS_TRANSFER_WRITE_BIT);
@@ -806,9 +823,9 @@ qbool VK_DLSS_CopyOutputTo(VkCommandBuffer commandBuffer, VkImage dstImage, VkIm
 	region.extent.width = vk_dlss_outputImageSize.width;
 	region.extent.height = vk_dlss_outputImageSize.height;
 	region.extent.depth = 1;
-	vkCmdCopyImage(commandBuffer, vk_dlss_outputImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+	vkCmdCopyImage(commandBuffer, vk_dlss_outputImage[vk_options.frame.currentFrame], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
-	srcBackToGeneral = VK_UpscaleMakeImageBarrier(vk_dlss_outputImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+	srcBackToGeneral = VK_UpscaleMakeImageBarrier(vk_dlss_outputImage[vk_options.frame.currentFrame], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
 		VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT);
 	dstToFinal = VK_UpscaleMakeImageBarrier(dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, dstImageLayoutAfterCopy,
 		VK_ACCESS_TRANSFER_WRITE_BIT, 0);

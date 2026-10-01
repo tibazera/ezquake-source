@@ -1,5 +1,35 @@
 # Onde paramos — Vulkan renderer / SDL3 port
 
+## Checkpoint 2026-10-01 (parte 11) — mesma classe de bug, terceiro arquivo: vk_dlss_outputImage
+
+Varredura final nos 3 arquivos do sistema de upscaling: `vk_dlss.c` tinha
+`vk_dlss_outputImage` como instância ÚNICA (não array), escrita pela SDK
+Streamline (`slEvaluateFeature`) e lida por `VK_DLSS_CopyOutputTo` dentro do
+MESMO frame -- categoria "scratch intra-frame" igual às 6 imagens já
+corrigidas em `vk_fsr2.c`, mas com o mesmo risco residual: nada impedia o
+command buffer do frame N+1 escrever nela via `slEvaluateFeature` enquanto o
+command buffer do frame N ainda executava seu próprio write+copy na GPU.
+
+**Corrigido**: `vk_dlss_outputImage`/`Memory`/`View` viraram arrays
+`[VK_MAX_FRAMES_IN_FLIGHT]`, `VK_DLSS_EnsureOutputImage`/`DestroyOutputImage`
+em loop por slot, `VK_DLSS_Composite`/`VK_DLSS_CopyOutputTo` indexando por
+`vk_options.frame.currentFrame` diretamente (mesmo padrão write-index puro
+das 6 imagens scratch intra-frame do `vk_fsr2.c` -- a SDK Streamline mantém
+seu próprio estado temporal internamente via `sl::Constants::reset`, esse
+buffer é só o destino de saída de CADA frame, não precisa de read-index).
+
+Build limpo confirmado do zero (exit 0, sem warning novo), hash
+`d005ea6619c2ca69ddd276538105e0e1f6426e06f775d937b3b296ca154e7ac0`.
+
+**Com isso, os 3 arquivos do sistema de upscaling** (`vk_fsr2.c` hand-port,
+`vk_upscale.c` DLSS/espacial, `vk_dlss.c` DLSS real via Streamline) **estão
+livres de instâncias únicas sem slot per-frame-in-flight** -- varredura
+completa feita, não ficou nenhuma pendência conhecida dessa classe de bug.
+Sessão total: 9 bugs reais confirmados e corrigidos.
+
+**Próxima ação real**: parar e aguardar validação visual -- recomendação
+repetida, agora com ainda mais peso dado o volume total de mudança.
+
 ## Checkpoint 2026-10-01 (parte 10) — mesmo bug de history race corrigido em vk_upscale.c (caminho DLSS/espacial)
 
 Continuação direta da parte 9: a nota registrada lá ("mesmo padrão existe em
