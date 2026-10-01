@@ -103,31 +103,33 @@ static VkPipelineLayout upscalePipelineLayout = VK_NULL_HANDLE;
 static VkPipeline upscalePipeline = VK_NULL_HANDLE;
 
 // Persistent history buffers: the previous frame's final upscaled color, at
-// native (imageSize) resolution -- PING-PONGED across 2 slots (historyIndex
-// below alternates 0/1 every frame), NOT a single shared image. A single
-// image would have frame N's vkCmdCopyImage write racing frame N+1's
-// fragment-shader read of the SAME image with no cross-command-buffer
-// synchronization (command buffers here are indexed by swapchain imageIndex,
-// which VK_BeginFrame only fences per-imageIndex -- neither that fence nor
-// the per-frame barriers inside VK_UpscaleUpdateHistory/VK_UpscaleComposite
-// order two DIFFERENT command buffers' access to a resource neither of them
-// exclusively owns). Ping-ponging means frame N reads slot A / writes slot
-// B while frame N+1 reads slot B / writes slot A -- each slot is written by
-// one frame and read by the NEXT, never touched by two frames' command
-// buffers at once, so the existing per-imageIndex fence wait (which already
-// guarantees frame N-2's command buffer finished before frame N's reuses
-// that imageIndex slot, VK_MAX_FRAMES_IN_FLIGHT=3 frames apart) is enough
-// -- no new synchronization primitive needed, just never aliasing the same
-// image across adjacent frames.
-static VkImage historyImages[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-static VkDeviceMemory historyImageMemories[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-static VkImageView historyImageViews[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+// native (imageSize) resolution. Sized to VK_MAX_FRAMES_IN_FLIGHT, NOT 2 --
+// this file used to ping-pong across 2 slots via a free-running counter
+// (historyIndex, incremented once per VK_UpscaleUpdateHistory call,
+// independent of which frameSlot/imageIndex was actually in use) with a
+// comment claiming the per-imageIndex fence wait made that safe. That claim
+// was wrong: historyIndex has period 2, but VK_MAX_FRAMES_IN_FLIGHT=3 frames
+// can be genuinely in flight concurrently, so frame N and frame N+2 target
+// the SAME historyIndex slot while nothing (neither the per-frameSlot fence
+// in VK_BeginFrame nor the per-imageIndex fence, which tracks a DIFFERENT
+// cycle) guarantees frame N's GPU work finished before frame N+2 submits
+// another write to the same image -- the exact same bug class found and
+// fixed in vk_fsr2.c's fsr2History (see that file's own history-slot
+// comment for the full derivation). Fixed here the same way: indexed
+// directly by frameSlot (vk_options.frame.currentFrame), not a free-running
+// counter -- frameSlot already carries the fence-backed non-overlap
+// guarantee this scheme actually needs.
+static VkImage historyImages[VK_MAX_FRAMES_IN_FLIGHT];
+static VkDeviceMemory historyImageMemories[VK_MAX_FRAMES_IN_FLIGHT];
+static VkImageView historyImageViews[VK_MAX_FRAMES_IN_FLIGHT];
 static VkExtent2D historyImageSize;
-// Slot written THIS frame (VK_UpscaleUpdateHistory) -- VK_UpscaleComposite
-// reads the OTHER slot (1 - historyIndex), which holds what was written
-// last frame. Advanced once per frame by VK_UpscaleUpdateHistory, after
-// this frame's composite has already read the other slot.
-static int historyIndex;
+
+// writeIdx = frameSlot; readIdx = the immediately preceding frame's slot
+// (frameSlot's predecessor mod VK_MAX_FRAMES_IN_FLIGHT) -- same scheme as
+// vk_fsr2.c's VK_Fsr2HistoryWriteIndex/ReadIndex, duplicated here rather
+// than shared across translation units since both are tiny and file-local.
+static uint32_t VK_UpscaleHistoryWriteIndex(uint32_t frameSlot) { return frameSlot % VK_MAX_FRAMES_IN_FLIGHT; }
+static uint32_t VK_UpscaleHistoryReadIndex(uint32_t frameSlot) { return (frameSlot + VK_MAX_FRAMES_IN_FLIGHT - 1) % VK_MAX_FRAMES_IN_FLIGHT; }
 // False until the slot VK_UpscaleComposite is about to read has actually
 // been written at least once -- both slots start with undefined contents,
 // so this must stay false for the first 2 frames temporal upscaling is
@@ -153,16 +155,14 @@ void VK_UpscaleInvalidateHistory(void)
 	historyValidFrameCount = 0;
 }
 
-// Per-frame reprojection matrices UBO (see vk_upscale_matrices_t) --
-// ping-ponged across the SAME 2 slots as historyImages above and for the
-// identical reason: frame N's fragment shader can still be reading
-// matricesBuffer[historyIndex from N's own perspective] on the GPU while
-// frame N+1's command buffer calls vkCmdUpdateBuffer on it, since they're
-// different command buffers with no fence between them. Always written and
-// read using the SAME historyIndex/readIndex pairing as historyImages, so
-// the two stay in lockstep (both describe "frame N-1's state").
-static VkBuffer matricesBuffers[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-static VkDeviceMemory matricesBufferMemories[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+// Per-frame reprojection matrices UBO (see vk_upscale_matrices_t) -- same
+// VK_MAX_FRAMES_IN_FLIGHT sizing and frameSlot-direct indexing as
+// historyImages above, for the identical reason (frame N's fragment shader
+// can still be reading this buffer on the GPU while a later frame's command
+// buffer calls vkCmdUpdateBuffer on it). Always written/read with the SAME
+// write/read index pairing as historyImages, so the two stay in lockstep.
+static VkBuffer matricesBuffers[VK_MAX_FRAMES_IN_FLIGHT];
+static VkDeviceMemory matricesBufferMemories[VK_MAX_FRAMES_IN_FLIGHT];
 
 qbool VK_UpscaleActive(void)
 {
@@ -273,7 +273,7 @@ static qbool VK_UpscaleCreatePipeline(void)
 
 	if (matricesBuffers[0] == VK_NULL_HANDLE) {
 		int slot;
-		for (slot = 0; slot < 2; ++slot) {
+		for (slot = 0; slot < VK_MAX_FRAMES_IN_FLIGHT; ++slot) {
 			if (!VK_CreateBufferResource(sizeof(vk_upscale_matrices_t), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
 					VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &matricesBuffers[slot], &matricesBufferMemories[slot])) {
 				return false;
@@ -448,33 +448,26 @@ static VkDescriptorSet VK_UpscaleDescriptorSet(uint32_t imageIndex)
 	depthImageInfo.imageView = vk_options.swapChain.sceneDepthImageView;
 	depthImageInfo.sampler = upscaleDepthSampler;
 
-	// History reads slot (1 - historyIndex): historyIndex is the slot THIS
-	// frame's VK_UpscaleUpdateHistory is about to write (or already wrote,
-	// if called before this -- but VK_UpscaleUpdateMatrices/descriptor set
-	// binding happens before the composite render pass, which is before
-	// VK_UpscaleUpdateHistory's post-render-pass write, see the call order
-	// in VK_EndWorldPassAndComposite), so the other slot holds what was
-	// written LAST frame -- exactly what this frame's reprojection needs
-	// (color history has a genuine 1-frame delay: written this frame, read
-	// next frame).
+	// History reads VK_UpscaleHistoryReadIndex(frameSlot) -- the PREVIOUS
+	// frame's slot, since color history has a genuine 1-frame delay (written
+	// last frame by VK_UpscaleUpdateHistory, read this frame for
+	// reprojection).
 	//
-	// The matrices UBO reads slot historyIndex instead -- NOT the same
-	// slot as history. Unlike color history, this frame's invViewProj/
-	// prevViewProj are written AND read within the SAME frame (by
-	// VK_UpscaleUpdateMatrices then VK_UpscaleComposite, both this frame);
-	// the ping-pong here exists only so frame N+1's vkCmdUpdateBuffer can't
-	// race frame N's still-in-flight fragment-shader read of the SAME
-	// buffer slot on a different command buffer, by writing a slot frame N
-	// isn't using. historyIndex identifies "the slot not in use by the
-	// previous frame's still-possibly-in-flight command buffer", correct
-	// for both uses despite the different read-timing semantics.
+	// The matrices UBO reads VK_UpscaleHistoryWriteIndex(frameSlot) instead
+	// -- THIS frame's own slot, not the previous one. Unlike color history,
+	// this frame's invViewProj/prevViewProj are written AND read within the
+	// SAME frame (by VK_UpscaleUpdateMatrices then VK_UpscaleComposite, both
+	// this frame) -- indexing by frameSlot directly is correct and safe
+	// (fence-backed non-overlap, same guarantee every other per-frame-in-flight
+	// resource in this project relies on), despite the different
+	// read-timing semantics from history.
 	VK_InitialiseStructure(historyImageInfo);
 	historyImageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-	historyImageInfo.imageView = historyImageViews[1 - historyIndex];
+	historyImageInfo.imageView = historyImageViews[VK_UpscaleHistoryReadIndex(vk_options.frame.currentFrame)];
 	historyImageInfo.sampler = upscaleSampler;
 
 	VK_InitialiseStructure(bufferInfo);
-	bufferInfo.buffer = matricesBuffers[historyIndex];
+	bufferInfo.buffer = matricesBuffers[VK_UpscaleHistoryWriteIndex(vk_options.frame.currentFrame)];
 	bufferInfo.offset = 0;
 	bufferInfo.range = sizeof(vk_upscale_matrices_t);
 
@@ -518,7 +511,7 @@ static VkDescriptorSet VK_UpscaleDescriptorSet(uint32_t imageIndex)
 static void VK_UpscaleDestroyHistoryBuffer(void)
 {
 	int slot;
-	for (slot = 0; slot < 2; ++slot) {
+	for (slot = 0; slot < VK_MAX_FRAMES_IN_FLIGHT; ++slot) {
 		if (historyImageViews[slot] != VK_NULL_HANDLE) {
 			vkDestroyImageView(vk_options.logicalDevice, historyImageViews[slot], NULL);
 			historyImageViews[slot] = VK_NULL_HANDLE;
@@ -535,7 +528,6 @@ static void VK_UpscaleDestroyHistoryBuffer(void)
 	historyImageSize.width = historyImageSize.height = 0;
 	historyValid = false;
 	historyValidFrameCount = 0;
-	historyIndex = 0;
 }
 
 // (Re)creates both historyImages[] slots at vk_options.swapChain.imageSize
@@ -557,7 +549,7 @@ static qbool VK_UpscaleEnsureHistoryBuffer(void)
 
 	VK_UpscaleDestroyHistoryBuffer();
 
-	for (slot = 0; slot < 2; ++slot) {
+	for (slot = 0; slot < VK_MAX_FRAMES_IN_FLIGHT; ++slot) {
 		if (!VK_CreateImageResource(
 				vk_options.swapChain.imageSize.width,
 				vk_options.swapChain.imageSize.height,
@@ -617,8 +609,8 @@ VkImageMemoryBarrier VK_UpscaleMakeImageBarrier(VkImage image, VkImageLayout old
 }
 
 // Copies this frame's final composited swapchain image into
-// historyImages[historyIndex] (the slot this frame is writing -- see the
-// historyIndex field comment for the ping-pong scheme), so next frame's
+// historyImages[VK_UpscaleHistoryWriteIndex(frameSlot)] (the slot this frame
+// is writing -- see historyImages' field comment), so next frame's
 // VK_UpscaleComposite has something to reproject against. Must run OUTSIDE
 // any render pass instance (vkCmdCopyImage isn't valid inside one) --
 // called from VK_EndWorldPassAndComposite/VK_EndFrame right after
@@ -642,7 +634,7 @@ void VK_UpscaleUpdateHistory(VkCommandBuffer commandBuffer, uint32_t imageIndex)
 		return;
 	}
 
-	writeSlot = historyImages[historyIndex];
+	writeSlot = historyImages[VK_UpscaleHistoryWriteIndex(vk_options.frame.currentFrame)];
 
 	// Swapchain image: PRESENT_SRC_KHR (this render pass's finalLayout, see
 	// VK_PostProcessRenderPassCreate) -> TRANSFER_SRC_OPTIMAL for the copy
@@ -695,16 +687,14 @@ void VK_UpscaleUpdateHistory(VkCommandBuffer commandBuffer, uint32_t imageIndex)
 	if (historyValidFrameCount < 2) {
 		++historyValidFrameCount;
 	}
-	// Only both slots having been written at least once (one write per
-	// slot, alternating below) makes the OTHER slot safe for
-	// VK_UpscaleComposite to sample next -- historyValid mirrors
-	// historyValidFrameCount >= 2 for the simpler check VK_TemporalUpscaleActive
-	// and the (1 - historyIndex) read side use.
+	// historyValidFrameCount >= 2 (not just >= 1) because with
+	// VK_MAX_FRAMES_IN_FLIGHT slots now, frameSlot's own slot could be the
+	// very first write this engine ever did for that slot -- 2 real frames
+	// having run is the simplest correct lower bound to guarantee the read
+	// index (the immediately preceding frameSlot) has been written at least
+	// once. historyValid mirrors this for the simpler check
+	// VK_TemporalUpscaleActive and the read side use.
 	historyValid = historyValidFrameCount >= 2;
-
-	// Advance to the other slot for NEXT frame's write -- must happen after
-	// everything above that reads historyIndex for THIS frame's write.
-	historyIndex = 1 - historyIndex;
 }
 
 qbool VK_CreateUpscaleResources(void)
@@ -738,7 +728,7 @@ void VK_DestroyUpscaleResources(void)
 	VK_UpscaleDestroyHistoryBuffer();
 	{
 		int slot;
-		for (slot = 0; slot < 2; ++slot) {
+		for (slot = 0; slot < VK_MAX_FRAMES_IN_FLIGHT; ++slot) {
 			if (matricesBuffers[slot] != VK_NULL_HANDLE) {
 				vkDestroyBuffer(vk_options.logicalDevice, matricesBuffers[slot], NULL);
 				matricesBuffers[slot] = VK_NULL_HANDLE;
@@ -828,10 +818,11 @@ static qbool VK_TemporalUpscaleActive(void)
 // frame leaking through.
 static qbool vk_upscale_matricesUpdatedThisFrame;
 
-// Writes this frame's reprojection matrices into matricesBuffers[historyIndex]
-// (the same slot index VK_UpscaleDescriptorSet binds for this frame's
-// read -- see its comment for why this is a different aliasing scheme than
-// the color history's) via vkCmdUpdateBuffer -- must run outside any render
+// Writes this frame's reprojection matrices into
+// matricesBuffers[VK_UpscaleHistoryWriteIndex(frameSlot)] (the same slot
+// VK_UpscaleDescriptorSet binds for this frame's read -- see its comment for
+// why this is a different aliasing scheme than the color history's) via
+// vkCmdUpdateBuffer -- must run outside any render
 // pass instance (the spec forbids vkCmdUpdateBuffer inside one), so called
 // from VK_EndWorldPassAndComposite/VK_EndFrame in vk_main.c BEFORE they
 // begin the composite render pass, not from inside VK_UpscaleComposite
@@ -854,7 +845,7 @@ qbool VK_UpscaleUpdateMatrices(VkCommandBuffer commandBuffer)
 	// sl::Constants::reset (see vk_dlss.c's VK_DLSS_Composite), it doesn't
 	// depend on this file's historyValid/historyValidFrameCount at all, so
 	// it needs these matrices from frame 1, not frame 3+.
-	if ((!VK_TemporalUpscaleActive() && !VK_DLSS_Active()) || matricesBuffers[historyIndex] == VK_NULL_HANDLE) {
+	if ((!VK_TemporalUpscaleActive() && !VK_DLSS_Active()) || matricesBuffers[VK_UpscaleHistoryWriteIndex(vk_options.frame.currentFrame)] == VK_NULL_HANDLE) {
 		return false;
 	}
 	if (!VK_CurrentInvViewProjMatrix(matrices.invViewProj)) {
@@ -883,7 +874,7 @@ qbool VK_UpscaleUpdateMatrices(VkCommandBuffer commandBuffer)
 	depthToShaderRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 	vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &depthToShaderRead);
 
-	vkCmdUpdateBuffer(commandBuffer, matricesBuffers[historyIndex], 0, sizeof(matrices), &matrices);
+	vkCmdUpdateBuffer(commandBuffer, matricesBuffers[VK_UpscaleHistoryWriteIndex(vk_options.frame.currentFrame)], 0, sizeof(matrices), &matrices);
 
 	VK_InitialiseStructure(toUniformRead);
 	toUniformRead.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -891,7 +882,7 @@ qbool VK_UpscaleUpdateMatrices(VkCommandBuffer commandBuffer)
 	toUniformRead.dstAccessMask = VK_ACCESS_UNIFORM_READ_BIT;
 	toUniformRead.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	toUniformRead.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	toUniformRead.buffer = matricesBuffers[historyIndex];
+	toUniformRead.buffer = matricesBuffers[VK_UpscaleHistoryWriteIndex(vk_options.frame.currentFrame)];
 	toUniformRead.size = sizeof(matrices);
 	vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 1, &toUniformRead, 0, NULL);
 
@@ -1282,7 +1273,7 @@ static VkDescriptorSet VK_MotionVectorsDescriptorSet(uint32_t imageIndex)
 	VkDescriptorBufferInfo bufferInfo;
 	VkWriteDescriptorSet writes[2];
 
-	if (imageIndex >= vk_options.swapChain.imageCount || vk_options.swapChain.sceneDepthImageView == VK_NULL_HANDLE || matricesBuffers[historyIndex] == VK_NULL_HANDLE) {
+	if (imageIndex >= vk_options.swapChain.imageCount || vk_options.swapChain.sceneDepthImageView == VK_NULL_HANDLE || matricesBuffers[VK_UpscaleHistoryWriteIndex(vk_options.frame.currentFrame)] == VK_NULL_HANDLE) {
 		return VK_NULL_HANDLE;
 	}
 
@@ -1311,7 +1302,7 @@ static VkDescriptorSet VK_MotionVectorsDescriptorSet(uint32_t imageIndex)
 	depthImageInfo.sampler = upscaleDepthSampler;
 
 	VK_InitialiseStructure(bufferInfo);
-	bufferInfo.buffer = matricesBuffers[historyIndex];
+	bufferInfo.buffer = matricesBuffers[VK_UpscaleHistoryWriteIndex(vk_options.frame.currentFrame)];
 	bufferInfo.offset = 0;
 	bufferInfo.range = sizeof(vk_upscale_matrices_t);
 
@@ -1340,9 +1331,10 @@ static VkDescriptorSet VK_MotionVectorsDescriptorSet(uint32_t imageIndex)
 // VK_UpscaleUpdateMatrices/VK_UpscaleUpdateHistory this has to be called
 // from vk_main.c's VK_EndWorldPassAndComposite (outside the composite
 // render pass), BEFORE VK_DLSS_Composite tags and reads this image. Uses
-// matricesBuffers[historyIndex] -- the SAME slot VK_UpscaleUpdateMatrices
-// just wrote this frame (see VK_UpscaleDescriptorSet's comment on why that
-// slot, not 1-historyIndex, holds this frame's matrices) -- so this must be
+// matricesBuffers[VK_UpscaleHistoryWriteIndex(frameSlot)] -- the SAME slot
+// VK_UpscaleUpdateMatrices just wrote this frame (see
+// VK_UpscaleDescriptorSet's comment on why that slot, not the read index,
+// holds this frame's matrices) -- so this must be
 // called AFTER VK_UpscaleUpdateMatrices in the same frame, never before.
 qbool VK_MotionVectorsComposite(VkCommandBuffer commandBuffer, uint32_t imageIndex)
 {

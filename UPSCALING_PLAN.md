@@ -136,10 +136,20 @@ dos shaders próprios podem ser eliminados pela substituição oficial, sem retr
   mesma garantia de fence que todo outro recurso per-frame-in-flight deste
   arquivo (`fsr2DepthParamsBuffer` etc) já usa. Build limpo confirmado, hash
   `5d4f3751916b4bcfbddda7934e8a77dd927b0ac94930faa82bd4665233647aa0`.
-  **Mesmo padrão existe em `vk_upscale.c`** (`historyIndex`/`historyImages[2]`,
-  caminho DLSS/espacial antigo) -- NÃO corrigido nesta sessão (fora do escopo
-  catalogado pela Fase 1, que só cita `vk_fsr2.c`); registrar como pendência
-  separada se for investigar DLSS/caminho espacial depois.
+  **Mesmo padrão existia em `vk_upscale.c`** (`historyIndex`/`historyImages[2]`/
+  `matricesBuffers[2]`, caminho DLSS/espacial antigo) -- CORRIGIDO em sessão
+  seguinte (fora do escopo original catalogado pela Fase 1, mas achado com
+  confiança técnica igual ao bug original ao auditar o arquivo). O comentário
+  existente alegava que era seguro por causa do fence per-`imageIndex` --
+  alegação tecnicamente incorreta: `historyIndex` era um contador livre
+  período-2, sem relação com `imageIndex` nem `frameSlot`. Corrigido com o
+  mesmo padrão provado em `vk_fsr2.c`: `historyImages`/`matricesBuffers`
+  redimensionados pra `VK_MAX_FRAMES_IN_FLIGHT`, indexados por
+  `vk_options.frame.currentFrame` diretamente (write) e índice do frame
+  anterior (read, história de cor -- 1 frame de delay real). `matricesBuffers`
+  usa write-index nos dois pontos de acesso (escrito E lido no MESMO frame,
+  intra-frame como `fsr2ReconstructedPrevDepth`). Build limpo confirmado,
+  hash `ee777b18d703779c39c5839e5bd570cd58b1e511b2392584c61dfe5136ee7d58`.
 - [ ] NOVO achado, ainda NÃO corrigido (fora do escopo do item acima, caso
   diferente e potencialmente pior): `fsr2DilatedMotion`/`fsr2DilatedMotionPrev`
   (`vk_fsr2.c`) são imagens ÚNICAS compartilhadas, SEM nenhum slot

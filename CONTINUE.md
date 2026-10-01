@@ -1,5 +1,54 @@
 # Onde paramos — Vulkan renderer / SDL3 port
 
+## Checkpoint 2026-10-01 (parte 10) — mesmo bug de history race corrigido em vk_upscale.c (caminho DLSS/espacial)
+
+Continuação direta da parte 9: a nota registrada lá ("mesmo padrão existe em
+`vk_upscale.c`, não corrigido") virou investigação real. `vk_upscale.c` tinha
+um comentário existente (de sessão anterior) alegando que `historyImages[2]`/
+`matricesBuffers[2]` eram seguros "porque o fence per-imageIndex garante não
+sobreposição a cada `VK_MAX_FRAMES_IN_FLIGHT=3` frames". **Essa alegação
+estava tecnicamente errada**: `historyIndex` (o índice real usado pra indexar
+essas arrays) é um contador livre incrementado 1x por
+`VK_UpscaleUpdateHistory`, SEM relação nenhuma com `imageIndex` nem com
+`frameSlot` -- período 2, igual ao bug já corrigido em `fsr2History`. O
+comentário confundiu dois fences diferentes (`inFlightFences[frameSlot]` e
+`imageInFlightFences[imageIndex]`, ambos reais e existentes no motor) com
+proteção que nenhum dos dois realmente dava pro contador `historyIndex`.
+
+**Corrigido com o mesmo padrão já provado em `vk_fsr2.c`**:
+- `historyImages`/`historyImageMemories`/`historyImageViews` e
+  `matricesBuffers`/`matricesBufferMemories` redimensionados de `[2]` pra
+  `[VK_MAX_FRAMES_IN_FLIGHT]`.
+- `VK_UpscaleHistoryWriteIndex`/`VK_UpscaleHistoryReadIndex` (duplicatas
+  locais das mesmas 2 funções já em `vk_fsr2.c` -- pequenas demais pra valer
+  compartilhar entre translation units).
+- `historyImages`: write-index (`frameSlot`) na escrita
+  (`VK_UpscaleUpdateHistory`), read-index (frame anterior) na leitura
+  (`VK_UpscaleDescriptorSet`) -- história de cor tem delay real de 1 frame.
+- `matricesBuffers`: write-index nos 2 pontos de acesso (`VK_UpscaleUpdateMatrices`
+  escreve, `VK_UpscaleDescriptorSet`/`VK_MotionVectorsDescriptorSet` leem) --
+  intra-frame, mesma categoria de `fsr2ReconstructedPrevDepth` no `vk_fsr2.c`
+  (escrito e lido no MESMO frame, não cross-frame apesar do padrão ping-pong
+  antigo sugerir o contrário).
+- Removido o toggle `historyIndex = 1 - historyIndex` do fim de
+  `VK_UpscaleUpdateHistory` -- não precisa mais, o índice já vem de
+  `vk_options.frame.currentFrame`, que avança sozinho a cada frame.
+- Todos os comentários que citavam `historyIndex`/"1 - historyIndex"
+  atualizados pra refletir o esquema novo.
+
+Build limpo confirmado do zero (exit 0, sem warning novo), hash
+`ee777b18d703779c39c5839e5bd570cd58b1e511b2392584c61dfe5136ee7d58`.
+
+**Com isso, os dois arquivos principais do sistema de upscaling (`vk_fsr2.c`
+hand-port e `vk_upscale.c` DLSS/espacial) estão livres da classe de bug
+"ping-pong período-2 vs frames-em-voo período-3"** que dominou a sessão.
+Sessão total: 8 bugs reais confirmados e corrigidos.
+
+**Próxima ação real**: mesma recomendação de sempre -- parar pra validação
+visual antes de continuar. O volume de mudança não testada é grande o
+suficiente que vale a pena o Tiago confirmar que nada regrediu antes de ir
+mais fundo em Fase 3 (entradas temporais) ou qualquer outra coisa nova.
+
 ## Checkpoint 2026-10-01 (parte 9) — maior pendência de Fase 1 corrigida: 8 imagens scratch sem slot per-frame-in-flight
 
 Continuação direta da parte 8. As 8 imagens "scratch" de baixa resolução do
