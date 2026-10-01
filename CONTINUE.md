@@ -1,5 +1,25 @@
 # Onde paramos — Vulkan renderer / SDL3 port
 
+## Checkpoint 2026-09-30 — revisão Codex e plano de recuperação
+
+Leia `AGENTS.md` e `UPSCALING_PLAN.md` antes de continuar. Eles prevalecem sobre
+as afirmações históricas abaixo de FSR2 completo. Baseline auditada: `89f8648b`,
+worktree `E:\tmp\eqvk-upscaling`, branch `feature/vulkan-upscaling`.
+O port FSR2 próprio é incompleto e pode nem executar devido ao gate DLSS do motion pass.
+Há erros confirmados de recursos/layouts/formato/pool e teardown ausente.
+DLSS SR não foi validado em RTX; suporte ao pedido DLSS5 não foi demonstrado.
+Plano: SDK AMD oficial via shim C++, entradas temporais corretas, composição nativa,
+revisão Streamline, menu/comandos, validação e comparação upstream. Checklist no plano.
+Nesta etapa: documentação persistente e ligação do teardown FSR2 ao teardown swapchain.
+Build e validação de execução devem ser registrados abaixo conforme realmente realizados.
+
+- Verificação inicial: `git diff --check` passou.
+- Correção inicial: teardown FSR2 chamado por `VK_DestroySwapChainFramebuffers`;
+  runtime/restarts ainda não validados. Não marcar lifecycle completo no checklist.
+- `cmd /c _build_wip.bat` iniciado; configure disparou reconstrução de dependências
+  vcpkg (mudança de compiler hash). Build ainda pendente no checkpoint; nenhum
+  executável novo foi implantado. Na retomada, conferir processo/build antes de iniciar outro.
+
 Atualizado em: 2026-09-15 (sessão Claude, Windows, `E:\tmp\eqvk-upscaling` — worktree separado da branch `feature/vulkan-upscaling`) — ver seção "Sessão 2026-09-15 — FSR2/DLSS upscaler" logo abaixo para o estado mais recente. As demais seções continuam válidas como histórico.
 
 ## Sessão 2026-09-15 — FSR2/DLSS upscaler (espacial + temporal), enviado para `origin/feature/vulkan-upscaling`
