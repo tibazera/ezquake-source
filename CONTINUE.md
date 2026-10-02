@@ -47,6 +47,22 @@ custo intrínseco do algoritmo. **Não confirmado ainda -- precisa reteste.**
 Sessão total: 12 bugs reais confirmados e corrigidos (6 hand-port + 2 em
 vk_upscale.c/vk_dlss.c + 2 achados pelo Codex no shim da SDK + jitter + este).
 
+**Investigação adicional sem achar mais nada por leitura de código**
+(verificado e descartado como causa, tudo bate com o hand-port e com a doc
+oficial): `g_reset` lifecycle correto (só problema seria tremor no 1º frame
+pós-reset, não contínuo); `cameraFovAngleVertical`/`r_refdef.fov_y` conversão
+grau->radiano correta; `viewSpaceToMetersFactor` idêntico ao hand-port
+(1.7/56); `reversedDepth`/`FFX_FSR2_ENABLE_DEPTH_INVERTED` consistente com
+todo o resto do código; `R_FarPlaneZ()` retorna valor finito real (cvar
+`r_farclip`, com bound), não precisa de `FFX_FSR2_ENABLE_DEPTH_INFINITE`.
+
+**Build com os 2 fixes desta parte (jitter + output image race) ainda não
+testado ao vivo** -- `C:\ezquake\ezquake-fsr2test.exe` continua bloqueado
+pelo processo do Tiago (ausente). Esgotei hipóteses razoáveis de bug por
+leitura de código sem mais dado real -- próxima ação de verdade precisa ou
+do Tiago testando de novo, ou de profiler/log real (RenderDoc, validation
+layers com `-dev`, ou captura de frame time), não mais leitura às cegas.
+
 ## Checkpoint 2026-10-02 (parte 14) — Tiago retestou: tremor melhorou mas não sumiu, FPS caiu muito (esperado o oposto)
 
 Autorização explícita do Tiago pra trabalhar sem parar até ele voltar amanhã,
