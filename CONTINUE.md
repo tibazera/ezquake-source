@@ -50,6 +50,21 @@ isolados e inferir -- deveria ter procurado o sample primeiro, não depois.
 sessão (sinal normal -> sinal invertido -> sinal normal+escala dobrada),
 precisa de confirmação real do Tiago antes de considerar resolvido.
 
+**Varredura sistemática extra contra o mesmo sample** (todos os campos do
+`FfxFsr2ContextDescription`/`FfxFsr2DispatchDescription` que o sample
+preenche): `FFX_FSR2_ENABLE_HIGH_DYNAMIC_RANGE` -- sample sempre seta
+(Cauldron usa HDR), nós corretamente NÃO setamos (`postProcessColorImages`
+usa `physicalDeviceSurfaceFormat.format`, confirmado BGRA8 UNORM, SDR real).
+`FFX_FSR2_ENABLE_DEPTH_INFINITE` -- sample seta junto com `DEPTH_INVERTED`,
+nós corretamente não setamos (far plane finito, `r_farclip`). `preExposure`/
+`exposure` -- ambos `1.0f` igual ao sample. Nenhuma outra discrepância de
+convenção encontrada nesta passada.
+
+**Build com o fix de motion vector ainda não deployado** -- `ezquake-fsr2test.exe`
+continua bloqueado pelo processo do Tiago em várias tentativas ao longo desta
+sessão de trabalho autônomo. Hash do build pronto pra deploy assim que o
+arquivo for liberado: `29ed7ad1119c7ce45f11cc5a982237e89ce9e0b1d26179e3a7e89e33b7d58ac9`.
+
 **Jitter re-confirmado contra o mesmo sample** (não só a doc desta vez):
 `UpscaleContext.cpp:141-147` confirma exatamente o que a doc já tinha dito e
 o que a parte 13 corrigiu -- `jitterOffset` recebe o valor CRU de
