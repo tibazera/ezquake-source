@@ -1,5 +1,52 @@
 # Onde paramos — Vulkan renderer / SDL3 port
 
+## Checkpoint 2026-10-02 (parte 15) — Codex achou o `g_outputImage` sem slot no shim da SDK (mesmo bug, arquivo esquecido)
+
+Resultado do job `task-muqe8fgj-851hug` (investigação de performance):
+Codex não conseguiu RODAR build nem commitar (sandbox dele nega escrita fora
+de `C:\Projetos Linux\ezquake-sdl3-vulkan-pr`, só investigação read-only),
+mas achou por inspeção algo real que eu tinha deixado passar:
+
+> "Concrete correctness concern: `g_outputImage` is a single image shared
+> across three frames in flight. It should be per-frame-slot."
+
+**Confirmado real**: `g_outputImage`/`g_outputImageMemory`/`g_outputImageView`
+em `vk_fsr2_sdk.cpp` ainda eram instâncias ÚNICAS, sem slot per-frame-in-flight
+-- exatamente a MESMA classe de bug que corrigi em `vk_fsr2.c` (8 imagens),
+`vk_upscale.c` (history/matrices) e `vk_dlss.c` (output image), mas esqueci
+de aplicar no PRÓPRIO shim da SDK oficial que escrevi nesta sessão. Ironia
+notada: documentei extensivamente o padrão, corrigi em 3 arquivos, e deixei
+o 4º (o mais novo) com o mesmo bug.
+
+**Corrigido**: `g_outputImage[FSR2_SDK_MAX_FRAMES_IN_FLIGHT]` (constante
+literal `3`, duplicada localmente já que este arquivo deliberadamente não
+inclui headers do motor -- ver comentário do próprio arquivo). `frameSlot`
+adicionado como novo parâmetro em `VK_Fsr2SdkComposite` (`vk_fsr2_sdk.cpp`)
+e no `extern` correspondente em `vk_fsr2_sdk_bridge.c`, preenchido com
+`vk_options.frame.currentFrame` no call site da wrapper. Todos os pontos de
+acesso (`CreateOutputImage`/`DestroyOutputImage` em loop, `ffxGetTextureResourceVK`
+do output, as 2 barreiras + `vkCmdCopyImage` finais) indexados por
+`frameSlot`.
+
+**Removido** o `fprintf` de diagnóstico temporário (não mais necessário --
+confirmei junto com o Codex que `CreateContextLocked` NÃO roda toda frame,
+`sceneSize`/`displaySize` são estáveis; a hipótese de recriação de contexto
+foi descartada por ambos independentemente).
+
+Build limpo confirmado do zero (exit 0, sem warning novo), hash
+`ab9b252afff97b72d5c6bf598019de4286b536466c8797081aed8a59b9cfc41e`.
+
+**Hipótese do Codex pra causa de performance** ("custo fixo do FSR2 pode
+exceder economia do renderscale 0.66 numa engine leve como Quake") avaliada
+e considerada fraca -- FSR2 é desenhado pra rodar em tempo real em GPUs bem
+menos potentes que a RX 6800 XT do Tiago, não deveria ser estruturalmente
+lento demais. Mais provável que o race agora corrigido (ou outro ainda não
+achado) estivesse causando stall de sincronização real via driver, não
+custo intrínseco do algoritmo. **Não confirmado ainda -- precisa reteste.**
+
+Sessão total: 12 bugs reais confirmados e corrigidos (6 hand-port + 2 em
+vk_upscale.c/vk_dlss.c + 2 achados pelo Codex no shim da SDK + jitter + este).
+
 ## Checkpoint 2026-10-02 (parte 14) — Tiago retestou: tremor melhorou mas não sumiu, FPS caiu muito (esperado o oposto)
 
 Autorização explícita do Tiago pra trabalhar sem parar até ele voltar amanhã,

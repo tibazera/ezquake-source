@@ -28,6 +28,12 @@ extern "C" {
 
 typedef int vk_fsr2_sdk_bool; // 0/1, matches the engine's qbool ABI (int-sized enum) without including q_shared.h
 
+// Mirrors VK_MAX_FRAMES_IN_FLIGHT (vk_local.h) -- duplicated as a literal
+// rather than included, since this TU deliberately avoids every engine
+// header (see this file's own header comment on why). If the engine's
+// constant ever changes, this one must change with it.
+#define FSR2_SDK_MAX_FRAMES_IN_FLIGHT 3
+
 namespace {
 
 FfxFsr2Context g_context;
@@ -40,9 +46,24 @@ bool g_reset = true;
 VkDevice g_device = VK_NULL_HANDLE;
 VkPhysicalDevice g_physicalDevice = VK_NULL_HANDLE;
 
-VkImage g_outputImage = VK_NULL_HANDLE;
-VkDeviceMemory g_outputImageMemory = VK_NULL_HANDLE;
-VkImageView g_outputImageView = VK_NULL_HANDLE;
+// Per-frame-in-flight, NOT a single shared image -- this is the exact same
+// cross-command-buffer race already found and fixed across vk_fsr2.c,
+// vk_upscale.c and vk_dlss.c this session (see those files' own history-slot
+// comments for the full derivation): with VK_MAX_FRAMES_IN_FLIGHT=3 real
+// command buffers potentially executing concurrently on the GPU, a single
+// shared output image means frame N+1's slEvaluateFeature-equivalent
+// (ffxFsr2ContextDispatch writing g_outputImage) could race frame N's still
+// in-flight read+copy of that same image. Found by Codex's independent
+// investigation into the Tiago-reported shimmer/perf regression
+// (2026-10-02) -- confirmed real by inspection, not yet proven to be the
+// sole cause of the perf drop (that needs GPU timing this session doesn't
+// have access to), but it is a genuine correctness bug regardless and the
+// same class fixed everywhere else in this codebase. Indexed by frameSlot
+// (passed in from VK_Fsr2SdkComposite/VK_Fsr2SdkCompositeWrapper's caller,
+// vk_options.frame.currentFrame on the C side).
+VkImage g_outputImage[FSR2_SDK_MAX_FRAMES_IN_FLIGHT];
+VkDeviceMemory g_outputImageMemory[FSR2_SDK_MAX_FRAMES_IN_FLIGHT];
+VkImageView g_outputImageView[FSR2_SDK_MAX_FRAMES_IN_FLIGHT];
 
 uint32_t FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties)
 {
@@ -58,66 +79,71 @@ uint32_t FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties)
 
 void DestroyOutputImage()
 {
-	if (g_outputImageView != VK_NULL_HANDLE) {
-		vkDestroyImageView(g_device, g_outputImageView, nullptr);
-		g_outputImageView = VK_NULL_HANDLE;
-	}
-	if (g_outputImage != VK_NULL_HANDLE) {
-		vkDestroyImage(g_device, g_outputImage, nullptr);
-		g_outputImage = VK_NULL_HANDLE;
-	}
-	if (g_outputImageMemory != VK_NULL_HANDLE) {
-		vkFreeMemory(g_device, g_outputImageMemory, nullptr);
-		g_outputImageMemory = VK_NULL_HANDLE;
+	for (int slot = 0; slot < FSR2_SDK_MAX_FRAMES_IN_FLIGHT; ++slot) {
+		if (g_outputImageView[slot] != VK_NULL_HANDLE) {
+			vkDestroyImageView(g_device, g_outputImageView[slot], nullptr);
+			g_outputImageView[slot] = VK_NULL_HANDLE;
+		}
+		if (g_outputImage[slot] != VK_NULL_HANDLE) {
+			vkDestroyImage(g_device, g_outputImage[slot], nullptr);
+			g_outputImage[slot] = VK_NULL_HANDLE;
+		}
+		if (g_outputImageMemory[slot] != VK_NULL_HANDLE) {
+			vkFreeMemory(g_device, g_outputImageMemory[slot], nullptr);
+			g_outputImageMemory[slot] = VK_NULL_HANDLE;
+		}
 	}
 }
 
 bool CreateOutputImage(VkExtent2D size, VkFormat format)
 {
-	VkImageCreateInfo imageInfo{};
-	VkMemoryRequirements memReq;
-	VkMemoryAllocateInfo allocInfo{};
-	VkImageViewCreateInfo viewInfo{};
-
 	DestroyOutputImage();
 
-	imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-	imageInfo.imageType = VK_IMAGE_TYPE_2D;
-	imageInfo.format = format;
-	imageInfo.extent = { size.width, size.height, 1 };
-	imageInfo.mipLevels = 1;
-	imageInfo.arrayLayers = 1;
-	imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-	imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-	imageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-	imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-	imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	for (int slot = 0; slot < FSR2_SDK_MAX_FRAMES_IN_FLIGHT; ++slot) {
+		VkImageCreateInfo imageInfo{};
+		VkMemoryRequirements memReq;
+		VkMemoryAllocateInfo allocInfo{};
+		VkImageViewCreateInfo viewInfo{};
 
-	if (vkCreateImage(g_device, &imageInfo, nullptr, &g_outputImage) != VK_SUCCESS) {
-		return false;
-	}
+		imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+		imageInfo.imageType = VK_IMAGE_TYPE_2D;
+		imageInfo.format = format;
+		imageInfo.extent = { size.width, size.height, 1 };
+		imageInfo.mipLevels = 1;
+		imageInfo.arrayLayers = 1;
+		imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+		imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+		imageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+		imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+		imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-	vkGetImageMemoryRequirements(g_device, g_outputImage, &memReq);
-	allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-	allocInfo.allocationSize = memReq.size;
-	allocInfo.memoryTypeIndex = FindMemoryType(memReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-	if (allocInfo.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(g_device, &allocInfo, nullptr, &g_outputImageMemory) != VK_SUCCESS) {
-		DestroyOutputImage();
-		return false;
-	}
-	vkBindImageMemory(g_device, g_outputImage, g_outputImageMemory, 0);
+		if (vkCreateImage(g_device, &imageInfo, nullptr, &g_outputImage[slot]) != VK_SUCCESS) {
+			DestroyOutputImage();
+			return false;
+		}
 
-	viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-	viewInfo.image = g_outputImage;
-	viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-	viewInfo.format = format;
-	viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-	viewInfo.subresourceRange.levelCount = 1;
-	viewInfo.subresourceRange.layerCount = 1;
+		vkGetImageMemoryRequirements(g_device, g_outputImage[slot], &memReq);
+		allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+		allocInfo.allocationSize = memReq.size;
+		allocInfo.memoryTypeIndex = FindMemoryType(memReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+		if (allocInfo.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(g_device, &allocInfo, nullptr, &g_outputImageMemory[slot]) != VK_SUCCESS) {
+			DestroyOutputImage();
+			return false;
+		}
+		vkBindImageMemory(g_device, g_outputImage[slot], g_outputImageMemory[slot], 0);
 
-	if (vkCreateImageView(g_device, &viewInfo, nullptr, &g_outputImageView) != VK_SUCCESS) {
-		DestroyOutputImage();
-		return false;
+		viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+		viewInfo.image = g_outputImage[slot];
+		viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+		viewInfo.format = format;
+		viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		viewInfo.subresourceRange.levelCount = 1;
+		viewInfo.subresourceRange.layerCount = 1;
+
+		if (vkCreateImageView(g_device, &viewInfo, nullptr, &g_outputImageView[slot]) != VK_SUCCESS) {
+			DestroyOutputImage();
+			return false;
+		}
 	}
 	return true;
 }
@@ -225,7 +251,7 @@ void VK_Fsr2SdkInvalidateHistory(void)
 }
 
 vk_fsr2_sdk_bool VK_Fsr2SdkComposite(
-	VkCommandBuffer commandBuffer,
+	VkCommandBuffer commandBuffer, uint32_t frameSlot,
 	VkImage sceneColorImage, VkImageView sceneColorView, VkFormat sceneColorFormat,
 	VkImage sceneDepthImage, VkImageView sceneDepthView,
 	VkImage motionVectorsImage, VkImageView motionVectorsView,
@@ -247,10 +273,18 @@ vk_fsr2_sdk_bool VK_Fsr2SdkComposite(
 	VkImageMemoryBarrier barriers[2];
 	VkImageCopy region;
 
-	if (g_device == VK_NULL_HANDLE || sceneWidth == 0 || sceneHeight == 0 || displayWidth == 0 || displayHeight == 0) {
+	if (g_device == VK_NULL_HANDLE || sceneWidth == 0 || sceneHeight == 0 || displayWidth == 0 || displayHeight == 0 ||
+		frameSlot >= FSR2_SDK_MAX_FRAMES_IN_FLIGHT) {
 		return 0;
 	}
 
+	// Confirmed NOT the cause of the 2026-10-02 FPS regression (Codex's
+	// independent investigation + inspection here agree): sceneSize/displaySize
+	// are stable frame to frame (stored once at swapchain creation,
+	// VK_SceneRenderExtent/vk_options.swapChain.imageSize don't change
+	// per-frame), so this branch only fires on real resize/renderscale
+	// change, not every frame. Real diagnostic logging removed -- see
+	// CONTINUE.md for what WAS found (g_outputImage race, fixed below).
 	if (!g_contextValid || g_sceneSize.width != sceneWidth || g_sceneSize.height != sceneHeight ||
 		g_displaySize.width != displayWidth || g_displaySize.height != displayHeight) {
 		if (!CreateContextLocked(sceneSize, displaySize, reversedDepth, outputFormat)) {
@@ -266,7 +300,7 @@ vk_fsr2_sdk_bool VK_Fsr2SdkComposite(
 		VK_FORMAT_D32_SFLOAT, nullptr, FFX_RESOURCE_STATE_COMPUTE_READ);
 	dispatch.motionVectors = ffxGetTextureResourceVK(&g_context, motionVectorsImage, motionVectorsView, sceneWidth, sceneHeight,
 		VK_FORMAT_R16G16_SFLOAT, nullptr, FFX_RESOURCE_STATE_COMPUTE_READ);
-	dispatch.output = ffxGetTextureResourceVK(&g_context, g_outputImage, g_outputImageView, displayWidth, displayHeight,
+	dispatch.output = ffxGetTextureResourceVK(&g_context, g_outputImage[frameSlot], g_outputImageView[frameSlot], displayWidth, displayHeight,
 		outputFormat, nullptr, FFX_RESOURCE_STATE_UNORDERED_ACCESS);
 	dispatch.jitterOffset.x = jitterX;
 	dispatch.jitterOffset.y = jitterY;
@@ -323,7 +357,7 @@ vk_fsr2_sdk_bool VK_Fsr2SdkComposite(
 	barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
 	barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	barriers[0].image = g_outputImage;
+	barriers[0].image = g_outputImage[frameSlot];
 	barriers[0].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
 	barriers[1] = barriers[0];
@@ -340,7 +374,7 @@ vk_fsr2_sdk_bool VK_Fsr2SdkComposite(
 	region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
 	region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
 	region.extent = { displayWidth, displayHeight, 1 };
-	vkCmdCopyImage(commandBuffer, g_outputImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+	vkCmdCopyImage(commandBuffer, g_outputImage[frameSlot], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
 	barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
 	barriers[0].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;

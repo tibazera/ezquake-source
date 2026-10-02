@@ -21,7 +21,7 @@ extern int VK_Fsr2SdkInit(VkDevice device, VkPhysicalDevice physicalDevice);
 extern void VK_Fsr2SdkDestroyResources(void);
 extern void VK_Fsr2SdkInvalidateHistory(void);
 extern int VK_Fsr2SdkComposite(
-	VkCommandBuffer commandBuffer,
+	VkCommandBuffer commandBuffer, uint32_t frameSlot,
 	VkImage sceneColorImage, VkImageView sceneColorView, VkFormat sceneColorFormat,
 	VkImage sceneDepthImage, VkImageView sceneDepthView,
 	VkImage motionVectorsImage, VkImageView motionVectorsView,
@@ -79,7 +79,7 @@ qbool VK_Fsr2SdkCompositeWrapper(VkCommandBuffer commandBuffer, VkImage sceneCol
 
 	sharpenEnabled = vid_vulkan_sharpness.value > 0.0f;
 
-	return VK_Fsr2SdkComposite(commandBuffer,
+	return VK_Fsr2SdkComposite(commandBuffer, vk_options.frame.currentFrame,
 		sceneColorImage, sceneColorView, vk_options.physicalDeviceSurfaceFormat.format,
 		sceneDepthImage, sceneDepthView,
 		motionVectorsImage, motionVectorsView,
