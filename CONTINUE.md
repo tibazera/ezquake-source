@@ -1,5 +1,53 @@
 # Onde paramos — Vulkan renderer / SDL3 port
 
+## Checkpoint 2026-10-02 (parte 14) — Tiago retestou: tremor melhorou mas não sumiu, FPS caiu muito (esperado o oposto)
+
+Autorização explícita do Tiago pra trabalhar sem parar até ele voltar amanhã,
+junto com o Codex em paralelo (job `task-muqe8fgj-851hug`, investigando a
+mesma regressão de performance de forma independente).
+
+**Reteste real** (`vid_vulkan_upscaler 3` + `renderscale 0.66`, build com o
+fix de jitter): "deu uma boa melhora mas não parou" (tremor) "e o jogo parece
+estar travando com FPS baixo... com uso do FSR2 e DLSS era pro fps triplicar
+não ao contrário". Confirma: fix de jitter foi parcialmente correto (melhora
+real, não é placebo), mas resta pelo menos 1 causa de tremor residual, e tem
+um problema de performance SEPARADO e grave que não foi causado pelo fix de
+jitter (Tiago relatou os dois sintomas juntos na mesma mensagem, mais
+consistente com bug pré-existente desde o início do caminho SDK, não
+regressão nova).
+
+**Diagnóstico temporário adicionado** (`vk_fsr2_sdk.cpp`, `fprintf(stderr,...)`
+em `CreateContextLocked`'s trigger condition) pra confirmar/descartar a
+hipótese mais perigosa: contexto da SDK sendo recriado TODO frame em vez de
+uma vez só (`ffxFsr2ContextCreate` é caro -- compila pipelines, aloca memória
+de device -- se rodar toda frame explicaria travamento e FPS baixo
+perfeitamente). Build limpo confirmado (precisou de `#include <cstdio>`
+adicional), hash `531b016e6b0ffdc85731f77aa1e51bd4ad2cbf181dd4072288b94c6769cd961d`.
+**Ainda não deployado** -- `C:\ezquake\ezquake-fsr2test.exe` estava em uso
+pelo processo do Tiago (arquivo bloqueado), aguardando ele fechar o jogo pra
+copiar o build novo.
+
+**Investigação própria sem achar causa concreta ainda** (só por leitura de
+código, sem profiler): descartei several hipóteses -- motion vectors
+pipeline/framebuffer já tem cache lazy correto (não recria por frame), o SDK
+sempre despacha o luminance pyramid incondicionalmente (comportamento padrão
+documentado, não um bug meu), contexto único global (`g_context`, não array
+per-frame-in-flight) não deveria ser problema de performance numa única fila
+gráfica sequencial. Nenhuma fonte óbvia de stall encontrada por leitura --
+precisa mesmo do log/profiler real pra confirmar.
+
+**Codex investigando em paralelo** a mesma regressão, mesmas 5 hipóteses
+priorizadas passadas a ele (recriação de contexto, vkDeviceWaitIdle síncrono,
+falha silenciosa no dispatch, vazamento de recurso, outro problema óbvio no
+hot path) -- lendo o `ffx_fsr2.cpp` real da SDK pra entender o dispatch
+interno. Resultado ainda pendente no momento deste checkpoint.
+
+**Próxima ação real**: assim que o Tiago puder fechar o jogo, deployar o
+build com diagnóstico, pedir pra ele testar de novo e capturar o
+`fprintf(stderr,...)` (ex: rodar com `2> log.txt` ou via terminal visível) --
+se aparecer "(re)creating context" repetidamente durante o jogo normal
+(não só 1x no início), confirma a hipótese mais perigosa.
+
 ## Checkpoint 2026-10-02 (parte 13) — PRIMEIRO TESTE VISUAL REAL: tremor/borrão no modo SDK oficial, causa provável corrigida
 
 **Tiago testou ao vivo**: `vid_vulkan_upscaler 3` + `vid_vulkan_renderscale 0.66`
