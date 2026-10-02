@@ -50,6 +50,18 @@ isolados e inferir -- deveria ter procurado o sample primeiro, não depois.
 sessão (sinal normal -> sinal invertido -> sinal normal+escala dobrada),
 precisa de confirmação real do Tiago antes de considerar resolvido.
 
+**Jitter re-confirmado contra o mesmo sample** (não só a doc desta vez):
+`UpscaleContext.cpp:141-147` confirma exatamente o que a doc já tinha dito e
+o que a parte 13 corrigiu -- `jitterOffset` recebe o valor CRU de
+`ffxFsr2GetJitterOffset` (sem negar Y), a negação só acontece na hora de
+montar a matriz de projeção (`SetProjectionJitter`, `-2*jitterY/height`).
+A correção da parte 13 estava certa; diferente do motion vector, não precisou
+de correção adicional. Única diferença real: o sample usa a sequência
+Halton(2,3) própria da SDK (`ffxFsr2GetJitterOffset`) com fase count calculado
+por `ffxFsr2GetJitterPhaseCount(renderWidth, displayWidth)`, enquanto nós
+reusamos a tabela Halton-8 fixa do motor -- isso é otimização de qualidade
+(pendência já documentada na Fase 2), não bug de convenção/sinal.
+
 ## Checkpoint 2026-10-02 (parte 15) — Codex achou o `g_outputImage` sem slot no shim da SDK (mesmo bug, arquivo esquecido)
 
 Resultado do job `task-muqe8fgj-851hug` (investigação de performance):
