@@ -216,6 +216,12 @@ dos shaders próprios podem ser eliminados pela substituição oficial, sem retr
   (ver checkpoint); valores corretos (sinais, convenções) NÃO confirmados
   visualmente -- só verificados contra comentários/fórmulas já usadas pelo
   hand-port (vk_fsr2.c) e vk_dlss.c, não testados ao vivo.
+- [x] Sinal de `motionVectorScale` corrigido (revisão do Codex): era `(1,1)`,
+  devia ser `(-1,-1)` -- nosso buffer grava `current-previous` em UV, a SDK
+  espera `previous-current` (soma à UV atual pra achar UV anterior, confirmado
+  lendo `ffx_fsr2_reconstruct_dilated_velocity_and_previous_depth.h`).
+  Magnitude já estava certa (buffer é UV, não pixels, apesar do README
+  descrever pixels -- isso se aplica ao buffer pré-escala). Ver CONTINUE.md.
 - [ ] Usar ffxFsr2GetJitterPhaseCount/GetJitterOffset; remover tabela fixa de 8 fases
   e garantir mesma amostra/signo no desenho e no dispatch. NÃO feito -- este
   caminho ainda reusa `VK_JitterPixelOffset` (tabela Halton-8 fixa do motor,

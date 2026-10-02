@@ -270,8 +270,23 @@ vk_fsr2_sdk_bool VK_Fsr2SdkComposite(
 		outputFormat, nullptr, FFX_RESOURCE_STATE_UNORDERED_ACCESS);
 	dispatch.jitterOffset.x = jitterX;
 	dispatch.jitterOffset.y = jitterY;
-	dispatch.motionVectorScale.x = 1.0f;
-	dispatch.motionVectorScale.y = 1.0f;
+	// Sign, NOT magnitude: this project's motion-vector buffer (vk_motion_vectors.frag)
+	// stores currentUV - previousUV, already in UV space [0,1] (confirmed by
+	// reading the shader). The SDK's own LoadInputMotionVector
+	// (ffx_fsr2_callbacks_glsl.h) computes fUvMotionVector = fSrcMotionVector *
+	// MotionVectorScale() and then uses it as fReprojectedUv = fUv +
+	// fMotionVector (ffx_fsr2_reconstruct_dilated_velocity_and_previous_depth.h)
+	// -- i.e. the SDK expects previousUV - currentUV (added to current UV to
+	// reach the previous frame's UV), the OPPOSITE sign from what this
+	// buffer stores. Scale stays 1:1 in magnitude (buffer is already UV, not
+	// pixels -- the official sample's own motionVectorScale=(renderWidth,
+	// renderHeight) only applies to a buffer stored in NDC [-1,1], which this
+	// one is not), just negated. Confirmed against the vendored v2.2.1
+	// source, not the README's generic pixel-space description, which
+	// applies to the pre-scale raw buffer, not the post-scale fUvMotionVector
+	// this file produces.
+	dispatch.motionVectorScale.x = -1.0f;
+	dispatch.motionVectorScale.y = -1.0f;
 	dispatch.renderSize.width = sceneWidth;
 	dispatch.renderSize.height = sceneHeight;
 	dispatch.enableSharpening = enableSharpening != 0;
@@ -285,10 +300,14 @@ vk_fsr2_sdk_bool VK_Fsr2SdkComposite(
 	dispatch.viewSpaceToMetersFactor = viewSpaceToMetersFactor;
 
 	err = ffxFsr2ContextDispatch(&g_context, &dispatch);
-	g_reset = false;
 	if (err != FFX_OK) {
+		// Leave g_reset set on failure -- a failed dispatch means the SDK's
+		// own internal history (whatever state it holds) didn't advance
+		// correctly this frame, so the NEXT real dispatch must still request
+		// a reset rather than blend against a frame that silently failed.
 		return 0;
 	}
+	g_reset = false;
 
 	// Copy the SDK's output image into dstImage. The backend tracks
 	// g_outputImage's own layout internally; it was registered as

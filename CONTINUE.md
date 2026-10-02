@@ -1,5 +1,52 @@
 # Onde paramos — Vulkan renderer / SDL3 port
 
+## Checkpoint 2026-10-01 (parte 12) — Codex achou 2 bugs reais no shim da SDK oficial, verificados e corrigidos
+
+Delegado ao Codex (`codex-companion task`) um segundo-pass de revisão independente
+sobre os 16 commits desta sessão. Codex não teve permissão de escrita no
+worktree (`E:\tmp\eqvk-upscaling`, fora do diretório autorizado dele), então só
+reportou achados sem aplicar -- verificados e corrigidos manualmente aqui.
+
+**Achado 1 (real, confirmado contra o código-fonte vendorizado v2.2.1, CORRIGIDO)**:
+`vk_fsr2_sdk.cpp`'s `motionVectorScale` estava `(1.0, 1.0)`. O Codex apontou
+sinal errado mas magnitude errada (sugeriu `(-sceneWidth, -sceneHeight)`,
+tratando o buffer como se estivesse em pixels). Investigação própria:
+- `src/vulkan_shaders/vk_motion_vectors.frag:88`: nosso buffer grava
+  `result = texCoord - prevUV` -- já em espaço UV [0,1], NÃO pixels.
+- `external/fsr2/.../ffx_fsr2_callbacks_glsl.h:357`: SDK computa
+  `fUvMotionVector = fSrcMotionVector * MotionVectorScale()` -- o resultado
+  PÓS-escala já se chama `fUvMotionVector`, confirmando que a SDK espera UV
+  depois da escala, não pixels (a descrição em pixels do README se aplica ao
+  buffer ANTES da escala, não ao resultado).
+- `external/fsr2/.../ffx_fsr2_reconstruct_dilated_velocity_and_previous_depth.h:30`:
+  SDK usa `fReprojectedUv = fUv + fMotionVector` -- ou seja a SDK espera
+  `previousUV - currentUV` (somado à UV atual dá a UV anterior), o OPOSTO do
+  que nosso buffer grava (`currentUV - previousUV`).
+- Conclusão correta: sinal errado SIM, magnitude não -- fix é
+  `motionVectorScale = (-1.0, -1.0)`, não `(-sceneWidth, -sceneHeight)`.
+  Comentário extenso adicionado no código citando as 3 fontes exatas.
+
+**Achado 2 (real, confirmado, CORRIGIDO)**: `g_reset = false` rodava ANTES de
+checar `ffxFsr2ContextDispatch`'s retorno -- se o dispatch falhasse, o reset
+real do próximo frame real seria perdido (flag já zerada), deixando o SDK
+tentar blend contra um estado interno que pode não ter avançado direito.
+Corrigido: `g_reset = false` só depois de confirmar `FFX_OK`.
+
+Build limpo confirmado do zero (exit 0, sem warning novo), hash
+`b14a56438f893f968de6657a98cb8eba5f653fc3f8a41a2793cf3fe866705251`.
+
+**Nota de processo**: delegar ao Codex funcionou bem pra achar um bug real de
+convenção (sinal do motion vector) que eu não tinha verificado contra a fonte
+antes -- mas o número exato que ele sugeriu (`-sceneWidth`) estava errado,
+só o diagnóstico de "sinal invertido" estava certo. Toda alegação de IA
+(minha ou do Codex) sobre convenção de SDK externa precisa ser verificada
+contra o código-fonte real antes de aplicar, não contra a intuição nem
+contra a primeira citação de doc que aparecer -- o README por si só teria
+levado a um fix errado aqui.
+
+Ainda nenhuma validação visual. Sessão total: 9 bugs corrigidos antes +
+2 agora = 11.
+
 ## Checkpoint 2026-10-01 (parte 11) — mesma classe de bug, terceiro arquivo: vk_dlss_outputImage
 
 Varredura final nos 3 arquivos do sistema de upscaling: `vk_dlss.c` tinha
