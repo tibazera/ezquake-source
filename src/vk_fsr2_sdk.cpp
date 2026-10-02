@@ -195,7 +195,19 @@ bool CreateContextLocked(VkExtent2D sceneSize, VkExtent2D displaySize, int rever
 	desc.displaySize.width = displaySize.width;
 	desc.displaySize.height = displaySize.height;
 	desc.device = ffxGetDeviceVK(g_device);
-	desc.flags = FFX_FSR2_ENABLE_AUTO_EXPOSURE;
+	// NOT FFX_FSR2_ENABLE_AUTO_EXPOSURE: this flag only selects WHICH
+	// exposure value is used (the SPD-computed one vs params->exposure/the
+	// internal default) -- ffx_fsr2.cpp's scheduleDispatch call for
+	// pipelineComputeLuminancePyramid is UNCONDITIONAL regardless of this
+	// flag (confirmed by reading the dispatch function directly), so this
+	// does NOT skip the SPD pass or its cost. Kept removed anyway because
+	// it's still the more correct setting for this project (v_gamma/
+	// v_contrast already handle exposure/tonemapping on the engine side,
+	// same reasoning vk_dlss.c already applies with a fixed preExposure),
+	// but this alone does not explain the ~3000->~1400 FPS drop Tiago
+	// reported with Vulkan+FSR2 vs Vulkan alone -- that cost is elsewhere,
+	// still being investigated.
+	desc.flags = 0;
 	if (reversedDepth) {
 		desc.flags |= FFX_FSR2_ENABLE_DEPTH_INVERTED;
 	}
