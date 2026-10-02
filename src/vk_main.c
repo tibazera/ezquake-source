@@ -75,6 +75,17 @@ extern cvar_t cl_multiview;
 extern cvar_t v_contrast;
 extern cvar_t vid_vulkan_upscaler;
 
+// external/fsr2/src/ffx-fsr2-api/ffx_fsr2.h's official jitter helpers,
+// declared directly rather than including that header here -- it pulls in
+// ffx_fsr2_interface.h's GLSL/HLSL-shared macro headers, unnecessary
+// complexity for 2 functions with plain int32_t/float signatures
+// (FfxErrorCode is typedef'd int32_t in ffx_error.h, confirmed). Used only
+// when vid_vulkan_upscaler==3 (official SDK path) -- the hand-port
+// (vid_vulkan_upscaler==1) keeps its own calibrated Halton-8 table
+// (vk_jitter_halton8 below), matched to its own shaders' exact convention.
+extern int32_t ffxFsr2GetJitterPhaseCount(int32_t renderWidth, int32_t displayWidth);
+extern int32_t ffxFsr2GetJitterOffset(float* outX, float* outY, int32_t index, int32_t phaseCount);
+
 
 void VK_DrawImage(float x, float y, float width, float height, float tex_s, float tex_t, float tex_width, float tex_height, byte* color, int flags);
 void VK_DrawRectangle(float x, float y, float width, float height, byte* color);
@@ -598,9 +609,32 @@ void VK_JitterPixelOffset(float* outX, float* outY)
 	*outY = -vk_jitter_halton8[vk_jitter_frameIndex % 8][1];
 }
 
+// Raw per-pixel jitter (engine's own Halton-8 table, or the official SDK's
+// own Halton(2,3) sequence when vid_vulkan_upscaler==3) BEFORE any
+// per-pixel-to-NDC scaling or sign flip -- the single source both
+// VK_JitteredProjectionMatrix (actual rendering) and the SDK dispatch's
+// jitterOffset field read from, so the two can never disagree about which
+// frame's jitter value is "this frame's", the bug class documented at
+// length elsewhere in this file for the other sign mismatch. Separate
+// sequence for upscaler==3: the official SDK's ffxFsr2GetJitterPhaseCount
+// depends on the render/display size ratio (not fixed at 8 regardless of
+// scale like this engine's own table), matching what UPSCALING_PLAN.md
+// Fase 2 asked for ("usar ffxFsr2GetJitterPhaseCount/GetJitterOffset").
+static void VK_RawJitterOffset(VkExtent2D sceneSize, VkExtent2D displaySize, float* outX, float* outY)
+{
+	if (vid_vulkan_upscaler.integer == 3) {
+		int32_t phaseCount = ffxFsr2GetJitterPhaseCount((int32_t)sceneSize.width, (int32_t)displaySize.width);
+		ffxFsr2GetJitterOffset(outX, outY, (int32_t)vk_jitter_frameIndex, phaseCount);
+		return;
+	}
+	*outX = vk_jitter_halton8[vk_jitter_frameIndex % 8][0];
+	*outY = vk_jitter_halton8[vk_jitter_frameIndex % 8][1];
+}
+
 void VK_JitteredProjectionMatrix(float* out)
 {
 	VkExtent2D sceneSize;
+	float rawJitterX, rawJitterY;
 	float jitterX, jitterY;
 
 	if (!VK_UpscaleActive()) {
@@ -609,8 +643,9 @@ void VK_JitteredProjectionMatrix(float* out)
 	}
 
 	sceneSize = VK_SceneRenderExtent();
-	jitterX = vk_jitter_halton8[vk_jitter_frameIndex % 8][0] * (2.0f / (float)max(1, (int)sceneSize.width));
-	jitterY = vk_jitter_halton8[vk_jitter_frameIndex % 8][1] * (2.0f / (float)max(1, (int)sceneSize.height));
+	VK_RawJitterOffset(sceneSize, vk_options.swapChain.imageSize, &rawJitterX, &rawJitterY);
+	jitterX = rawJitterX * (2.0f / (float)max(1, (int)sceneSize.width));
+	jitterY = rawJitterY * (2.0f / (float)max(1, (int)sceneSize.height));
 
 	memcpy(out, R_ProjectionMatrix(), 16 * sizeof(float));
 	// Standard projection-matrix jitter injection: bias the same terms
@@ -1064,22 +1099,21 @@ void VK_EndWorldPassAndComposite(void)
 			if (!fsr2HandledThisFrame && vk_force_clear_frames_remaining == 0 && !skipTemporalUpdate && VK_UpscaleActive() &&
 				vid_vulkan_upscaler.integer == 3 && VK_MotionVectorsComposite(commandBuffer, vk_options.frame.imageIndex)) {
 				float sdkJitterX, sdkJitterY;
-				// NOT VK_JitterPixelOffset -- that function's Y negation is
-				// calibrated for vk_fsr2.c's OWN hand-written shaders, which
-				// consume the jitter in final Vulkan clip-space convention
-				// (post vk_flipRemapMatrix flip). The official SDK's
-				// jitterOffset field wants the RAW Halton value instead (see
-				// ffx_fsr2.h's own documented pseudo-code: jitterX_matrix =
-				// 2*jitterX_raw/width, jitterY_matrix = -2*jitterY_raw/height
-				// -- the SDK applies its own Y negation internally when
-				// building its matrix-space jitter, so passing an
-				// already-negated Y here double-flips it). Use the same raw
-				// table VK_JitteredProjectionMatrix reads from directly,
-				// matching what this project's OWN projection matrix actually
-				// applies before vk_flipRemapMatrix's flip. Both statics
-				// already declared above in this same translation unit.
-				sdkJitterX = vk_jitter_halton8[vk_jitter_frameIndex % 8][0];
-				sdkJitterY = vk_jitter_halton8[vk_jitter_frameIndex % 8][1];
+				// VK_RawJitterOffset, not VK_JitterPixelOffset -- the latter's
+				// Y negation is calibrated for vk_fsr2.c's OWN hand-written
+				// shaders (final Vulkan clip-space convention, post
+				// vk_flipRemapMatrix flip). The official SDK's jitterOffset
+				// field wants the RAW value instead (ffx_fsr2.h's documented
+				// pseudo-code negates Y only when building the matrix-space
+				// jitter, internally, from the raw value) -- VK_RawJitterOffset
+				// is the SAME function VK_JitteredProjectionMatrix calls, so
+				// this is guaranteed to be exactly what was used to render
+				// this frame's geometry, not a second independent
+				// computation that could silently drift out of sync. Also
+				// switches to the official ffxFsr2GetJitterPhaseCount/
+				// GetJitterOffset sequence instead of the engine's fixed
+				// Halton-8 table when upscaler==3 (UPSCALING_PLAN.md Fase 2).
+				VK_RawJitterOffset(VK_SceneRenderExtent(), vk_options.swapChain.imageSize, &sdkJitterX, &sdkJitterY);
 				fsr2HandledThisFrame = VK_Fsr2SdkCompositeWrapper(commandBuffer,
 					vk_options.swapChain.postProcessColorImages[vk_options.frame.imageIndex],
 					vk_options.swapChain.postProcessColorImageViews[vk_options.frame.imageIndex],

@@ -1,5 +1,45 @@
 # Onde paramos — Vulkan renderer / SDL3 port
 
+## Checkpoint 2026-10-02 (parte 20) — vazamento confirmado de vez (27min estável) + jitter oficial da SDK implementado
+
+**Confirmação adicional do fix de memória**: processo de teste (deployado na
+parte 19) checado de novo depois de 27 minutos de CPU time real -- memória
+**idêntica** à checagem anterior (1.275.100K, bit a bit igual). Não é mais
+"parece estável", é confirmação robusta com tempo de execução bem maior que
+qualquer teste anterior desta sessão.
+
+**Implementado**: jitter oficial da SDK (`ffxFsr2GetJitterPhaseCount`/
+`ffxFsr2GetJitterOffset`) pro modo `vid_vulkan_upscaler==3`, substituindo a
+tabela Halton-8 fixa do motor -- pendência documentada desde a Fase 2 do
+plano ("Usar ffxFsr2GetJitterPhaseCount/GetJitterOffset; remover tabela
+fixa de 8 fases"), nunca implementada até agora. A API da SDK é C puro
+(`int32_t`/`float*`), declarada via `extern` direto em `vk_main.c` em vez de
+incluir `ffx_fsr2.h` completo (que arrastaria macros de shader GLSL/HLSL
+desnecessárias pra esse arquivo).
+
+**Decisão de design importante**: criada `VK_RawJitterOffset()`, função
+única que tanto `VK_JitteredProjectionMatrix` (que RENDERIZA a cena de
+verdade) quanto o call site do dispatch da SDK oficial agora chamam -- antes
+eram 2 leituras independentes da mesma tabela que PODERIAM divergir goal
+(mesma classe de bug risco que o comentário antigo já alertava sobre sinal).
+Agora é garantido que o jitter usado pra desenhar e o jitter informado à SDK
+são EXATAMENTE o mesmo valor, não só "deveriam ser". Hand-port
+(`vid_vulkan_upscaler==1`) mantém sua própria tabela calibrada, intocado.
+
+`ffxFsr2GetJitterPhaseCount` depende da razão `renderWidth/displayWidth` --
+diferente da tabela fixa de 8 fases do motor (sempre 8 independente do fator
+de upscale), a fórmula oficial ajusta o número de fases conforme o scale
+real (0.66 neste teste), potencialmente melhorando a qualidade/reduzindo
+tremor residual em comparação com uma sequência de 8 fases genérica.
+
+Build limpo confirmado do zero (exit 0, sem warning novo, link com os
+símbolos da SDK resolveu sem problema), hash
+`6d6f4deac022b8712333d05cb4c25822fa324e6b13a16647121b11a4f3885496`.
+
+**Ainda não testado ao vivo** -- precisa deploy + teste visual do Tiago pra
+confirmar se isso reduz o tremor residual junto com o fix de
+`motionVectorScale` já aplicado.
+
 ## Checkpoint 2026-10-02 (parte 19) — VAZAMENTO DE MEMÓRIA CONFIRMADO RESOLVIDO com dados reais
 
 Autorização explícita do Tiago ("mas sim meu deus pq se te dei autorização
