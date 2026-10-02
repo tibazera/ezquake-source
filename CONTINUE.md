@@ -1,5 +1,45 @@
 # Onde paramos — Vulkan renderer / SDL3 port
 
+## Checkpoint 2026-10-02 (parte 17) — Codex bloqueado pelo ambiente, varredura adicional feita sozinho, sem mais achados
+
+Segunda tentativa de delegar ao Codex (`task-muqerlop-8x2wfm`) falhou
+diferente da primeira: "Blocked by the environment before any repository
+access" -- `CreateProcessAsUserW: Access denied` (erro 5 do Windows) no
+shell dele, e `E:\tmp\eqvk-upscaling` fora da raiz gravável configurada pra
+ele. Diferente do job anterior (que conseguiu LER via `cmd`, só não
+conseguiu escrever), esse nem leu nada -- "I did not read, modify, build,
+or commit anything". Não adianta insistir no mesmo padrão de delegação pra
+esse worktree; sigo a varredura sozinho.
+
+**Varredura adicional feita sozinho** (os mesmos pontos que pedi ao Codex
+investigar, já que ele não conseguiu): `frameTimeDelta` -- confirmado em
+milissegundos nos dois lados (`FSR2Sample.cpp:490` divide por 1000 pra virar
+segundos, nosso `cls.frametime * 1000.0f` já entrega em ms, bate).
+`sharpness` -- sample usa slider `[0,1]` direto sem remapeamento do app
+(`UI.cpp:248`), SDK remapeia internamente (`ffx_fsr2.cpp:1004`); nosso
+`bound(0.0f, vid_vulkan_sharpness.value, 1.0f)` idêntico. `reactive`/
+`transparencyAndComposition`/`exposure`/`enableAutoReactive` não setados --
+confirmado que isso é EQUIVALENTE ao padrão do sample: `dispatch` zerado via
+`memset` deixa `FfxResource.resource == NULL`, que é exatamente o que
+`ffxFsr2ResourceIsNull()` (`ffx_fsr2.cpp:1216`) checa -- não precisa
+registrar explicitamente como "vazio" via `ffxGetTextureResourceVK(nullptr,...)`
+feito pelo sample, memset já cobre. Formato de depth (`VK_FORMAT_D32_SFLOAT`)
+confirmado idêntico ao sample (`Renderer.cpp:72`).
+
+**Nenhuma discrepância nova encontrada nesta passada.** Com motion vector
+scale e jitter já corrigidos e confirmados contra o sample real, e todo
+resto do dispatch verificado campo a campo sem achar mais nada, a hipótese
+de "convenção errada em algum campo do dispatch" está ficando esgotada --
+se o tremor/performance persistir no próximo teste, a causa provável muda
+de categoria: ou é algo na integração C/C++ em si (barreiras, layout,
+timing de submissão) já parcialmente coberto pelas correções de race
+anteriores, ou precisa mesmo de profiler/captura real (RenderDoc) em vez de
+mais leitura de código.
+
+**Build ainda não deployado** -- arquivo de teste seguiu bloqueado durante
+toda esta janela de trabalho autônomo. Hash pronto pra deploy:
+`29ed7ad1119c7ce45f11cc5a982237e89ce9e0b1d26179e3a7e89e33b7d58ac9`.
+
 ## Checkpoint 2026-10-02 (parte 16) — CORREÇÃO da correção: motionVectorScale da parte 13 estava errado, achado comparando contra o sample oficial real
 
 Enquanto aguardava reteste, fui direto comparar contra o sample Vulkan
