@@ -37,6 +37,22 @@ tentativas minhas de reproduzir sozinho que bateram no mutex dele.
 novo -- hipótese forte, mas ainda não confirmada, de que o vazamento
 desaparece com o fix do `g_outputImage` aplicado.
 
+**Correção de interpretação após 100 min de observação**: memória PRIVADA
+ficou estável em 2529MB entre duas checagens (00:xx e ~100min depois),
+só o working set variou levemente (1118->1214MB, paginação normal do SO,
+não alocação nova). Isso muda a categoria do problema: NÃO parece ser
+vazamento crescente sem fim por frame -- parece ser uma alocação excessiva
+de UMA VEZ que estabiliza num platô alto (2.5GB), compatível com múltiplas
+recriações de contexto cada uma deixando resíduo até as recriações pararem,
+ou simplesmente a SDK real alocando mais que o esperado de uma vez (13
+níveis de mipmap de luminância + histórico + lock status + múltiplos
+buffers internos, confirmado em `ffx_fsr2.cpp` -- razoável que some bastante,
+ainda que 2.5GB pareça alto demais pra essa resolução). De qualquer forma,
+2.5GB é patologicamente alto pra esse motor independente de ser platô ou
+vazamento -- a correção do `g_outputImage` continua sendo o candidato mais
+forte, só que agora por "evitar recriações repetidas residuais" em vez de
+"vazamento por frame".
+
 ## Checkpoint 2026-10-02 (parte 17) — Codex bloqueado pelo ambiente, varredura adicional feita sozinho, sem mais achados
 
 Segunda tentativa de delegar ao Codex (`task-muqerlop-8x2wfm`) falhou
