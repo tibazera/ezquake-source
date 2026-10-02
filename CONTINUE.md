@@ -1,5 +1,55 @@
 # Onde paramos — Vulkan renderer / SDL3 port
 
+## Checkpoint 2026-10-02 (parte 16) — CORREÇÃO da correção: motionVectorScale da parte 13 estava errado, achado comparando contra o sample oficial real
+
+Enquanto aguardava reteste, fui direto comparar contra o sample Vulkan
+REAL da AMD (`external/fsr2/src/VK/UpscaleContext_FSR2_API.cpp`,
+vendorizado junto com a API, framework Cauldron completa) em vez de só
+ler os headers internos do SDK isoladamente -- e achei que a correção da
+parte 13 (`motionVectorScale = (-1,-1)`) estava ERRADA.
+
+**O que o sample oficial realmente faz** (não hipótese, lido direto):
+- `libs/cauldron/src/VK/shaders/GLTFMotionVectorsPass-frag.glsl:58-59`:
+  `motionVect = CurrPosition.xy/w - PrevPosition.xy/w` -- espaço NDC
+  [-1,1], sinal `current - previous`. `CurrPosition = gl_Position`
+  (clip space Vulkan nativo, mesma convenção que nosso `vk_motion_vectors.frag`
+  já usa via `invViewProj`/`prevViewProj`).
+- `src/VK/UpscaleContext_FSR2_API.cpp:231-232`:
+  `motionVectorScale = (renderWidth, renderHeight)`, POSITIVO, não negado.
+- `ffx_fsr2.cpp:902-903`: o SDK divide esse valor pelo tamanho do alvo de
+  motion vectors (`renderWidth`/`Height` aqui) ANTES de guardar como
+  `cbFSR2.fMotionVectorScale` -- ou seja a escala EFETIVA interna do sample
+  é exatamente `1.0` (sem conversão adicional nenhuma no shader, apesar do
+  nome `fUvMotionVector` sugerir uma conversão pra UV que na prática não
+  acontece pro sample).
+
+**Conclusão corrigida**: nosso buffer (`vk_motion_vectors.frag`) já usa o
+MESMO sinal que o sample (`current - previous`) -- a correção de sinal da
+parte 13 estava invertendo algo que já estava certo. A diferença real é só
+de MAGNITUDE: nosso buffer está em UV [0,1] (metade da amplitude do NDC
+[-1,1] do sample pra o mesmo movimento físico, já que NDC = 2*UV-1). Pra
+reproduzir a escala efetiva comprovada do sample (1.0) usando um buffer UV
+em vez de NDC, o parâmetro pré-divisão precisa ser o DOBRO:
+`motionVectorScale = (2*sceneWidth, 2*sceneHeight)`, sinal inalterado
+(positivo, sem negar).
+
+Comentário antigo substituído por um novo citando as 3 fontes exatas
+(shader do sample, call site do dispatch, divisão interna do SDK) em vez de
+só os headers internos isolados. Build limpo confirmado, hash
+`29ed7ad1119c7ce45f11cc5a982237e89ce9e0b1d26179e3a7e89e33b7d58ac9`.
+
+**Nota de processo importante**: esta é a SEGUNDA tentativa de acertar essa
+mesma convenção na mesma sessão. A primeira vez (parte 13) citei os headers
+internos do SDK (`ffx_fsr2_callbacks_glsl.h`, `ffx_fsr2_reconstruct_...h`)
+e errei porque não tinha visto AINDA o sample de referência completo nem a
+divisão em `ffx_fsr2.cpp:902-903` que muda tudo. Lição: pra convenção de
+unidade/sinal de uma SDK externa, o código de REFERÊNCIA FUNCIONANDO
+(sample oficial) é evidência mais forte que ler fragmentos de header
+isolados e inferir -- deveria ter procurado o sample primeiro, não depois.
+**Ainda não testado ao vivo** -- é a 3ª hipótese de motion vector desta
+sessão (sinal normal -> sinal invertido -> sinal normal+escala dobrada),
+precisa de confirmação real do Tiago antes de considerar resolvido.
+
 ## Checkpoint 2026-10-02 (parte 15) — Codex achou o `g_outputImage` sem slot no shim da SDK (mesmo bug, arquivo esquecido)
 
 Resultado do job `task-muqe8fgj-851hug` (investigação de performance):

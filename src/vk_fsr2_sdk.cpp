@@ -304,23 +304,33 @@ vk_fsr2_sdk_bool VK_Fsr2SdkComposite(
 		outputFormat, nullptr, FFX_RESOURCE_STATE_UNORDERED_ACCESS);
 	dispatch.jitterOffset.x = jitterX;
 	dispatch.jitterOffset.y = jitterY;
-	// Sign, NOT magnitude: this project's motion-vector buffer (vk_motion_vectors.frag)
-	// stores currentUV - previousUV, already in UV space [0,1] (confirmed by
-	// reading the shader). The SDK's own LoadInputMotionVector
-	// (ffx_fsr2_callbacks_glsl.h) computes fUvMotionVector = fSrcMotionVector *
-	// MotionVectorScale() and then uses it as fReprojectedUv = fUv +
-	// fMotionVector (ffx_fsr2_reconstruct_dilated_velocity_and_previous_depth.h)
-	// -- i.e. the SDK expects previousUV - currentUV (added to current UV to
-	// reach the previous frame's UV), the OPPOSITE sign from what this
-	// buffer stores. Scale stays 1:1 in magnitude (buffer is already UV, not
-	// pixels -- the official sample's own motionVectorScale=(renderWidth,
-	// renderHeight) only applies to a buffer stored in NDC [-1,1], which this
-	// one is not), just negated. Confirmed against the vendored v2.2.1
-	// source, not the README's generic pixel-space description, which
-	// applies to the pre-scale raw buffer, not the post-scale fUvMotionVector
-	// this file produces.
-	dispatch.motionVectorScale.x = -1.0f;
-	dispatch.motionVectorScale.y = -1.0f;
+	// CORRECTED (2026-10-02, second pass): previous comment's sign-only fix
+	// was wrong. Verified against the actual official Vulkan sample
+	// (external/fsr2/src/VK/UpscaleContext_FSR2_API.cpp:231-232 and
+	// libs/cauldron/src/VK/shaders/GLTFMotionVectorsPass-frag.glsl:58-59),
+	// not just the SDK's internal shader headers in isolation:
+	// - The official sample's own motion-vector shader computes
+	//   `motionVect = CurrPosition.xy/w - PrevPosition.xy/w` -- NDC space
+	//   [-1,1], SAME sign convention (current - previous) this project's
+	//   vk_motion_vectors.frag already uses, just in UV [0,1] instead of NDC.
+	// - The sample passes motionVectorScale = (renderWidth, renderHeight),
+	//   POSITIVE, not negated.
+	// - ffx_fsr2.cpp:902-903 divides that scale by the motion-vector target
+	//   size (renderWidth/Height here, since FFX_FSR2_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS
+	//   is not set) before storing it as cbFSR2.fMotionVectorScale -- so the
+	//   sample's effective internal scale is exactly 1.0, meaning its NDC
+	//   buffer is consumed as-is with no further unit conversion inside the
+	//   shaders despite LoadInputMotionVector's result being named
+	//   fUvMotionVector.
+	// This project's buffer is UV [0,1], which is exactly half the magnitude
+	// of the sample's NDC [-1,1] delta for the same underlying motion
+	// (NDC = 2*UV - 1). To reproduce the sample's proven-correct effective
+	// scale of 1.0 on an NDC-space buffer using a UV-space buffer of half
+	// the magnitude, the pre-division scale parameter must be doubled:
+	// 2*renderWidth instead of renderWidth. Sign stays unchanged (current -
+	// previous matches the sample already).
+	dispatch.motionVectorScale.x = 2.0f * (float)sceneWidth;
+	dispatch.motionVectorScale.y = 2.0f * (float)sceneHeight;
 	dispatch.renderSize.width = sceneWidth;
 	dispatch.renderSize.height = sceneHeight;
 	dispatch.enableSharpening = enableSharpening != 0;
