@@ -1,5 +1,42 @@
 # Onde paramos — Vulkan renderer / SDL3 port
 
+## Checkpoint 2026-10-02 (parte 18) — achado real: vazamento de memória de 2.5GB no processo do Tiago, build sem os 2 últimos fixes
+
+Enquanto tentava reproduzir o bug sozinho (testes isolados deram falso
+alarme de "Error" -- era só o mutex de instância única do motor, "QWCL is
+already running on this system", detectando o processo do Tiago ainda vivo,
+confirmado via UI Automation lendo o texto real do diálogo), descobri o
+processo dele (`ezquake-fsr2test.exe`, PID 40304, rodando desde 00:16:18)
+com **2.5 GB de memória privada** (`PrivateMemorySize64`), ~1.1GB de working
+set, depois de ~40 minutos de execução. Isso é MUITO acima do normal pra
+ezQuake (tipicamente dezenas-centenas de MB) -- confirma vazamento de
+memória real, consistente com "FPS caindo, travando" ao longo do tempo que
+o Tiago relatou (sistema ficando sem memória / pressão de swap).
+
+**Achado crítico sobre esse dado**: o hash do exe dele (`af755a61676761eb...`)
+é da **parte 13** (fix de jitter), rodando SEM os 2 fixes mais importantes
+feitos depois: o `g_outputImage` cross-command-buffer race (parte 15) e a
+correção de `motionVectorScale` (parte 16). O vazamento observado é
+plausivelmente CAUSADO pelo race do `g_outputImage` -- uma imagem Vulkan
+única sendo escrita por até 3 command buffers potencialmente concorrentes
+sem sincronização correta pode levar a reação em cascata de recursos
+(descriptor sets, memória de staging, ou pior: o driver/camada de validação
+tentando se recuperar de hazard, acumulando estado a cada frame problemático).
+
+**Não tentei nem vou tentar matar ou mexer no processo do Tiago** -- é o
+dele, rodando com os cvars de teste ativos. Só constatei o estado via
+`Get-Process` sem interferir. Limpeza feita: removidos os 3 diretórios/exes
+de teste isolado que criei durante a investigação (`/c/ezquake_diag2`,
+`ezquake-diag.exe`, `ezquake-diag3.exe`) -- não eram o processo dele, eram
+tentativas minhas de reproduzir sozinho que bateram no mutex dele.
+
+**Próxima ação real**: quando o Tiago puder fechar o processo antigo
+(`ezquake-fsr2test.exe`, build da parte 13) e testar o build mais recente
+(`29ed7ad1119c7ce45f11cc5a982237e89ce9e0b1d26179e3a7e89e33b7d58ac9`, parte
+16, com os 2 fixes de race+motion vector), isso deve ser verificado de
+novo -- hipótese forte, mas ainda não confirmada, de que o vazamento
+desaparece com o fix do `g_outputImage` aplicado.
+
 ## Checkpoint 2026-10-02 (parte 17) — Codex bloqueado pelo ambiente, varredura adicional feita sozinho, sem mais achados
 
 Segunda tentativa de delegar ao Codex (`task-muqerlop-8x2wfm`) falhou
