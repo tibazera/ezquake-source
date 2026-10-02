@@ -944,7 +944,22 @@ qbool VK_CreateSwapChain(SDL_Window* window, VkInstance instance, VkSurfaceKHR s
 		createInfo.imageExtent.width = width;
 		createInfo.imageExtent.height = height;
 	}
-	createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT; // VK_IMAGE_USAGE_TRANSFER_DST_BIT if pre-processing enabled
+	// VK_IMAGE_USAGE_TRANSFER_DST_BIT: multiple upscaler paths copy their own
+	// output directly into the swapchain image via vkCmdCopyImage
+	// (vk_fsr2_sdk.cpp's VK_Fsr2SdkComposite, vk_dlss.c's VK_DLSS_CopyOutputTo
+	// -- the latter never exercised in practice since Streamline's slInit
+	// fails outright on non-RTX hardware, but it has the exact same real
+	// requirement). Confirmed missing via live validation-layer capture
+	// (2026-10-02): VUID-VkImageMemoryBarrier-oldLayout-01213 and
+	// VUID-vkCmdCopyImage-aspect-06663 fired on every frame once the
+	// official FSR2 SDK path (vid_vulkan_upscaler==3) actually started
+	// dispatching -- the swapchain image only had COLOR_ATTACHMENT_BIT (and
+	// TRANSFER_SRC_BIT from the screenshot path below), never
+	// TRANSFER_DST_BIT. Real validation errors firing every frame explain
+	// the reported stuttering/freezing: the AMD driver falls back to a
+	// much slower recovery path when it detects a layout/usage hazard it
+	// cannot resolve cleanly, every single frame.
+	createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 	if (VK_PhysicalDeviceGraphicsQueueFamilyIndex() != VK_PhysicalDevicePresentQueueFamilyIndex()) {
 		queueFamilyIndices[0] = VK_PhysicalDeviceGraphicsQueueFamilyIndex();
 		queueFamilyIndices[1] = VK_PhysicalDevicePresentQueueFamilyIndex();

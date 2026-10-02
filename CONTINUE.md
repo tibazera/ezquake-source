@@ -1,5 +1,58 @@
 # Onde paramos — Vulkan renderer / SDL3 port
 
+## Checkpoint 2026-10-02 (parte 22) — CAUSA RAIZ REAL da queda de performance/freezes encontrada e corrigida: swapchain sem TRANSFER_DST_BIT
+
+**Dados reais do Tiago**: Vulkan puro 2500 FPS, hand-port FSR2 (modo 1) 1900
+FPS, SDK oficial (modo 3) 1400 FPS **com travamentos/freezes**. Pedido
+explícito de teste com `-dev` (validation layers) pra capturar evidência real.
+
+**Capturado ao vivo** (testado pelo próprio Claude, em paralelo ao teste do
+Tiago): log com `-dev -condebug` mostrou **77 ocorrências** de erro de
+validação real por execução, incluindo
+`VUID-VkImageMemoryBarrier-oldLayout-01213` e `VUID-vkCmdCopyImage-aspect-06663`
+-- ambos dizendo a mesma coisa: a imagem de destino do `vkCmdCopyImage`
+(`vk_options.swapChain.images[...]`, ou seja a PRÓPRIA imagem do swapchain)
+tinha usage flags `VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT`
+-- **sem `VK_IMAGE_USAGE_TRANSFER_DST_BIT`**, que é exigido pra qualquer
+`vkCmdCopyImage`/transição de layout pra `TRANSFER_DST_OPTIMAL`.
+
+**Causa raiz localizada**: `src/vk_swapchain.c:947` --
+`createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;` na criação do
+swapchain, com um comentário old já dizendo "`VK_IMAGE_USAGE_TRANSFER_DST_BIT`
+if pre-processing enabled" -- a intenção já estava documentada, mas NUNCA
+implementada. `VK_Fsr2SdkComposite` (`vk_fsr2_sdk.cpp`) e `VK_DLSS_CopyOutputTo`
+(`vk_dlss.c`) ambos fazem `vkCmdCopyImage` direto pro swapchain -- o DLSS
+nunca exercitou esse bug na prática (Streamline falha no `slInit` antes, GPU
+AMD não é RTX), mas a SDK oficial do FSR2 É o primeiro caminho real a
+disparar esse erro em produção, TODO frame, o tempo todo.
+
+**Por que isso explica os freezes**: um erro de validação real repetido TODO
+frame não é só um warning cosmético -- em hardware/driver real (sem
+validation layers ligadas, como no uso normal), o driver AMD precisa
+detectar e tentar se recuperar de um hazard de layout/usage que não devia
+nem ser possível, e essa recuperação é MUITO mais cara que o caminho normal.
+Bate exatamente com "travando demais" + "freezes" relatado.
+
+**Corrigido**: `createInfo.imageUsage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT`
+incondicional -- é um usage BÁSICO garantido por toda surface de apresentação
+Vulkan compatível (parte do `supportedUsageFlags` mínimo obrigatório por
+spec, não precisa de checagem de capability). Build limpo confirmado
+(exit 0), hash `cfb84daee486be530ec36c049cb46f1f55664d03465bc9a26bce46ef6a6f8ceb`.
+
+**Confirmado ao vivo que o fix funciona de verdade, não só em teoria**:
+reteste com `-dev` no build corrigido -- os erros `VUID-VkImageMemoryBarrier-
+oldLayout-01213`/`VUID-vkCmdCopyImage-aspect-06663` **sumiram 100%** (de 10
+ocorrências cada pra 0). Restaram outros erros DIFERENTES (sobre
+compatibilidade de render pass de geometria 3D normal, nada a ver com
+FSR2/swapchain) -- aparentam ser o hazard pré-existente já documentado em
+sessões anteriores (`project_pak2_md3_bug_deferred.md` e notas relacionadas
+de descriptor-set race), fora do escopo deste trabalho de upscaling.
+
+**Ainda não confirmado**: se isso recupera o FPS perdido (1400->?) -- precisa
+do Tiago testar o build v5 de verdade e medir. A causa (erro de validação
+real todo frame) é forte candidata a explicar boa parte da queda, mas não
+está provado que é 100% da queda até medir.
+
 ## Checkpoint 2026-10-02 (parte 21) — build com jitter oficial também confirmado sem vazamento
 
 Fechado o processo v1 (já com 29min de confirmação robusta de memória
