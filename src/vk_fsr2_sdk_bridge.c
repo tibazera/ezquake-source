@@ -63,6 +63,16 @@ void VK_Fsr2SdkInvalidateHistoryWrapper(void)
 	VK_Fsr2SdkInvalidateHistory();
 }
 
+// Logged once per transition (not per frame -- a failing dispatch would
+// otherwise spam the console every frame it falls back), tracking only
+// whether the LAST call succeeded so a flip in either direction gets one
+// line. Per AGENTS.md: "falha não pode se tornar substituição silenciosa" --
+// this path previously had zero diagnostic output at all (unlike the
+// hand-port's VK_Fsr2Composite, which already prints on every failure
+// branch), so a silent fallback to the old render-pass path was
+// indistinguishable from the SDK path legitimately being off.
+static qbool fsr2SdkLastCallSucceeded = true; // starts true so the FIRST real failure always logs
+
 qbool VK_Fsr2SdkCompositeWrapper(VkCommandBuffer commandBuffer, VkImage sceneColorImage, VkImageView sceneColorView,
 	VkImage sceneDepthImage, VkImageView sceneDepthView, VkImage motionVectorsImage, VkImageView motionVectorsView,
 	VkExtent2D sceneSize, VkExtent2D displaySize, float jitterX, float jitterY,
@@ -72,14 +82,19 @@ qbool VK_Fsr2SdkCompositeWrapper(VkCommandBuffer commandBuffer, VkImage sceneCol
 	extern float R_FarPlaneZ(void);
 	extern refdef_t r_refdef;
 	qbool sharpenEnabled;
+	qbool result;
 
 	if (!VK_Fsr2SdkCreateResources()) {
+		if (fsr2SdkLastCallSucceeded) {
+			Con_Printf("vulkan: FSR2 SDK diagnostic -- VK_Fsr2SdkCreateResources failed, falling back\n");
+			fsr2SdkLastCallSucceeded = false;
+		}
 		return false;
 	}
 
 	sharpenEnabled = vid_vulkan_sharpness.value > 0.0f;
 
-	return VK_Fsr2SdkComposite(commandBuffer, vk_options.frame.currentFrame,
+	result = VK_Fsr2SdkComposite(commandBuffer, vk_options.frame.currentFrame,
 		sceneColorImage, sceneColorView, vk_options.physicalDeviceSurfaceFormat.format,
 		sceneDepthImage, sceneDepthView,
 		motionVectorsImage, motionVectorsView,
@@ -93,4 +108,15 @@ qbool VK_Fsr2SdkCompositeWrapper(VkCommandBuffer commandBuffer, VkImage sceneCol
 		R_NearPlaneZ(), R_FarPlaneZ(), (float)(r_refdef.fov_y * M_PI / 180.0),
 		VK_FSR2_SDK_QUAKE_UNITS_TO_METERS,
 		dstImage, dstImageLayoutBeforeCopy, dstImageLayoutAfterCopy) != 0;
+
+	if (!result && fsr2SdkLastCallSucceeded) {
+		Con_Printf("vulkan: FSR2 SDK diagnostic -- VK_Fsr2SdkComposite failed (scene %ux%u display %ux%u), falling back\n",
+			sceneSize.width, sceneSize.height, displaySize.width, displaySize.height);
+	}
+	else if (result && !fsr2SdkLastCallSucceeded) {
+		Con_Printf("vulkan: FSR2 SDK diagnostic -- recovered, dispatch succeeding again\n");
+	}
+	fsr2SdkLastCallSucceeded = result;
+
+	return result;
 }

@@ -222,10 +222,15 @@ dos shaders próprios podem ser eliminados pela substituição oficial, sem retr
   lendo `ffx_fsr2_reconstruct_dilated_velocity_and_previous_depth.h`).
   Magnitude já estava certa (buffer é UV, não pixels, apesar do README
   descrever pixels -- isso se aplica ao buffer pré-escala). Ver CONTINUE.md.
-- [ ] Usar ffxFsr2GetJitterPhaseCount/GetJitterOffset; remover tabela fixa de 8 fases
-  e garantir mesma amostra/signo no desenho e no dispatch. NÃO feito -- este
-  caminho ainda reusa `VK_JitterPixelOffset` (tabela Halton-8 fixa do motor,
-  mesma do hand-port), não a sequência própria do SDK oficial.
+- [x] Usar ffxFsr2GetJitterPhaseCount/GetJitterOffset; remover tabela fixa de 8 fases
+  e garantir mesma amostra/signo no desenho e no dispatch. FEITO (checkpoint
+  2026-10-02 parte 20): `VK_RawJitterOffset()` nova função única que tanto
+  `VK_JitteredProjectionMatrix` (desenho real) quanto o dispatch da SDK
+  consultam -- quando `vid_vulkan_upscaler==3`, usa
+  `ffxFsr2GetJitterPhaseCount`/`GetJitterOffset` reais da SDK em vez da
+  tabela Halton-8 fixa do motor. Hand-port (`==1`) mantém a tabela própria
+  intocada. Build confirmado sem vazamento de memória rodando ~2.5min
+  (parte 21).
 - [ ] Usar luminance pyramid/locks/luma history do SDK, sem substituir por luma direta.
   Delegado inteiramente ao SDK (dispatch único, sem acesso a passes internos) --
   não há substituição por luma direta neste caminho, mas também não auditado.
@@ -259,7 +264,13 @@ dos shaders próprios podem ser eliminados pela substituição oficial, sem retr
   não executar segundo temporal após dispatch parcialmente gravado sem plano válido.
 - [ ] Output do backend -> composição nativa -> gamma/contrast/FXAA definidos -> HUD.
 - [ ] Garantir pós-processamento uma vez e UI/texto nativos, sem histórico temporal.
-- [ ] Log/diagnóstico: solicitado, ativo, tamanho render/output, reset e motivo de falha.
+- [x] Log/diagnóstico de falha: parcialmente feito. `VK_Fsr2SdkCompositeWrapper`
+  (`vk_fsr2_sdk_bridge.c`) agora loga via `Con_Printf` quando o dispatch da
+  SDK oficial falha e cai pro fallback (antes era 100% silencioso, diferente
+  do hand-port que já logava) -- throttle de 1 linha por transição de
+  estado, não spam por frame. Ainda falta: log explícito de "solicitado vs
+  ativo" (qual upscaler o usuário pediu vs qual realmente rodou este frame)
+  e motivo específico de falha (código de erro FFX, não só "falhou").
 
 ## Fase 5 — NVIDIA
 
