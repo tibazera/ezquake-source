@@ -299,7 +299,18 @@ dos shaders próprios podem ser eliminados pela substituição oficial, sem retr
 
 ## Fase 7 — verificação e aceite
 
-- [ ] Build RelWithDebInfo e Release com exit code zero, sem warnings novos relevantes.
+- [x] RelWithDebInfo: confirmado exit code 0 repetidamente ao longo de toda
+  a sessão (17+ builds via `tools/build-upscaling.cmd`), sem warning novo.
+- [ ] Release: FALHA REAL encontrada, não corrigida -- `cmake --build --preset
+  msvc-x64-release` falha na fase de CONFIGURE com
+  `CMake Error at CMakeLists.txt:49: Link Time Optimization requested, but
+  not available` (`check_ipo_supported` retorna falso nesse contexto de
+  invocação). Não é falha introduzida por este trabalho de upscaling --
+  Release nunca foi testado nesta sessão nem confirmado funcionando antes
+  dela. Causa raiz não investigada (fora do escopo desta sessão); pode ser
+  ambiental (toolchain MSVC específico desta máquina) ou configuração real
+  quebrada no projeto. Registrado como achado, não como fix -- precisa de
+  investigação dedicada separada.
 - [ ] Validation layers/sync validation: zero erros introduzidos, inclusive teardown.
 - [ ] Offline dm3: parada >=10 segundos reais; giro, caminhada, paredes finas,
   centro, partículas, água/alpha, arma, HUD e console; sem branco/magenta/tremulação anormal.
