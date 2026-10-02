@@ -40,6 +40,15 @@ mais leitura de código.
 toda esta janela de trabalho autônomo. Hash pronto pra deploy:
 `29ed7ad1119c7ce45f11cc5a982237e89ce9e0b1d26179e3a7e89e33b7d58ac9`.
 
+**Achado real sobre a falha de captura de log de sessões anteriores**: `-condebug`
+NÃO é uma flag booleana sozinha -- exige um argumento seguinte com o caminho
+do arquivo (`sys_win.c:1278-1284`, `s = COM_Argv(i + 1); qconsole_log = fopen(s, "a")`).
+Toda tentativa anterior desta sessão usou `-condebug` sem caminho, por isso
+nunca criou log algum nos smoke tests passados -- não é limitação do
+ambiente, é uso errado do parâmetro. Próximo teste usar
+`-condebug caminho\completo\log.txt` (caminho explícito, não relativo
+ambíguo) pra garantir captura real do console.
+
 ## Checkpoint 2026-10-02 (parte 16) — CORREÇÃO da correção: motionVectorScale da parte 13 estava errado, achado comparando contra o sample oficial real
 
 Enquanto aguardava reteste, fui direto comparar contra o sample Vulkan
