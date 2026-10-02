@@ -1,5 +1,26 @@
 # Onde paramos — Vulkan renderer / SDL3 port
 
+## Checkpoint 2026-10-02 (parte 21) — build com jitter oficial também confirmado sem vazamento
+
+Fechado o processo v1 (já com 29min de confirmação robusta de memória
+estável) pra poder testar o v2 (jitter oficial da SDK, parte 20) sozinho --
+os dois não rodam ao mesmo tempo (mutex de instância única do motor, "QWCL
+is already running on this system", mesmo diagnóstico da parte 18).
+
+**v2 testado**: `vid_vulkan_upscaler 3` + `renderscale 0.66`, dm3, 6
+checagens de memória ao longo de ~2.5 minutos de execução real --
+1.199-1.286 MB, estável (com leve queda no final, não crescimento). Log sem
+erros, sem VUID. **Confirma que o jitter oficial da SDK (parte 20) também
+não introduziu vazamento nem instabilidade.**
+
+Processo deixado RODANDO (`ezquake-fsr2test-v2.exe`) pro Tiago continuar
+observando/validando visualmente quando voltar -- esse é o build mais
+completo até agora: race do `g_outputImage` corrigido (parte 15),
+`motionVectorScale` corrigido contra o sample oficial (parte 16), jitter
+oficial da SDK implementado (parte 20). Falta só a confirmação visual humana
+de que o tremor residual melhorou/sumiu -- isso nenhum teste automatizado
+meu consegue avaliar.
+
 ## Checkpoint 2026-10-02 (parte 20) — vazamento confirmado de vez (27min estável) + jitter oficial da SDK implementado
 
 **Confirmação adicional do fix de memória**: processo de teste (deployado na
