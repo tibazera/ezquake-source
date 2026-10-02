@@ -1,5 +1,49 @@
 # Onde paramos — Vulkan renderer / SDL3 port
 
+## Checkpoint 2026-10-02 (parte 13) — PRIMEIRO TESTE VISUAL REAL: tremor/borrão no modo SDK oficial, causa provável corrigida
+
+**Tiago testou ao vivo**: `vid_vulkan_upscaler 3` + `vid_vulkan_renderscale 0.66`
+-- "a tela fica tremendo e meio borrada". Borrão é parcialmente esperado
+(upscaling espacial sempre borra algo), mas tremor (shimmering) não é normal --
+sintoma clássico de reprojeção temporal com convenção errada.
+
+**Causa provável encontrada e corrigida**: o jitter passado pro campo
+`jitterOffset` do dispatch oficial (`vk_main.c`, chamada a
+`VK_Fsr2SdkCompositeWrapper`) usava `VK_JitterPixelOffset()` -- a MESMA
+função usada pelo hand-port. Mas essa função nega o componente Y
+especificamente porque os shaders PRÓPRIOS do hand-port (`vk_fsr2_*.comp`)
+consomem o jitter já no espaço de clip Vulkan final (pós-flip de
+`vk_flipRemapMatrix`). A documentação oficial da AMD (`ffx_fsr2.h`, seção do
+`jitterOffset`) é explícita: o campo espera o valor CRU da sequência Halton,
+e a conversão pra espaço de matriz (`jitterY_matrix = -2*jitterY_raw/height`)
+é feita INTERNAMENTE pela SDK -- passar um Y já negado nosso causa dupla
+inversão.
+
+Confirmado matematicamente: `VK_JitteredProjectionMatrix` (que desenha a cena
+de verdade) usa o jitter Y CRU (sem negar) antes do flip de
+`vk_flipRemapMatrix`, resultando no mesmo efeito líquido que a fórmula oficial
+depois do flip -- ou seja, nossa matriz de projeção real já bate com a
+convenção da AMD. O bug era só no valor passado pro dispatch, que deveria
+usar o mesmo jitter CRU que a matriz de projeção usa, não o valor já ajustado
+de `VK_JitterPixelOffset`.
+
+**Corrigido** (`src/vk_main.c`): a chamada ao `VK_Fsr2SdkCompositeWrapper`
+agora lê `vk_jitter_halton8[vk_jitter_frameIndex % 8]` diretamente (mesmos
+statics que `VK_JitteredProjectionMatrix` já usa), sem a negação de Y que
+`VK_JitterPixelOffset` aplica. Comentário extenso citando a seção exata da
+doc oficial. Build limpo confirmado, hash
+`af755a61676761eb533eeddce233b726dd4d9c1268670a37325b0b458feeda9a`.
+
+**IMPORTANTE**: esta é uma hipótese bem fundamentada (matemática + doc oficial
+citada), não uma confirmação visual ainda -- precisa o Tiago testar de novo
+com esse build pra saber se o tremor sumiu ou diminuiu. Se persistir, outras
+suspeitas na fila (em ordem): `g_reset` nunca é setado verdadeiramente true
+de novo após o primeiro frame real de forma confiável (checar lógica de
+invalidate), ou falta mapear `ffxFsr2GetJitterPhaseCount` (ainda usa a tabela
+de 8 fases fixa do motor, não a fórmula oficial baseada em
+`displayWidth/renderWidth`, que pode mudar quantas fases de Halton são
+necessárias para esse fator de upscale específico de 0.66 = ~1.5x).
+
 ## Checkpoint 2026-10-01 (parte 12) — Codex achou 2 bugs reais no shim da SDK oficial, verificados e corrigidos
 
 Delegado ao Codex (`codex-companion task`) um segundo-pass de revisão independente

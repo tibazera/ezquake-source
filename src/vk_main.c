@@ -1064,7 +1064,22 @@ void VK_EndWorldPassAndComposite(void)
 			if (!fsr2HandledThisFrame && vk_force_clear_frames_remaining == 0 && !skipTemporalUpdate && VK_UpscaleActive() &&
 				vid_vulkan_upscaler.integer == 3 && VK_MotionVectorsComposite(commandBuffer, vk_options.frame.imageIndex)) {
 				float sdkJitterX, sdkJitterY;
-				VK_JitterPixelOffset(&sdkJitterX, &sdkJitterY);
+				// NOT VK_JitterPixelOffset -- that function's Y negation is
+				// calibrated for vk_fsr2.c's OWN hand-written shaders, which
+				// consume the jitter in final Vulkan clip-space convention
+				// (post vk_flipRemapMatrix flip). The official SDK's
+				// jitterOffset field wants the RAW Halton value instead (see
+				// ffx_fsr2.h's own documented pseudo-code: jitterX_matrix =
+				// 2*jitterX_raw/width, jitterY_matrix = -2*jitterY_raw/height
+				// -- the SDK applies its own Y negation internally when
+				// building its matrix-space jitter, so passing an
+				// already-negated Y here double-flips it). Use the same raw
+				// table VK_JitteredProjectionMatrix reads from directly,
+				// matching what this project's OWN projection matrix actually
+				// applies before vk_flipRemapMatrix's flip. Both statics
+				// already declared above in this same translation unit.
+				sdkJitterX = vk_jitter_halton8[vk_jitter_frameIndex % 8][0];
+				sdkJitterY = vk_jitter_halton8[vk_jitter_frameIndex % 8][1];
 				fsr2HandledThisFrame = VK_Fsr2SdkCompositeWrapper(commandBuffer,
 					vk_options.swapChain.postProcessColorImages[vk_options.frame.imageIndex],
 					vk_options.swapChain.postProcessColorImageViews[vk_options.frame.imageIndex],
