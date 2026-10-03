@@ -1,5 +1,155 @@
 # Onde paramos — Vulkan renderer / SDL3 port
 
+## Checkpoint 2026-10-02 (parte 24) — hipótese 1 da parte 23 CONFIRMADA ao vivo: `-dev` era 100% da "regressão" de 2500→600 FPS; baseline real sempre foi ~1400 FPS com stutter ao mover, sem mudança desta sessão
+
+**Teste controlado real, sem `-dev`, com `-condebug` pra log completo
+automático** (pedido do Tiago: "pq eu sempre tenho que digitar, nao eh mais
+facil vc pegar um log que pega tudo que tem no console" -- `-condebug` grava
+o console inteiro em arquivo, sem precisar copiar/colar manualmente).
+Sequência exata capturada em `C:\ezquake\latch_debug.log`: `map dm3`,
+`vid_vulkan_upscaler 3`, `vid_vulkan_renderscale 0.66`, `vid_restart`.
+
+**Resultado**: `vulkan: upscaler diagnostic -- native=1920x1080
+scene=1267x712 upscaleActive=1` (linha 217) -- o mecanismo de latch
+(`VID_RegisterLatchCvars`, já documentado/corrigido em sessão anterior)
+funcionou corretamente desta vez; `upscaleActive=0` relatado antes nesta
+mesma sessão foi erro de sequência de comandos do usuário, não bug de
+código. Em seguida `vulkan: upscaler temporal path ACTIVE (motion-vector
+reprojection) (historyValidFrameCount=2)` (linha 228) -- histórico válido e
+crescendo normalmente. **Nenhum VUID de render pass apareceu neste log**
+(sem `-dev`, validation layers desligadas) -- confirma que os VUIDs vistos
+nos testes anteriores desta sessão eram artefato exclusivo de rodar com
+`-dev`, não um problema latente sem ele.
+
+Tiago reportou o FPS real medido nesta condição (sem `-dev`, upscaler 3,
+renderscale 0.66, scene real ativa): **~1400 FPS parado, com stuttering e
+leve tremor ao mover a câmera** -- não 600. Confirma a Hipótese 1 da parte
+23 como correta: os "600 FPS" medidos antes eram inflados pelo overhead de
+`-dev`/validation layers (perda de ~4x é plausível e já documentada em
+sessão anterior, ver "Parte 6" citada abaixo), não uma regressão real.
+`b5067ab3` (TRANSFER_DST_BIT) nunca foi a causa de nada em modo 0 -- confirma
+Hipótese 2 como baixa, exatamente como o Codex avaliou.
+
+**O que isso NÃO resolve**: 1400 FPS parado com stutter/tremor ao mover é
+o MESMO sintoma original documentado desde o início desta sessão de
+upscaling (antes de qualquer fix de motionVectorScale, swapchain, etc.) --
+nenhuma mudança feita nesta sessão (incluindo o revert do motionVectorScale
+de volta a `2x renderSize` depois que `1x` mediu pior) alterou esse
+comportamento de base para melhor. A causa raiz do stutter dependente de
+movimento no caminho FSR2 SDK oficial continua sem solução. O motionVectorScale
+real correto ainda não está confirmado -- tanto `1x` quanto `2x` dão
+sintomas parecidos de stutter ao mover, o que é evidência de que essa
+variável provavelmente não é a causa raiz (já suspeitado na "parte
+quarta"/revert, agora reforçado).
+
+**Próximo passo real**: investigar causas fora do motionVectorScale para o
+custo específico de movimento -- descriptor set rebinding por frame no
+caminho FSR2 SDK (vk_fsr2_sdk_bridge.c/vk_fsr2_sdk.cpp), possível
+recriação/realocação de recursos a cada frame quando a câmera move, ou
+I/O síncrono (fence wait) específico do dispatch da SDK oficial que não
+existe no hand-port (modo 1, que não tem esse sintoma tão forte segundo
+dados anteriores: 1900 FPS sem menção de stutter).
+
+## Checkpoint 2026-10-02 (parte 23) — investigação estática da medição 2500→600 FPS: `-dev` é a hipótese dominante; nenhuma regressão comum por frame foi encontrada
+
+**Escopo e limitação desta passagem**: investigação exclusivamente estática,
+conforme pedido. Não houve build, execução do jogo, teste no hardware, deploy
+nem commit. O fato novo informado pelo Tiago é que o build atual mede cerca de
+600 FPS tanto com `vid_vulkan_upscaler 0` quanto com
+`vid_vulkan_upscaler 3`, enquanto a medição anterior de Vulkan puro era cerca
+de 2500 FPS. Como o modo 0 não executa os dispatches de FSR2/DLSS, uma causa
+específica do algoritmo FSR2 (incluindo `motionVectorScale`) não explica o
+sintoma comum aos dois modos.
+
+**Resultado da revisão do histórico e dos diffs desta sessão**: comparado o
+intervalo `89f8648b..b5067ab3` e revisados os commits das partes 1–22. As
+mudanças volumosas de imagens per-frame, history/scratch, output da SDK,
+motion vectors, jitter e dispatch ficam em `vk_fsr2.c`, `vk_fsr2_sdk.cpp`,
+`vk_dlss.c` e `vk_upscale.c`, ou atrás de `VK_UpscaleActive()` e da seleção
+explícita `vid_vulkan_upscaler == 1/2/3`. Em modo 0,
+`VK_ResolveSceneSize()` retorna o tamanho nativo, `VK_UpscaleActive()` é falso,
+`VK_JitteredProjectionMatrix()` usa a projeção sem jitter, e
+`VK_EndWorldPassAndComposite()` retorna antes do bloco de upscale quando
+`swapChain.upscaleActive` é falso. Portanto essas mudanças não fornecem um
+mecanismo capaz de reduzir também o modo 0 em 76%.
+
+O único diff de produto desta sessão encontrado no caminho de criação usado
+por **todos** os modos é `b5067ab3`, que acrescenta
+`VK_IMAGE_USAGE_TRANSFER_DST_BIT` ao `imageUsage` do swapchain. Não houve
+mudança desta sessão no acquire/submit/present, nos fences, nos semáforos, no
+avanço de `currentFrame`, no present mode ou no frame pacing. As chamadas
+novas de teardown (`VK_Fsr2DestroyResources` e
+`VK_Fsr2SdkDestroyResourcesWrapper`) rodam só na destruição/recriação do
+swapchain, não por frame. A árvore local não commitada modifica apenas
+`src/vk_fsr2_sdk.cpp` (comentário/valor de motion-vector scale) e o submodule;
+isso também não alcança o modo 0.
+
+### Hipóteses rankeadas
+
+1. **Muito alta — as medições não são equivalentes porque os ~600 FPS foram
+   obtidos com `-dev`, e os ~2500 FPS sem `-dev`.** Evidência direta no código:
+   `src/vk_instance.c:43` testa `COM_CheckParm(cmdline_param_developer_mode)`;
+   quando `-dev` está presente, `VK_AddValidationLayers()` habilita
+   `VK_LAYER_KHRONOS_validation` e instala o callback de debug. Logo `-dev`
+   muda o caminho Vulkan global, inclusive com `vid_vulkan_upscaler 0`; não é
+   apenas logging do FSR2. Uma queda 2500→600 FPS (4,17x mais tempo por frame,
+   de ~0,40 ms para ~1,67 ms) é plausível num workload extremamente curto e
+   CPU/driver-bound sob validação. Há ainda erros de validação remanescentes
+   no caminho comum de geometria (`VUID-vkCmdDraw-renderPass-02684`,
+   `VUID-vkCmdDrawIndexed-renderPass-02684`, `VUID-vkCmdDraw-None-09600` e
+   `VUID-vkCmdDraw-imageLayout-00344`, registrados em
+   `QUESTIONS_FOR_CODEX.md`); se emitidos repetidamente, o custo de validar e
+   reportar cada draw aumenta mais. Evidência histórica especialmente forte:
+   este mesmo `CONTINUE.md`, na seção antiga “Parte 6 — Teste ao vivo com
+   Tiago”, já registra um A/B confirmado no mesmo renderer: “FPS baixo” com
+   `-dev` e “FPS normal” sem `-dev`. **Ainda não é confirmação da medição
+   atual**, pois o comando exato usado para obter os 600 FPS não foi
+   registrado.
+
+2. **Baixa — `b5067ab3`/`VK_IMAGE_USAGE_TRANSFER_DST_BIT` muda a escolha
+   interna do WSI/driver para o swapchain.** É o único candidato novo comum ao
+   modo 0, portanto merece um A/B se a comparação sem `-dev` ainda reproduzir
+   a queda. Porém, em modo 0 não há `vkCmdCopyImage` para o swapchain e o flag
+   por si só não grava comandos, não adiciona barreiras, não espera fence e
+   não altera o present loop. Não há evidência estática de custo por frame,
+   muito menos de 4,17x; classificá-lo como causa agora seria especulação.
+   Também corrigir os VUIDs do modo 3 não prova que o flag era a causa dos
+   freezes/FPS: a validação prova a violação anterior e que ela sumiu, não o
+   custo do driver sem validation layers.
+
+3. **Baixa, mas precisa ser controlada — configuração/binário/cenário
+   diferentes.** O histórico mistura build `RelWithDebInfo`, build `Release`,
+   executáveis de teste diferentes e comandos com/sem `-dev`. Present mode,
+   resolução, `vid_vsync`, mapa, posição, janela/compositor, cvars de
+   pós-processo e processo/binário exato não foram anexados à nova medição de
+   600 FPS. Qualquer um deles invalida um A/B, embora nenhum diff novo desta
+   sessão aponte especificamente para eles. Essa hipótese é mais provável que
+   uma regressão escondida de FSR2 no modo 0, mas menos específica que `-dev`.
+
+4. **Muito baixa/descartada pelo fluxo — fixes de FSR2/DLSS, jitter,
+   `motionVectorScale`, slots per-frame e invalidação de history.** Todos
+   exigem upscaler ativo ou backend 1/2/3; não executam no Vulkan puro. Mesmo a
+   função nova `VK_Fsr2SdkInvalidateHistoryWrapper()` só aparece dentro do
+   bloco de composição alcançado quando `swapChain.upscaleActive` é verdadeiro
+   e, internamente, apenas seta um booleano. Não explica igualdade aproximada
+   entre modo 0 e modo 3.
+
+### Próxima verificação mínima no hardware (não executada nesta passagem)
+
+Fazer primeiro um A/B do **mesmo executável**, mesma inicialização limpa,
+mesmo mapa/câmera/resolução/present mode e `vid_vulkan_upscaler 0`, mudando
+somente a presença de `-dev`; registrar a linha de comando completa e se o
+console imprime `vulkan: validation layers available`. Se sem `-dev` voltar à
+faixa anterior, não há regressão geral comprovada. Só se o modo 0 continuar em
+~600 FPS sem validation layers vale testar um binário com apenas `b5067ab3`
+revertido localmente (sem commit) para isolar o único diff comum plausível.
+Depois disso, comparar build type/configuração e só então partir para profiler.
+
+**Estado honesto**: causa mais provável identificada, mas não confirmada sem o
+comando da medição atual/A-B. Nenhuma causa estática nova no present loop,
+fences ou semáforos foi encontrada. Não chamar `b5067ab3` de causa de
+performance sem o A/B acima.
+
 ## Checkpoint 2026-10-02 (parte 22) — CAUSA RAIZ REAL da queda de performance/freezes encontrada e corrigida: swapchain sem TRANSFER_DST_BIT
 
 **Dados reais do Tiago**: Vulkan puro 2500 FPS, hand-port FSR2 (modo 1) 1900

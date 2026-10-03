@@ -316,31 +316,26 @@ vk_fsr2_sdk_bool VK_Fsr2SdkComposite(
 		outputFormat, nullptr, FFX_RESOURCE_STATE_UNORDERED_ACCESS);
 	dispatch.jitterOffset.x = jitterX;
 	dispatch.jitterOffset.y = jitterY;
-	// CORRECTED (2026-10-02, second pass): previous comment's sign-only fix
-	// was wrong. Verified against the actual official Vulkan sample
-	// (external/fsr2/src/VK/UpscaleContext_FSR2_API.cpp:231-232 and
-	// libs/cauldron/src/VK/shaders/GLTFMotionVectorsPass-frag.glsl:58-59),
-	// not just the SDK's internal shader headers in isolation:
-	// - The official sample's own motion-vector shader computes
-	//   `motionVect = CurrPosition.xy/w - PrevPosition.xy/w` -- NDC space
-	//   [-1,1], SAME sign convention (current - previous) this project's
-	//   vk_motion_vectors.frag already uses, just in UV [0,1] instead of NDC.
-	// - The sample passes motionVectorScale = (renderWidth, renderHeight),
-	//   POSITIVE, not negated.
-	// - ffx_fsr2.cpp:902-903 divides that scale by the motion-vector target
-	//   size (renderWidth/Height here, since FFX_FSR2_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS
-	//   is not set) before storing it as cbFSR2.fMotionVectorScale -- so the
-	//   sample's effective internal scale is exactly 1.0, meaning its NDC
-	//   buffer is consumed as-is with no further unit conversion inside the
-	//   shaders despite LoadInputMotionVector's result being named
-	//   fUvMotionVector.
-	// This project's buffer is UV [0,1], which is exactly half the magnitude
-	// of the sample's NDC [-1,1] delta for the same underlying motion
-	// (NDC = 2*UV - 1). To reproduce the sample's proven-correct effective
-	// scale of 1.0 on an NDC-space buffer using a UV-space buffer of half
-	// the magnitude, the pre-division scale parameter must be doubled:
-	// 2*renderWidth instead of renderWidth. Sign stays unchanged (current -
-	// previous matches the sample already).
+	// REVERTED (2026-10-02, fourth pass): the "third pass" fix below (scale=
+	// renderSize, no 2x) was tested live and made things WORSE (FPS dropped
+	// further, same test conditions -- map, position, settings -- confirmed
+	// by direct comparison against the prior 2x-scale run). The reasoning
+	// that motivated it is also contradicted by the live log: with scale=
+	// renderSize (no 2x), the console showed
+	// "upscaler temporal path ACTIVE (motion-vector reprojection)
+	// (historyValidFrameCount=2)" while moving -- i.e. history was NOT being
+	// invalidated every frame, which is what the "fReprojectedHrUv pushed out
+	// of [0,1]" theory predicted would happen. That theory is refuted by this
+	// data point, not just unconfirmed. Reverting to the previous working
+	// value (2x) pending a different explanation for the movement-dependent
+	// stutter; the motionVectorScale magnitude is very likely NOT the actual
+	// cause of the FPS drop on camera movement. See CONTINUE.md /
+	// QUESTIONS_FOR_CODEX.md for the next lines of investigation (render pass
+	// incompatibility VUIDs captured live with -dev are a stronger suspect --
+	// they fire on every draw call in the FSR2 SDK path, same during movement
+	// and at rest, so they don't explain the movement-specific component by
+	// themselves, but a render-pass mismatch forcing a slow driver recovery
+	// path per frame could compound with something motion-dependent).
 	dispatch.motionVectorScale.x = 2.0f * (float)sceneWidth;
 	dispatch.motionVectorScale.y = 2.0f * (float)sceneHeight;
 	dispatch.renderSize.width = sceneWidth;
