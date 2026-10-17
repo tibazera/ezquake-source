@@ -1,3 +1,72 @@
+# Plano de finalização (2026-10-17)
+
+Este bloco é o plano ativo e vem antes do histórico abaixo. Fases antigas
+continuam valendo como checklist detalhado; aqui está só a ordem de execução.
+
+## O que aproveitar do AnyPS5 (github.com/boykopovar/AnyPS5, commit 66702f1)
+
+O AnyPS5 NÃO tem FSR2, DLSS nem PSSR implementado (`libScePsml_debug` é stub de
+alocação MFSR). O aproveitável é infraestrutura Vulkan, como referência de
+padrão (licença a conferir antes de copiar qualquer trecho literal):
+
+- `VK_KHR_timeline_semaphore` para frame pacing, no lugar de fence-por-frame
+  e dos `vkDeviceWaitIdle` usados como guarda.
+- VulkanMemoryAllocator (já vendorizado lá): substitui alocação manual dos
+  recursos do upscaler (output per-frame, histórico, motion vectors, scratch da SDK).
+- `VK_EXT_memory_budget`: checar orçamento antes de criar recursos do FSR2/DLSS.
+- `VK_EXT_descriptor_indexing`: confirma o caminho bindless (task #4), fora do escopo aqui.
+
+FSR2/DLSS continuam vindo SOMENTE do upstream oficial (AMD FidelityFX-FSR2
+v2.2.1 já vendorizado em `external/fsr2`, NVIDIA Streamline em `external/streamline`).
+
+## Ordem de execução
+
+### Etapa 1: matar o stutter ao mover no modo 3 (bloqueador)
+Sintoma: ~1600 FPS parado, cai para ~1000 com stutter ao mover. Modo 1 não tem isso.
+1. Medir antes de mexer: Tracy ou VkQueryPool em volta de `ffxFsr2ContextDispatch`,
+   tempo CPU de submit/acquire, e contar alocações por frame (descriptor sets,
+   imagens, pipelines) no caminho SDK e no backend Vulkan oficial.
+2. Conferir no backend oficial (`ffx_fsr2_vk.cpp`) se o dispatch aloca descriptor
+   sets/pipeline barriers por frame além do esperado e se usamos o pool/flags
+   que o sample oficial usa.
+3. Conferir `FfxFsr2DispatchDescription.frameTimeDelta`, `reset` e `enableSharpening`
+   iguais ao sample; reset indevido a cada frame explica custo dependente de movimento.
+4. Critério de saída: modo 3 com custo de GPU estável parado/movendo, sem VUID com `-dev`.
+
+### Etapa 2: sincronização (aproveita AnyPS5)
+1. Timeline semaphore para frames em voo; remover `vkDeviceWaitIdle` de caminhos
+   não-teardown (vk_main.c: 258, 485, 515 a revisar um por um).
+2. Confirmar semáforos de present por imagem do swapchain (renderFinished já é;
+   revisar imageAvailable e o acquire temporário de `vk_main.c:212`).
+3. Critério: zero `VUID` de semáforo/descriptor com `-dev` em dm3 por 5 minutos.
+
+### Etapa 3: entradas temporais corretas (Fase 3 antiga)
+1. Teste matemático executável: câmera parada => motion zero sem jitter.
+2. Motion vectors de entidades animadas (não só reprojeção de câmera).
+3. Máscara reactive para partículas/transparência; reset em mapa/teleport/demo seek/vid_restart.
+4. Mip bias negativo conforme manual AMD só para texturas do mundo.
+5. Critério: comparação visual lado a lado com modo nativo, sem ghosting em rocket trail.
+
+### Etapa 4: limpeza e exclusividade (Fases 2 e 4 antigas)
+1. Um backend por frame: off / FSR2 oficial / DLSS SR. Remover hand-port FSR2
+   (`vk_fsr2.c` + 5 shaders) depois que o modo 3 passar nas etapas 1 e 3.
+2. Falha do backend: restaura layouts, invalida histórico, cai para off com log.
+3. Ordem: upscaler -> pós (gamma/contrast) uma vez -> HUD nativo.
+
+### Etapa 5: DLSS via Streamline (Fase 5 antiga)
+1. Trocar mirror C de `vk_dlss_types.h` por shim C++ com headers oficiais.
+2. Ordem oficial: slInit -> slSetVulkanInfo -> slIsFeatureSupported -> tags/constants -> evaluate.
+3. Na RX 6800 XT só dá para validar fallback limpo. Validação real exige GPU RTX:
+   sem ela, DLSS não é marcado como pronto.
+
+### Etapa 6: menu e entrega
+1. Options/Video: seletor de upscaler + qualidade (Quality/Balanced/Performance).
+2. Build Release limpo, porte para o branch principal e android conforme estratégia de branches.
+
+## Regras
+- Cada etapa: build, teste ao vivo com e sem `-dev`, log `-condebug`, só então commit.
+- Nada de "pronto" sem medição real.
+
 # Plano de recuperação e integração oficial FSR2 / DLSS
 
 Atualizado: 2026-09-30. Documento compartilhado para Codex e Claude.
