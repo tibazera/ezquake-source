@@ -78,3 +78,24 @@ Documented subsets (not bugs): no `*`/`%n$` width or precision, no
 
 Steps 1-4 (mingw build, TF2003 `csqc_selftest`, KTX v6, CSQC-disabled
 control) need the Windows workspace and local servers; they were not run here.
+
+## PR #1163 state at the fifth pass (7cae3630)
+
+Source: angeld's fifth-pass comment (2026-10-26) and dsvensson's re-check of
+eb282eb9.
+
+- S44 (sprintf typing): angeld reports it fixed in 7cae363. The FTE comparison
+  above agrees for the domain selection. The float -> int32 cast (Divergence 1)
+  was not raised in the review, so it is new input for the S44 thread.
+- S87 (itof/ftoi): still unimplemented by design. The stated reason is now
+  byte-offset entities. dsvensson's point stands: fteqcc emits these calls for
+  casts, so modules built with fteextensions.qc get 0/world.
+- S71 (#0 names): fixed in 1e877c87. The call aborts like PF_Fixme, but the
+  module is disabled instead of the client disconnecting.
+- Still open per dsvensson: S17 (string ring / #500 copies; #500 was removed in
+  a9a485b), S24 (csprogs loaded after begin), S30, S51 (world writable
+  window, OP_STATE check), svcfte_effect 74/75 local defines (waiting on qwprot).
+- 48 "Acknowledged" low/medium items are deferred to
+  docs/plans/csqc_pr1163_residual_findings.md, waiting on dsvensson's OK.
+- angeld's baseline: csqc_selftest pass=313 fail=2 skip=2 (R6 buf chain,
+  WS2-C setkeybind gate, which is in PR-2). Our run should match this.
