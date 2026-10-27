@@ -99,3 +99,34 @@ eb282eb9.
   docs/plans/csqc_pr1163_residual_findings.md, waiting on dsvensson's OK.
 - angeld's baseline: csqc_selftest pass=313 fail=2 skip=2 (R6 buf chain,
   WS2-C setkeybind gate, which is in PR-2). Our run should match this.
+
+## Fixes on this branch after 7cae363 (to validate locally)
+
+Commits fb3f9e8, 3e66300, 98b3529, 2a8a74e, eea1513. Only syntax/-O2 compile
+checks were run (Linux gcc); nothing was executed.
+
+| Area | Fix | How to check |
+|---|---|---|
+| sprintf #627 | float-domain %d/%u/%x as int64, saturating | `sprintf("%d %u %x", 3000000000, -1, -1)` -> `3000000000 18446744073709551615 ffffffffffffffff` |
+| cvar #45 | no vm deref before NULL check | - |
+| te_bloodshower #406 | howmany from PARM3 | effect count follows the 4th arg |
+| input_timelength | clamp before int cast | NaN/huge value -> msec 1/255, no crash |
+| csqc_client.c | include qsound.h (pointer truncation on 64-bit) | svc 77 sound precache on a 64-bit build |
+| MSG_ReadFloat | bounded, sets msg_badread | readfloat loop past the end returns -1 |
+| SCR_CenterPrint | line count bounded | cprint of 1100 newlines, no crash |
+| strftime #478 | bounded copy, NULL tm, safe conversions | `strftime(0, "%Q %Y %")` does not abort on Windows |
+| Draw_CachePicSafe | .lmp size checked | `drawpic(..., "gfx/palette.lmp", ...)` fails soft; HUD/console pics still load |
+| spawn #14 | errors on a full pool | - |
+| strunzone | notices only with developer 1 | - |
+| Mod_FindName | long names match their truncated slot | `.model` with a 70-char name, no slot leak |
+| strncmp #228 | s2ofs applied | `strncmp("abc", "xbc", 2, 1, 1)` == 0 |
+| bitshift #218 | no UB for shift >= 32 / negative | `bitshift(1, 40)` == 0 |
+| checkcommand #294 | alias -> 2 | an alias name returns 2 |
+| Disconnect | clears sent-command history | reconnect, prediction stays sane |
+| TranslateMarkup | colour state initialised | `^s` before any colour |
+| strreplace #484/#485 | integer-safe bound | - |
+| csprogs cache | no write on a truncated path | - |
+
+Expected selftest baseline is still pass=313 fail=2 skip=2; a selftest that
+asserted an old behaviour (e.g. checkcommand of an alias == 0, strunzone
+console spam) may need its expectation updated.
