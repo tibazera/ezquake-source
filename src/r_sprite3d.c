@@ -28,7 +28,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include "r_renderer.h"
 #include "r_texture.h"
 
-int indexes_start_quads, indexes_start_flashblend, indexes_start_sparks;
+int indexes_start_quads, indexes_start_flashblend, indexes_start_sparks, indexes_start_beams;
 
 static const char* batch_type_names[] = {
 	"ENTITIES",
@@ -106,7 +106,7 @@ gl_sprite3d_batch_t batches[MAX_SPRITE3D_BATCHES];
 unsigned int batchMapping[MAX_SPRITE3D_BATCHES];
 unsigned int batchCount;
 unsigned int vertexCount;
-static unsigned int indexData[INDEXES_MAX_QUADS * 4 + INDEXES_MAX_SPARKS * 9 + INDEXES_MAX_FLASHBLEND * 18 + (INDEXES_MAX_QUADS + INDEXES_MAX_SPARKS + INDEXES_MAX_FLASHBLEND) * 3];
+static unsigned int indexData[INDEXES_MAX_QUADS * 4 + INDEXES_MAX_SPARKS * 9 + INDEXES_MAX_FLASHBLEND * 18 + INDEXES_MAX_BEAMS * 6 + (INDEXES_MAX_QUADS + INDEXES_MAX_SPARKS + INDEXES_MAX_FLASHBLEND + INDEXES_MAX_BEAMS) * 3];
 static int sprites_in_batch[sprite_vertpool_count];
 
 sprite_vertpool_id batch_to_vertpool[] = {
@@ -206,30 +206,34 @@ void R_Sprite3DInitialiseBatch(sprite3d_batch_id type, r_state_id state, texture
 	batch->texture_index = index;
 	batch->name = batch_type_names[type];
 	batch->id = type;
+	batch->glVertexOffset = buffers.BufferOffset(r_buffer_sprite_vertex_data) / sizeof(verts[0]);
 }
 
-r_sprite3d_vert_t* R_Sprite3DAddEntrySpecific(sprite3d_batch_id type, int verts_required, texture_ref texture, int texture_index)
+r_sprite3d_vert_t* R_Sprite3DAddEntrySpecific(sprite3d_batch_id type, int verts_required, texture_ref texture)
 {
 	gl_sprite3d_batch_t* batch = BatchForType(type, false);
 	int start = vertexCount;
-	int sprite_count = sprites_in_batch[batch_to_vertpool[batch->id]];
+	int* sprite_count;
 
-	if (!batch || sprite_count >= MAX_3DSPRITES_PER_BATCH || (sprite_count + 1) * verts_required >= MAX_VERTS_PER_BATCH) {
+	if (!batch) {
+		return NULL;
+	}
+	sprite_count = &sprites_in_batch[batch_to_vertpool[batch->id]];
+	if (*sprite_count >= MAX_3DSPRITES_PER_BATCH || (*sprite_count + 1) * verts_required >= MAX_VERTS_PER_BATCH) {
 		return NULL;
 	}
 	if (start + verts_required >= MAX_VERTS_PER_SCENE) {
 		return NULL;
 	}
 	batch->firstVertices[batch->count] = start;
-	batch->glFirstVertices[batch->count] = start + buffers.BufferOffset(r_buffer_sprite_vertex_data) / sizeof(verts[0]);
+	batch->glFirstVertices[batch->count] = start + batch->glVertexOffset;
 	batch->numVertices[batch->count] = verts_required;
 	batch->textures[batch->count] = texture;
-	batch->textureIndexes[batch->count] = texture_index;
 
 	if (batch->count) {
 		batch->allSameNumber &= verts_required == batch->numVertices[0];
 	}
-	sprites_in_batch[batch_to_vertpool[batch->id]] += 1;
+	++*sprite_count;
 	++batch->count;
 	vertexCount += verts_required;
 	return &verts[start];
@@ -237,35 +241,12 @@ r_sprite3d_vert_t* R_Sprite3DAddEntrySpecific(sprite3d_batch_id type, int verts_
 
 r_sprite3d_vert_t* R_Sprite3DAddEntryFixed(sprite3d_batch_id type, int verts_required)
 {
-	return R_Sprite3DAddEntrySpecific(type, verts_required, null_texture_reference, 0);
+	return R_Sprite3DAddEntrySpecific(type, verts_required, null_texture_reference);
 }
 
 r_sprite3d_vert_t* R_Sprite3DAddEntry(sprite3d_batch_id type, int verts_required)
 {
-	return R_Sprite3DAddEntrySpecific(type, verts_required, null_texture_reference, 0);
-}
-
-void R_Sprite3DSetVert(r_sprite3d_vert_t* vert, float x, float y, float z, float s, float t, byte color[4], int texture_index)
-{
-	extern int particletexture_array_index;
-	extern float particletexture_array_xpos_tr;
-	extern float particletexture_array_ypos_tr;
-
-	vert->color[0] = color[0];
-	vert->color[1] = color[1];
-	vert->color[2] = color[2];
-	vert->color[3] = color[3];
-	VectorSet(vert->position, x, y, z);
-	if (texture_index < 0) {
-		vert->tex[0] = particletexture_array_xpos_tr;
-		vert->tex[1] = particletexture_array_ypos_tr;
-		vert->tex[2] = particletexture_array_index;
-	}
-	else {
-		vert->tex[0] = s;
-		vert->tex[1] = t;
-		vert->tex[2] = texture_index;
-	}
+	return R_Sprite3DAddEntrySpecific(type, verts_required, null_texture_reference);
 }
 
 void R_Sprite3DCreateVBO(void)
@@ -273,6 +254,31 @@ void R_Sprite3DCreateVBO(void)
 	if (!R_BufferReferenceIsValid(r_buffer_sprite_vertex_data)) {
 		buffers.Create(r_buffer_sprite_vertex_data, buffertype_vertex, "sprite3d-vbo", sizeof(verts), verts, bufferusage_once_per_frame);
 	}
+}
+
+// Indexes for sprites of the same number of vertices, separated by primitive restart if
+// supported, otherwise by degenerate triangles (which only works for triangle strips)
+static int R_Sprite3DAddIndexes(int pos, int sprites, int verts_per_sprite)
+{
+	int i, j;
+	int vbo_pos;
+
+	for (i = 0, vbo_pos = 0; i < sprites; ++i) {
+		if (i) {
+			if (GL_Supported(R_SUPPORT_PRIMITIVERESTART)) {
+				indexData[pos++] = ~(unsigned int)0;
+			}
+			else {
+				indexData[pos++] = vbo_pos - 1;
+				indexData[pos++] = vbo_pos;
+			}
+		}
+		for (j = 0; j < verts_per_sprite; ++j) {
+			indexData[pos++] = vbo_pos++;
+		}
+	}
+
+	return pos;
 }
 
 void R_Sprite3DCreateIndexBuffer(void)
@@ -284,37 +290,15 @@ void R_Sprite3DCreateIndexBuffer(void)
 		int vbo_pos;
 
 		indexes_start_quads = pos;
-		for (i = 0, vbo_pos = 0; i < INDEXES_MAX_QUADS; ++i) {
-			if (i) {
-				if (GL_Supported(R_SUPPORT_PRIMITIVERESTART)) {
-					indexData[pos++] = ~(unsigned int)0;
-				}
-				else {
-					indexData[pos++] = vbo_pos - 1;
-					indexData[pos++] = vbo_pos;
-				}
-			}
-			for (j = 0; j < 4; ++j) {
-				indexData[pos++] = vbo_pos++;
-			}
-		}
+		pos = R_Sprite3DAddIndexes(pos, INDEXES_MAX_QUADS, 4);
+
+		// Beams (triangle strips of 6 vertices)
+		indexes_start_beams = pos;
+		pos = R_Sprite3DAddIndexes(pos, INDEXES_MAX_BEAMS, 6);
 
 		// These are currently only supported/used if primitive restart supported, as they're rendered as triangle fans
 		indexes_start_flashblend = pos;
-		for (i = 0, vbo_pos = 0; i < INDEXES_MAX_FLASHBLEND; ++i) {
-			if (i) {
-				if (GL_Supported(R_SUPPORT_PRIMITIVERESTART)) {
-					indexData[pos++] = ~(unsigned int)0;
-				}
-				else {
-					indexData[pos++] = vbo_pos - 1;
-					indexData[pos++] = vbo_pos;
-				}
-			}
-			for (j = 0; j < 18; ++j) {
-				indexData[pos++] = vbo_pos++;
-			}
-		}
+		pos = R_Sprite3DAddIndexes(pos, INDEXES_MAX_FLASHBLEND, 18);
 
 		// These are currently only supported/used if primitive restart supported, as they're rendered as triangle fans
 		indexes_start_sparks = pos;

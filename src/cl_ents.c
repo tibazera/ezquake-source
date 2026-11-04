@@ -31,8 +31,20 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 static int MVD_TranslateFlags(int src);
 void TP_ParsePlayerInfo(player_state_t *, player_state_t *, player_info_t *info);	
 
+#ifdef FTE_PEXT_TRANS
+// FTE switches playerinfo to the extended flags layout (PF_EXTRA_PFS byte,
+// PF_ONGROUND/PF_SOLID moved to bits 22/23) when any of HULLSIZE, TRANS,
+// SCALE or FATNESS is negotiated. These are the ones ezQuake supports.
+#ifdef FTE_PEXT_SCALE
+#define PF_EXTRA_PFS_EXTENSIONS (FTE_PEXT_TRANS | FTE_PEXT_SCALE)
+#else
+#define PF_EXTRA_PFS_EXTENSIONS (FTE_PEXT_TRANS)
+#endif
+#endif
+
 extern cvar_t cl_predict_players, cl_solid_players, cl_rocket2grenade;
 extern cvar_t cl_predict_half, cl_predict_scale, cl_predict_lerp;
+extern cvar_t cl_predict_lerp_time;
 extern cvar_t cl_debug_remote_prediction_errors;
 extern cvar_t cl_model_bobbing;		
 extern cvar_t cl_model_height;
@@ -41,6 +53,8 @@ extern cvar_t r_drawvweps;
 extern  unsigned int     cl_dlight_active[MAX_DLIGHTS/32];       
 
 #define CL_PREDICT_SCALE_DEFAULT_THRESHOLD 320.0f
+#define CL_PREDICT_LERP_SNAP_DISTANCE 120.0f
+#define CL_PREDICT_LERP_STOP_EPSILON 0.01f
 
 static float CL_PredictScaleThreshold(void)
 {
@@ -63,12 +77,12 @@ static struct predicted_player {
 	int msec;
 	float paused_sec;
 	
-	// Lerping data for smooth prediction error correction
-	vec3_t lerp_origin;      	// Origin we're lerping from
-	vec3_t lerp_target;      	// Target origin after prediction
-	float lerp_start_time;   	// When the lerp started
-	qbool lerping;				// Whether we're currently lerping
-	float adaptive_lerp_time; 	// Adaptive lerp duration based on error magnitude
+	// Compare server updates at the same prediction time, independently of rendering.
+	player_state_t prediction_state;
+	qbool prediction_valid;
+	vec3_t lerp_offset;
+	double lerp_start_time;
+	qbool lerping;
 } predicted_players[MAX_CLIENTS];
 
 char *cl_modelnames[cl_num_modelindices];
@@ -207,10 +221,11 @@ void CL_AddEntityToList(visentlist_t* list, visentlist_entrytype_t vistype, enti
 		if (vistype == visent_alpha) {
 			// Sort transparent entities based on closest point for stable back-to-front rendering.
 			vec3_t distance;
+			float scale = R_EntityScale(ent);
 			int i;
 			for (i = 0; i < 3; i++) {
 				distance[i] = r_refdef.vieworg[i] - ent->origin[i];
-				distance[i] -= bound(ent->model->mins[i], distance[i], ent->model->maxs[i]);
+				distance[i] -= bound(scale * ent->model->mins[i], distance[i], scale * ent->model->maxs[i]);
 			}
 			list->list[cl_visents.count].distance = DotProduct(distance, distance);
 		} else {
@@ -326,7 +341,7 @@ dlight_t *CL_AllocDlight(int key)
 			if (dl->key == key) {
 				memset (dl, 0, sizeof(*dl));
 				dl->key = key;
-				cl_dlight_active[i/32] |= (1<<(i%32));
+				cl_dlight_active[i/32] |= (1u<<(i%32));
 				return dl;
 			}
 		}
@@ -336,11 +351,11 @@ dlight_t *CL_AllocDlight(int key)
 	for (i = 0; i < MAX_DLIGHTS/32; i++) {
 		if (cl_dlight_active[i] != 0xffffffff) {
 			for (j = 0; j < 32; j++) {
-				if (!(cl_dlight_active[i] & (1<<j)) && i*32+j < MAX_DLIGHTS) {
+				if (!(cl_dlight_active[i] & (1u<<j)) && i*32+j < MAX_DLIGHTS) {
 					dl = cl_dlights + i * 32 + j;
 					memset(dl, 0, sizeof(*dl));
 					dl->key = key;
-					cl_dlight_active[i] |= 1<<j;
+					cl_dlight_active[i] |= 1u<<j;
 					return dl;
 				}
 			}
@@ -398,11 +413,11 @@ void CL_DecayLights(void)
 	for (i = 0; i < MAX_DLIGHTS/32; i++) {
 		if (cl_dlight_active[i]) {
 			for (j = 0; j < 32; j++) {
-				if ((cl_dlight_active[i]&(1<<j)) && i*32+j < MAX_DLIGHTS) {
+				if ((cl_dlight_active[i]&(1u<<j)) && i*32+j < MAX_DLIGHTS) {
 					dl = cl_dlights + i*32 + j;
 
 					if (dl->die < cl.time) {
-						cl_dlight_active[i] &= ~(1 << j);
+						cl_dlight_active[i] &= ~(1u << j);
 						dl->radius = 0;
 						continue;
 					}
@@ -410,7 +425,7 @@ void CL_DecayLights(void)
 					dl->radius -= max(r_lightdecayrate.value, 1) * cls.frametime * dl->decay;
 
 					if (dl->radius <= 0) {
-						cl_dlight_active[i] &= ~(1 << j);
+						cl_dlight_active[i] &= ~(1u << j);
 						dl->radius = 0;
 						continue;
 					}
@@ -530,9 +545,25 @@ void CL_ParseDelta (entity_state_t *from, entity_state_t *to, int bits) {
 	} else {
 		morebits = 0;
 	}
+#ifdef FTE_PEXT_ENTITYDBL
+	if (morebits & U_FTE_ENTITYDBL) {
+		to->number += 512;
+	}
+#endif
+#ifdef FTE_PEXT_ENTITYDBL2
+	if (morebits & U_FTE_ENTITYDBL2) {
+		to->number += 1024;
+	}
+#endif
 #endif
 
 	to->flags = bits;
+	// Removals have no update fields. Older servers leave high entity-number
+	// bits in the leading word, where they overlap the origin flags.
+	if (bits & U_REMOVE) {
+		return;
+	}
+
 	if (bits & U_MODEL) {
 		to->modelindex = MSG_ReadByte();
 #ifdef FTE_PEXT_MODELDBL
@@ -543,6 +574,8 @@ void CL_ParseDelta (entity_state_t *from, entity_state_t *to, int bits) {
 		to->modelindex = MSG_ReadShort();
 #endif
 	}
+	if ((unsigned)to->modelindex >= MAX_MODELS)
+		Host_Error ("CL_ParseDelta: invalid modelindex %d", to->modelindex);
 
 	if (bits & U_FRAME)
 		to->frame = MSG_ReadByte ();
@@ -597,6 +630,12 @@ void CL_ParseDelta (entity_state_t *from, entity_state_t *to, int bits) {
 	}
 
 #ifdef PROTOCOL_VERSION_FTE
+#ifdef FTE_PEXT_SCALE
+	if ((morebits & U_FTE_SCALE) && (cls.fteprotocolextensions & FTE_PEXT_SCALE)) {
+		to->scale = MSG_ReadByte();
+	}
+#endif
+
 #ifdef FTE_PEXT_TRANS
 	if (morebits & U_FTE_TRANS && cls.fteprotocolextensions & FTE_PEXT_TRANS) {
 		to->trans = MSG_ReadByte();
@@ -612,16 +651,6 @@ void CL_ParseDelta (entity_state_t *from, entity_state_t *to, int bits) {
 	}
 #endif
 
-#ifdef FTE_PEXT_ENTITYDBL
-	if (morebits & U_FTE_ENTITYDBL) {
-		to->number += 512;
-	}
-#endif
-#ifdef FTE_PEXT_ENTITYDBL2
-	if (morebits & U_FTE_ENTITYDBL2) {
-		to->number += 1024;
-	}
-#endif
 #endif
 }
 
@@ -1143,6 +1172,10 @@ void CL_LinkPacketEntities(void)
 				VectorInterpolate(cent->old_origin, lerp, cent->current.origin, ent.origin);
 			}
 		}
+#if defined(FTE_PEXT_SCALE)
+		// 1/16 units, 0 (unset) stays 0 which the renderer treats as unscaled.
+		ent.scale = state->scale / 16.0f;
+#endif
 #if defined(FTE_PEXT_TRANS)
 		// set trans, 0 and 255 are both opaque, represented by alpha 0.
 		ent.alpha = state->trans == 255 ? 0.0f : (float)state->trans / 254.0f;
@@ -1487,7 +1520,10 @@ void CL_ParsePlayerinfo (void)
 					state->skinnum &= ~(1 << 7);
 					state->modelindex += 256;
 				}
-				else if (cl.model_precache[state->modelindex] != NULL && cl.model_precache[state->modelindex]->type == mod_brush && state->modelindex + 256 == cl_modelindices[mi_player]) {
+				else if ((unsigned)state->modelindex < MAX_MODELS
+						&& cl.model_precache[state->modelindex] != NULL
+						&& cl.model_precache[state->modelindex]->type == mod_brush
+						&& state->modelindex + 256 == cl_modelindices[mi_player]) {
 					// Temporary hack to detect demos where the modelindex needs to be +256, but not encoded in the skin field
 					state->modelindex = cl_modelindices[mi_player];
 				}
@@ -1512,14 +1548,14 @@ void CL_ParsePlayerinfo (void)
 	{
 #ifdef FTE_PEXT_TRANS
 		flags = (unsigned short) MSG_ReadShort ();
-		if (cls.fteprotocolextensions & FTE_PEXT_TRANS)
+		if (cls.fteprotocolextensions & PF_EXTRA_PFS_EXTENSIONS)
 		{
 			if (flags & PF_EXTRA_PFS)
 				flags |= MSG_ReadByte() << 16;
 		}
 		else
 		{
-			// Without PEXT_TRANS there's no PF_EXTRA_PFS, move
+			// Without the extended layout there's no PF_EXTRA_PFS, move
 			// PF_ONGROUND and PF_SOLID to their expected offsets.
 			flags = (flags & 0x3fff) | (flags & 0xc000) << 8;
 		}
@@ -1636,6 +1672,14 @@ void CL_ParsePlayerinfo (void)
 		else
 			state->weaponframe = 0;
 
+
+#ifdef FTE_PEXT_SCALE
+		// Only sent while the scale differs from 1, and the slot still holds
+		// the state from UPDATE_BACKUP frames ago, so reset it first.
+		state->scale = 0;
+		if ((flags & PF_SCALE) && (cls.fteprotocolextensions & FTE_PEXT_SCALE))
+			state->scale = MSG_ReadByte();
+#endif
 #ifdef FTE_PEXT_TRANS
 		if (flags & PF_TRANS_Z && cls.fteprotocolextensions & FTE_PEXT_TRANS)
 			state->alpha = MSG_ReadByte();
@@ -1706,7 +1750,7 @@ guess_pm_type:
 			//   in protocol 27 - we always write out in new format
 			MSG_WriteByte(&cls.demomessage, num);
 #if defined(FTE_PEXT_TRANS)
-			if (cls.fteprotocolextensions & FTE_PEXT_TRANS)
+			if (cls.fteprotocolextensions & PF_EXTRA_PFS_EXTENSIONS)
 			{
 				if (flags & 0xff0000)
 				{
@@ -1720,9 +1764,9 @@ guess_pm_type:
 			}
 			else
 			{
-				// Without PEXT_TRANS there's no PF_EXTRA_PFS, move
+				// Without the extended layout there's no PF_EXTRA_PFS, move
 				// PF_ONGROUND and PF_SOLID to their expected offsets.
-				MSG_WriteShort (&cls.demomessage, flags & 0x3fff | (flags & 0xc00000) >> 8);
+				MSG_WriteShort (&cls.demomessage, (flags & 0x3fff) | ((flags & 0xc00000) >> 8));
 			}
 #else
 			MSG_WriteShort(&cls.demomessage, flags);
@@ -1778,12 +1822,19 @@ guess_pm_type:
 					}
 				}
 			}
+#ifdef FTE_PEXT_SCALE
+			if ((flags & PF_SCALE) && (cls.fteprotocolextensions & FTE_PEXT_SCALE))
+				MSG_WriteByte(&cls.demomessage, state->scale);
+#endif
 #ifdef FTE_PEXT_TRANS
 			if (flags & PF_TRANS_Z && cls.fteprotocolextensions & FTE_PEXT_TRANS)
 				MSG_WriteByte(&cls.demomessage, state->alpha);		
 #endif
 		}
 	}
+
+	if ((unsigned)state->modelindex >= MAX_MODELS)
+		Host_Error ("CL_ParsePlayerinfo: invalid modelindex %d", state->modelindex);
 
 	if (cl.z_ext & Z_EXT_PF_ONGROUND)
 		state->onground = (flags & PF_ONGROUND) != 0;
@@ -1810,7 +1861,7 @@ guess_pm_type:
 void CL_AddFlagModels (entity_t *ent, int team) 
 {
 	int i;
-	float f;
+	float f, scale;
 	vec3_t v_forward, v_right;
 	entity_t newent;
 
@@ -1845,12 +1896,15 @@ void CL_AddFlagModels (entity_t *ent, int team)
 	newent.model = cl.model_precache[cl_modelindices[mi_flag]];
 	newent.skinnum = team;
 	newent.colormap = vid.colormap;
+	newent.scale = ent->scale;
 
+	// keep the flag on the back of a scaled player
+	scale = R_EntityScale(ent);
 	AngleVectors (ent->angles, v_forward, v_right, NULL);
 	v_forward[2] = -v_forward[2]; // reverse z component
 	for (i = 0; i < 3; i++)
-		newent.origin[i] = ent->origin[i] - f * v_forward[i] + 22 * v_right[i];
-	newent.origin[2] -= 16;
+		newent.origin[i] = ent->origin[i] - scale * f * v_forward[i] + scale * 22 * v_right[i];
+	newent.origin[2] -= 16 * scale;
 
 	VectorCopy (ent->angles, newent.angles);
 	newent.angles[2] -= 45;
@@ -1892,6 +1946,7 @@ static qbool CL_AddVWepModel (entity_t *ent, int vw_index, int old_vw_frame)
 		newent.renderfx |= RF_BEHINDWALL;
 	newent.effects = ent->effects; // Electro - added for shells
 	newent.scoreboard = ent->scoreboard; // for team color in gl_outline
+	newent.scale = ent->scale; // shares the player transform
 
 	if ((!cls.mvdplayback || Cam_TrackNum() >= 0) && cl.racing && !CL_SetAlphaByDistance(&newent)) {
 		return false;
@@ -1920,6 +1975,151 @@ void CL_StorePausePredictionLocations(void)
 	}
 }
 
+// CL_PredictUsercmd halves long commands recursively, truncating odd milliseconds.
+static int CL_RemotePredictionMsec(int msec)
+{
+	int steps = 1;
+
+	while (msec > 50) {
+		msec /= 2;
+		steps *= 2;
+	}
+	return msec * steps;
+}
+
+// Called with this player's collision solids installed. Keep the ordinary prediction
+// separate from its visual correction so movement never feeds back into smoothing.
+static void CL_PredictRemotePlayer(int playernum, player_state_t *state, int msec, vec3_t origin)
+{
+	struct predicted_player *player = &predicted_players[playernum];
+	player_state_t previous, next, exact;
+	vec3_t offset = {0}, error;
+	float lerp_time = cl_predict_lerp_time.value / 1000.0f;
+	qbool smoothing = cl_predict_lerp.value != 0 && lerp_time > 0 && playernum != cl.playernum;
+	qbool exponential = cl_predict_lerp.integer == 2;
+	qbool check_error = smoothing || cl_debug_remote_prediction_errors.value > 0;
+	qbool compare = false;
+
+	if (!smoothing || cl.time < player->lerp_start_time) {
+		player->lerping = false;
+	}
+	if (player->lerping) {
+		double elapsed = cl.time - player->lerp_start_time;
+		float decay = exponential ? exp(-elapsed / lerp_time) : max(0.0f, 1.0f - elapsed / lerp_time);
+
+		VectorScale(player->lerp_offset, decay, offset);
+		// Exponential decay has no finite endpoint; discard a negligible tail.
+		if (decay <= 0 || (exponential && VectorLength(offset) < CL_PREDICT_LERP_STOP_EPSILON)) {
+			VectorClear(offset);
+			player->lerping = false;
+		}
+	}
+
+	if (check_error && !ISPAUSED && player->prediction_valid && state->messagenum != player->prediction_state.messagenum) {
+		double target_time = state->state_time + CL_RemotePredictionMsec(msec) * 0.001;
+		double elapsed = (target_time - player->prediction_state.state_time) * 1000;
+
+		// Do not replay across time resets, stale states, respawns or model changes.
+		if (state->state_time >= player->prediction_state.state_time && elapsed >= 0 && elapsed <= 255 &&
+			state->pm_type == player->prediction_state.pm_type && state->modelindex == player->prediction_state.modelindex) {
+			int remaining = (int)(elapsed + 0.5);
+			usercmd_t command = player->prediction_state.command;
+			prediction_event_sound_t *events = p_event_sound;
+
+			previous = player->prediction_state;
+			// Use the normal predictor's recursive split: different step sizes
+			// manufacture errors under friction, gravity and collisions.
+			if (remaining > 0) {
+				command.msec = remaining;
+				next = previous;
+				CL_PredictUsercmd(&previous, &next, &command, false);
+				previous = next;
+				remaining -= CL_RemotePredictionMsec(command.msec);
+			}
+			// Finish only the milliseconds truncated by that split, so the
+			// compared positions still represent the same time.
+			if (remaining > 0) {
+				command.msec = remaining;
+				next = previous;
+				CL_PredictUsercmd(&previous, &next, &command, false);
+				previous = next;
+			}
+			// This replay only measures an error; keep its sounds out of the event queue.
+			while (p_event_sound != events) {
+				prediction_event_sound_t *event = p_event_sound;
+				p_event_sound = event->next;
+				free(event);
+			}
+			compare = true;
+		}
+		else {
+			player->lerping = false;
+			VectorClear(offset);
+		}
+	}
+
+	exact = *state;
+	if (msec > 0) {
+		state->command.msec = msec;
+		CL_PredictUsercmd(state, &exact, &state->command, false);
+	}
+	VectorCopy(exact.origin, origin);
+
+	if (compare) {
+		float distance;
+
+		VectorSubtract(previous.origin, exact.origin, error);
+		distance = VectorLength(error);
+		if (cl_debug_remote_prediction_errors.value > 0 && distance >= cl_debug_remote_prediction_errors.value) {
+			Com_Printf("Remote prediction error: player=%s distance=%.2f\n", cl.players[playernum].name, distance);
+		}
+		if (smoothing) {
+			// Large discrepancies should snap instead of leaving a displaced model.
+			if (distance >= CL_PREDICT_LERP_SNAP_DISTANCE) {
+				player->lerping = false;
+				VectorClear(offset);
+			}
+			else if (distance > 0) {
+				// Decay the old correction before adding the new discrepancy to
+				// preserve continuity when another packet changes the prediction.
+				VectorAdd(offset, error, offset);
+				distance = VectorLength(offset);
+				if (distance >= CL_PREDICT_LERP_SNAP_DISTANCE) {
+					player->lerping = false;
+					VectorClear(offset);
+				}
+				else {
+					VectorCopy(offset, player->lerp_offset);
+					player->lerp_start_time = cl.time;
+					player->lerping = true;
+				}
+			}
+		}
+	}
+	VectorAdd(origin, offset, origin);
+	if (player->lerping) {
+		trace_t trace = PM_PlayerTrace(exact.origin, origin);
+
+		if (trace.startsolid || trace.allsolid) {
+			// The raw position is authoritative when a mover encloses the hull.
+			VectorCopy(exact.origin, origin);
+			VectorClear(player->lerp_offset);
+			player->lerping = false;
+		}
+		else if (trace.fraction < 1) {
+			VectorCopy(trace.endpos, origin);
+			// Trim the saved correction too, without restarting its decay.
+			// Otherwise the blocked part would return when the obstacle moves.
+			VectorScale(player->lerp_offset, trace.fraction, player->lerp_offset);
+			if (trace.fraction == 0) {
+				player->lerping = false;
+			}
+		}
+	}
+	player->prediction_state = *state;
+	player->prediction_valid = check_error;
+}
+
 // Create visible entities in the correct position for all current players
 static void CL_LinkPlayers(void)
 {
@@ -1928,7 +2128,7 @@ static void CL_LinkPlayers(void)
 	vec3_t tmp, end, diff;
 	double playertime = CL_PlayerTime();
 	player_info_t *info;
-	player_state_t *state, exact;
+	player_state_t *state;
 	entity_t ent;
 	centity_t *cent;
 	frame_t *frame;
@@ -1942,11 +2142,18 @@ static void CL_LinkPlayers(void)
 
 	for (j = 0; j < MAX_CLIENTS; j++, info++, state++) 
 	{
+		qbool was_drawn = predicted_players[j].drawn;
+
 		info = &cl.players[j];
 		state = &frame->playerstate[j];
 		cent = &cl_entities[j + 1];
 
+		// Preserve last frame's validity for lerping while resetting this frame's visibility.
 		predicted_players[j].drawn = false;
+		if (!was_drawn) {
+			predicted_players[j].lerping = false;
+			predicted_players[j].prediction_valid = false;
+		}
 
 		if (state->messagenum != cl.parsecount)
 			continue;	// not present this frame
@@ -2025,6 +2232,10 @@ static void CL_LinkPlayers(void)
 
 		// VULT MOTION TRAILS
 		ent.alpha = 0;
+#ifdef FTE_PEXT_SCALE
+		// 1/50 units, 0 (not sent) stays 0 which the renderer treats as unscaled.
+		ent.scale = state->scale / 50.0f;
+#endif
 		// The player object never gets added.
 		if (j == cl.playernum) {
 			// VULT CAMERAS
@@ -2123,100 +2334,23 @@ static void CL_LinkPlayers(void)
 				msec = (int)(msec * scale);
 			}
 		}
-		if (msec <= 0 || !cl_predict_players.value || cls.mvdplayback) {
+		if (!cl_predict_players.value || cls.mvdplayback) {
 			VectorCopy (state->origin, ent.origin);
 			VectorCopy(ent.origin, predicted_players[j].drawn_origin);
 			predicted_players[j].msec = 0;
 			predicted_players[j].drawn = true;
-			predicted_players[j].lerping = false; // No lerping needed for non-predicted players
+			predicted_players[j].lerping = false;
+			predicted_players[j].prediction_valid = false;
 		}
 		else {
-			vec3_t prediction_error;
-			float error_distance;
-
-			// predict players movement
-			msec = min(msec, 255);
-			state->command.msec = msec;
-
+			// A stationary player still needs correction smoothing, even when
+			// velocity scaling leaves no movement to extrapolate.
+			msec = bound(0, msec, 255);
 			oldphysent = pmove.numphysent;
 			CL_SetSolidPlayers(j);
-			CL_PredictUsercmd(state, &exact, &state->command, false);
+			CL_PredictRemotePlayer(j, state, msec, ent.origin);
 			pmove.numphysent = oldphysent;
 
-			// Calculate prediction error
-			VectorSubtract(exact.origin, predicted_players[j].drawn_origin, prediction_error);
-			error_distance = VectorLength(prediction_error);
-
-			if (cl_debug_remote_prediction_errors.value > 0 && error_distance >= cl_debug_remote_prediction_errors.value) {
-				Com_Printf("Remote prediction error: player=%s distance=%.2f\n",
-					info->name, error_distance);
-			}
-			
-			// Handle prediction error lerping (but not for local player)
-			if (cl_predict_lerp.value && j != cl.playernum) {
-				// Use cl_predict_lerp as minimum error threshold
-				// 0 = disabled, 0-1 clamped to 1, >1 used as threshold
-				float error_threshold = cl_predict_lerp.value;
-				if (error_threshold > 0 && error_threshold < 1.0f)
-					error_threshold = 1.0f;
-				
-				// If error is significant, start or update lerping
-				if (error_distance > error_threshold && predicted_players[j].drawn) {
-					// Calculate adaptive lerp time based on error magnitude
-					// Formula: error_units * 13ms, clamped between 39ms and 260ms
-					predicted_players[j].adaptive_lerp_time = bound(0.039f, error_distance * 0.013f, 0.26f);
-					if (predicted_players[j].lerping) {
-						// Already lerping - update the target to the new position
-						// But start from current interpolated position to avoid jumps
-						float lerp_fraction = (cl.time - predicted_players[j].lerp_start_time) / predicted_players[j].adaptive_lerp_time;
-						if (lerp_fraction < 1.0f) {
-							// Calculate current interpolated position
-							vec3_t current_pos;
-							current_pos[0] = predicted_players[j].lerp_origin[0] + 
-								(predicted_players[j].lerp_target[0] - predicted_players[j].lerp_origin[0]) * lerp_fraction;
-							current_pos[1] = predicted_players[j].lerp_origin[1] + 
-								(predicted_players[j].lerp_target[1] - predicted_players[j].lerp_origin[1]) * lerp_fraction;
-							current_pos[2] = predicted_players[j].lerp_origin[2] + 
-								(predicted_players[j].lerp_target[2] - predicted_players[j].lerp_origin[2]) * lerp_fraction;
-							VectorCopy(current_pos, predicted_players[j].lerp_origin);
-						} else {
-							VectorCopy(predicted_players[j].lerp_target, predicted_players[j].lerp_origin);
-						}
-					} else {
-						// Start new lerp
-						VectorCopy(predicted_players[j].drawn_origin, predicted_players[j].lerp_origin);
-					}
-					VectorCopy(exact.origin, predicted_players[j].lerp_target);
-					predicted_players[j].lerp_start_time = cl.time;
-					predicted_players[j].lerping = true;
-				}
-				
-				// Apply lerping if active
-				if (predicted_players[j].lerping) {
-					float lerp_fraction = (cl.time - predicted_players[j].lerp_start_time) / predicted_players[j].adaptive_lerp_time;
-					
-					if (lerp_fraction >= 1.0f) {
-						// Lerp complete
-						VectorCopy(predicted_players[j].lerp_target, ent.origin);
-						predicted_players[j].lerping = false;
-					} else {
-						// Interpolate position
-						ent.origin[0] = predicted_players[j].lerp_origin[0] + 
-							(predicted_players[j].lerp_target[0] - predicted_players[j].lerp_origin[0]) * lerp_fraction;
-						ent.origin[1] = predicted_players[j].lerp_origin[1] + 
-							(predicted_players[j].lerp_target[1] - predicted_players[j].lerp_origin[1]) * lerp_fraction;
-						ent.origin[2] = predicted_players[j].lerp_origin[2] + 
-							(predicted_players[j].lerp_target[2] - predicted_players[j].lerp_origin[2]) * lerp_fraction;
-					}
-				} else {
-					// No lerping, use predicted position directly
-					VectorCopy(exact.origin, ent.origin);
-				}
-			} else {
-				// Lerping disabled, use predicted position directly
-				VectorCopy(exact.origin, ent.origin);
-			}
-			
 			VectorCopy(ent.origin, predicted_players[j].drawn_origin);
 			predicted_players[j].msec = msec;
 			predicted_players[j].drawn = true;
@@ -2546,7 +2680,7 @@ void CL_EmitEntities (void)
 	CL_UpdateTEnts();
 }
 
-int	mvd_fixangle;
+unsigned int	mvd_fixangle;
 
 static int MVD_TranslateFlags(int src) 
 {
@@ -2612,7 +2746,7 @@ static void MVD_InitInterpolation(void) {
 		pplayer->predict = false;
 
 		tracknum = Cam_TrackNum();
-		if (mvd_fixangle & (1 << i)) {
+		if (mvd_fixangle & (1u << i)) {
 			if (i == tracknum) {
 				VectorCopy(cl.viewangles, state->command.angles);
 				VectorCopy(cl.viewangles, state->viewangles);
@@ -2621,7 +2755,7 @@ static void MVD_InitInterpolation(void) {
 			// no angle interpolation
 			VectorCopy(state->command.angles, oldstate->command.angles);
 
-			mvd_fixangle &= ~(1 << i);
+			mvd_fixangle &= ~(1u << i);
 		}
 
 		// we dont interpolate ourself if we are spectating

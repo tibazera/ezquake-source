@@ -387,6 +387,8 @@ static r_program_uniform_t program_uniforms[] = {
 	{ r_program_aliasmodel, "causticsTex", 1, false },
 	// r_program_uniform_aliasmodel_samplers
 	{ r_program_aliasmodel, "samplers", 1, false },
+	// r_program_uniform_aliasmodel_posetex
+	{ r_program_aliasmodel, "poseTex", 1, false },
 	// r_program_uniform_sprites_materialtex
 	{ r_program_sprite3d, "materialTex", 1, false },
 	// r_program_uniform_postprocess_base
@@ -416,14 +418,6 @@ typedef struct r_program_attribute_s {
 } r_program_attribute_t;
 
 static r_program_attribute_t program_attributes[] = {
-	// r_program_attribute_aliasmodel_std_glc_flags
-	{ r_program_aliasmodel_std_glc, "flags" },
-	// r_program_attribute_aliasmodel_shell_glc_flags
-	{ r_program_aliasmodel_shell_glc, "flags" },
-	// r_program_attribute_aliasmodel_shadow_glc_flags
-	{ r_program_aliasmodel_shadow_glc, "flags" },
-	// r_program_attribute_aliasmodel_outline_glc_flags
-	{ r_program_aliasmodel_outline_glc, "flags" },
 	// r_program_attribute_world_drawflat_style
 	{ r_program_world_drawflat_glc, "style" },
 	// r_program_attribute_world_textured_style
@@ -737,7 +731,7 @@ static int GL_InsertDefinitions(
 		// Inject the appropriate GLSL version string (with shader type for GLC core profile)
 #ifdef RENDERER_OPTION_MODERN_OPENGL
 		if (R_UseModernOpenGL()) {
-			strings[0] = GL_VersionAtLeast(4, 3) ? "#version 430\n\n" : "#version 410\n\n";
+			strings[0] = GL_ShaderBindingsSupported() ? "#version 430\n\n" : "#version 410\n\n";
 		}
 		else
 #endif
@@ -849,7 +843,8 @@ static qbool GL_CompileProgram(
 	}
 
 	if (program->shaders[shadertype_compute].text) {
-		return GL_CompileComputeShaderProgram(program, compute_shader_text[0], compute_shader_text_length[0]);
+		// Inserts the definitions itself, compute_shader_text[0] is now only the version line
+		return GL_CompileComputeShaderProgram(program, program->shaders[shadertype_compute].text, program->shaders[shadertype_compute].length);
 	}
 
 	if (GL_CompileShader(vertex_components, vertex_shader_text, vertex_shader_text_length, GL_VERTEX_SHADER, &shaders[shadertype_vertex])) {
@@ -1150,7 +1145,8 @@ void GL_LoadProgramFunctions(void)
 		GL_InvalidateFunction(glProgramUniformMatrix4fv);
 	}
 
-	if (GL_VersionAtLeast(4, 3) || (GL_VersionAtLeast(4, 2) && SDL_GL_ExtensionSupported("GL_ARB_compute_shader") && SDL_GL_ExtensionSupported("GL_ARB_shader_image_load_store"))) {
+	// Shaders are compiled as GLSL 4.10 below OpenGL 4.3, which can't declare compute shaders
+	if (GL_ShaderBindingsSupported()) {
 		qbool compute_shaders_support = true;
 
 		GL_LoadMandatoryFunctionExtension(glDispatchCompute, compute_shaders_support);
@@ -1438,7 +1434,7 @@ int R_ProgramUniformGet1i(r_program_uniform_id uniform_id, int default_value)
 	return default_value;
 }
 
-// Set UBO block bindings manually when layout(binding=N) is unavailable (GL < 4.2)
+// Set UBO block bindings manually when layout(binding=N) is unavailable (GL < 4.3)
 static void R_PatchProgramBindings(r_program_id program_id)
 {
 	static const struct { const char* name; int binding; } storage_bindings[] = {
@@ -1450,7 +1446,7 @@ static void R_PatchProgramBindings(r_program_id program_id)
 	GLuint prog, idx;
 	int i;
 
-	if (GL_VersionAtLeast(4, 2)) {
+	if (GL_ShaderBindingsSupported()) {
 		return; // layout(binding=N) works in-shader
 	}
 
@@ -1518,7 +1514,7 @@ static void GL_BuildCoreDefinitions(void)
 
 #ifdef RENDERER_OPTION_MODERN_OPENGL
 	if (R_UseModernOpenGL()) {
-		if (GL_VersionAtLeast(4, 3)) {
+		if (GL_ShaderBindingsSupported()) {
 			strlcat(macro_definitions,
 				"#define EZ_HAS_SSBO 1\n"
 				"#define EZ_LAYOUT_BINDING(n) layout(binding=n)\n"
@@ -1739,6 +1735,10 @@ void R_ProgramCompileAll(void)
 
 			R_ProgramSetSubProgram(i, sub_program);
 			if (!GL_AppropriateRenderer(prog->renderer_id)) {
+				continue;
+			}
+			// Only the classic renderer draws with sub-programs other than the first
+			if (sub_program && prog->renderer_id == renderer_modern) {
 				continue;
 			}
 

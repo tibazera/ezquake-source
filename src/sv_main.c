@@ -68,8 +68,8 @@ cvar_t	zombietime = {"zombietime", "2"};	// seconds to sink messages
 // after disconnect
 
 #ifdef SERVERONLY
-cvar_t	rcon_password = {"rcon_password", ""};	// password for remote server commands
-cvar_t	password = {"password", ""};	// password for entering the game
+cvar_t	rcon_password = {"rcon_password", "", CVAR_NOTFROMSERVER};	// password for remote server commands
+cvar_t	password = {"password", "", CVAR_NOTFROMSERVER};	// password for entering the game
 #else
 // client already have such variables.
 extern cvar_t rcon_password;
@@ -99,8 +99,8 @@ cvar_t	qconsole_log_say = {"qconsole_log_say", "0", 0, OnChange_qconsolelogsay_v
 cvar_t	sys_command_line = {"sys_command_line", "", CVAR_ROM};
 
 cvar_t	sv_use_dns = {"sv_use_dns", "0"}; // 1 - use DNS lookup in status command, 0 - don't use
-cvar_t	spectator_password = {"spectator_password", ""};	// password for entering as a sepctator
-cvar_t	vip_password = {"vip_password", ""};	// password for entering as a VIP sepctator
+cvar_t	spectator_password = {"spectator_password", "", CVAR_NOTFROMSERVER};	// password for entering as a sepctator
+cvar_t	vip_password = {"vip_password", "", CVAR_NOTFROMSERVER};	// password for entering as a VIP sepctator
 cvar_t	vip_values = {"vip_values", ""};
 
 cvar_t	allow_download = {"allow_download", "1"};
@@ -134,6 +134,7 @@ cvar_t  sv_speedcheck = {"sv_speedcheck", "1"};
 //<-
 //<-
 //cvar_t	sv_highchars = {"sv_highchars", "1"};
+cvar_t	sv_calcphs = {"sv_calcphs", "2"}; // 0: no PHS, 1: force PVS/PHS, 2: automatic at map load
 cvar_t	sv_phs = {"sv_phs", "1"};
 cvar_t	pausable = {"pausable", "0"};
 cvar_t	sv_maxrate = {"sv_maxrate", "0"};
@@ -3482,6 +3483,7 @@ void SV_InitLocal (void)
 	//<-
 	Cvar_Register (&sv_allowlastscores);
 //	Cvar_Register (&sv_highchars);
+	Cvar_Register (&sv_calcphs);
 	Cvar_Register (&sv_phs);
 	Cvar_Register (&pausable);
 	Cvar_Register (&sv_maxrate);
@@ -3563,6 +3565,9 @@ void SV_InitLocal (void)
 #endif
 #ifdef FTE_PEXT_MODELDBL
 	svs.fteprotocolextensions |= FTE_PEXT_MODELDBL;
+#endif
+#ifdef FTE_PEXT_SOUNDDBL
+	svs.fteprotocolextensions |= FTE_PEXT_SOUNDDBL;
 #endif
 #ifdef FTE_PEXT_ENTITYDBL
 	svs.fteprotocolextensions |= FTE_PEXT_ENTITYDBL;

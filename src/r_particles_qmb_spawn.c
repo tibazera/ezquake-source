@@ -202,7 +202,10 @@ __inline static void AddParticleEnt(part_type_t type, vec3_t org, int count, flo
 				break;
 			case p_sparkray:
 				VectorCopy(org, p->endorg);
-				VectorCopy(dir, p->org);
+				// The ray ends at the first wall, and its end stops when drifting into one
+				if (!TraceLineN(p->endorg, dir, p->org, NULL)) {
+					VectorCopy(dir, p->org);
+				}
 				for (j = 0; j < 3; j++)
 					p->vel[j] = (rand() & 127) - 64;
 				p->growth = -16;
@@ -239,6 +242,7 @@ __inline static void AddParticleEnt(part_type_t type, vec3_t org, int count, flo
 			case p_rain:
 				p->size = 1;
 				VectorCopy(org, p->org);
+				VectorCopy(org, p->endorg);
 				p->vel[0] = (rand() % 10 + 85)*size;
 				p->vel[1] = (rand() % 10 + 85)*size;
 				p->vel[2] = (rand() % -100 - 2000)*(size / 3);
@@ -260,6 +264,7 @@ __inline static void AddParticleEnt(part_type_t type, vec3_t org, int count, flo
 			case p_streakwave:
 			case p_smallspark:
 				VectorCopy(org, p->org);
+				VectorCopy(org, p->endorg);
 				VectorCopy(dir, p->vel);
 				break;
 				//VULT PARTICLES

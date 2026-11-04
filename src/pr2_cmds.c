@@ -296,11 +296,11 @@ void PF2_setmodel(edict_t *e, char *m)
 	if (!m)
 		m = "";
 	// check to see if model was properly precached
-	for (i = 0, check = sv.model_precache; *check; i++, check++)
+	for (i = 0, check = sv.model_precache; i < MAX_MODELS && *check; i++, check++)
 		if (!strcmp(*check, m))
 			break;
 
-	if (!*check)
+	if (i == MAX_MODELS || !*check)
 		PR2_RunError("no precache: %s\n", m);
 
 	PR2_SetEntityString_model(e, &e->v->model, m);
@@ -436,8 +436,7 @@ PF2_ambientsound
 */
 void PF2_ambientsound(float x, float y, float z, char *samp, float vol,	float attenuation)
 {
-	char	**check;
-	int		i, soundnum;
+	int		soundnum;
 	vec3_t 	pos;
 
 	pos[0] = x;
@@ -447,27 +446,13 @@ void PF2_ambientsound(float x, float y, float z, char *samp, float vol,	float at
 	if( !samp )
 		samp = "";
 
-	// check to see if samp was properly precached
-	for (soundnum = 0, check = sv.sound_precache; *check; check++, soundnum++)
-		if (!strcmp(*check, samp))
-			break;
-
-	if (!*check)
+	soundnum = SV_AmbientSoundIndex(samp);
+	if (soundnum < 0)
 	{
 		Con_Printf("no precache: %s\n", samp);
 		return;
 	}
-
-	// add an svc_spawnambient command to the level signon packet
-	MSG_WriteByte(&sv.signon, svc_spawnstaticsound);
-	for (i = 0; i < 3; i++)
-		MSG_WriteCoord(&sv.signon, pos[i]);
-
-	MSG_WriteByte(&sv.signon, soundnum);
-
-	MSG_WriteByte(&sv.signon, vol * 255);
-	MSG_WriteByte(&sv.signon, attenuation * 64);
-
+	SV_WriteStaticSound(&sv.signon, pos, soundnum, vol * 255, attenuation * 64);
 }
 
 /*
@@ -589,8 +574,6 @@ name checkclient ()
 =================
 */
 
-static byte	*checkpvs;
-
 int PF2_newcheckclient(int check)
 {
 	int		i;
@@ -631,7 +614,7 @@ int PF2_newcheckclient(int check)
 
 	// get the PVS for the entity
 	VectorAdd (ent->v->origin, ent->v->view_ofs, org);
-	checkpvs = CM_LeafPVS (CM_PointInLeaf(org));
+	memcpy(sv.checkpvs, CM_LeafPVS(CM_PointInLeaf(org)), CM_PVSRowBytes());
 
 	return i;
 }
@@ -663,7 +646,7 @@ intptr_t PF2_checkclient(void)
 	self = PROG_TO_EDICT(pr_global_struct->self);
 	VectorAdd(self->v->origin, self->v->view_ofs, view);
 	l = CM_Leafnum(CM_PointInLeaf(view)) - 1;
-	if ((l < 0) || !(checkpvs[l >> 3] & (1 << (l & 7))))
+	if ((l < 0) || !(sv.checkpvs[l >> 3] & (1 << (l & 7))))
 	{
 		return NUM_FOR_EDICT(sv.edicts);
 	}
@@ -1128,7 +1111,11 @@ intptr_t PF2_Find(int e, int fofs, char *str)
 		if (!*(intptr_t *)((byte *)ed->v + fofs))
 			continue;
 
-		t = VM_ArgPtr(*(intptr_t *)((char *)ed->v + fofs));
+		// String fields hold pointers in native mods but 32-bit offsets in QVMs
+		if (sv_vm->type == VMI_NATIVE)
+			t = VM_ArgPtr(*(intptr_t *)((char *)ed->v + fofs));
+		else
+			t = VM_ArgPtr(*(string_t *)((char *)ed->v + fofs));
 
 		if (!t)
 			continue;
@@ -2510,6 +2497,13 @@ void PF2_VisibleTo(int viewer, int first, int len, byte *visible)
 	}
 }
 
+static qbool PR2_CvarWritable(const char *name)
+{
+	cvar_t *var = Cvar_Find(name);
+
+	return !var || !(var->flags & CVAR_NOTFROMSERVER);
+}
+
 //===========================================================================
 // SysCalls
 //===========================================================================
@@ -2607,7 +2601,8 @@ intptr_t PR2_GameSystemCalls(intptr_t *args) {
 	case G_CVAR:
 		return PASSFLOAT(Cvar_Value(VMA(1)));
 	case G_CVAR_SET:
-		Cvar_SetByName(VMA(1), VMA(2));
+		if (PR2_CvarWritable(VMA(1)))
+			Cvar_SetByName(VMA(1), VMA(2));
 		return 0;
 	case G_FINDRADIUS:
 		return PF2_FindRadius(NUM_FOR_GAME_EDICT(VMA(1)), (float *)VMA(2), VMF(3));
@@ -2726,7 +2721,8 @@ intptr_t PR2_GameSystemCalls(intptr_t *args) {
 		VM_CheckBounds(sv_vm, args[3], args[4]);
 		return PF2_FS_GetFileList(VMA(1), VMA(2), VMA(3), args[4], args[5]);
 	case G_CVAR_SET_FLOAT:
-		Cvar_SetValueByName(VMA(1), VMF(2));
+		if (PR2_CvarWritable(VMA(1)))
+			Cvar_SetValueByName(VMA(1), VMF(2));
 		return 0;
 	case G_CVAR_STRING:
 		VM_CheckBounds(sv_vm, args[2], args[3]);

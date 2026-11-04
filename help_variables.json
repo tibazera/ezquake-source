@@ -2335,6 +2335,12 @@
         }
       ]
     },
+    "cl_pext_scale": {
+      "default": "1",
+      "desc": "If set, enable support for FTE's entity scale protocol extension.\nAllows the server to scale models.",
+      "group-id": "21",
+      "type": "boolean"
+    },
     "cl_pext_serversideweapon": {
       "default": "0",
       "desc": "When 1, requests the MVD PEXT1 server-side weapon selection extension during connect; if the server does not support it, weapon scripts fall back to client-side execution.",
@@ -2443,10 +2449,24 @@
     },
     "cl_predict_lerp": {
       "default": "1",
-      "desc": "Sets minimum prediction error threshold for adaptive smoothing. 0 disables, values 0-1 are clamped to 1.",
+      "desc": "Enables smoothing of prediction corrections for remote players.",
       "group-id": "21",
-      "type": "float",
-      "remarks": "Only affects other players, not your own movement. Higher values require larger prediction errors before smoothing begins. Helps reduce visual 'warping' from strafing, knockback, rocket jumps, and network jitter."
+      "type": "integer",
+      "remarks": "Only affects other players, not your own movement.",
+      "values": [
+        {
+          "description": "Disabled",
+          "name": "0"
+        },
+        {
+          "description": "Linear decay (faster)",
+          "name": "1"
+        },
+        {
+          "description": "Exponential decay (smoother)",
+          "name": "2"
+        }
+      ]
     },
     "cl_predict_players": {
       "default": "1",
@@ -15703,6 +15723,13 @@
         }
       ]
     },
+    "qtv_proxyaddr": {
+      "default": "",
+      "desc": "Relay QTV (host:port) to route /qtvplay through.",
+      "group-id": "38",
+      "remarks": "Like cl_proxyaddr but for QTV. Not applied to tcp: or already chained addresses.",
+      "type": "string"
+    },
     "qtv_say_team": {
       "default": "0",
       "group-id": "38",
@@ -20671,6 +20698,27 @@
     "sv_bigcoords": {
       "group-id": "43",
       "type": "string"
+    },
+    "sv_calcphs": {
+      "default": "2",
+      "desc": "Controls server PVS (potentially visible set) storage and PHS (potentially hearable set) calculation.",
+      "group-id": "43",
+      "remarks": "Applies when a new server map is loaded. Changing this variable does not rebuild the current map. External clients always use automatic PVS storage. Without PHS, PHS multicast uses the existing broadcast fallback.",
+      "type": "enum",
+      "values": [
+        {
+          "description": "Expand PVS matrices smaller than 1 MiB; decode larger ones on demand. Do not calculate PHS.",
+          "name": "0"
+        },
+        {
+          "description": "Always expand PVS and calculate PHS, subject to available hunk memory.",
+          "name": "1"
+        },
+        {
+          "description": "Expand PVS and calculate PHS only for matrices smaller than 1 MiB; otherwise decode PVS on demand without PHS.",
+          "name": "2"
+        }
+      ]
     },
     "sv_cheats": {
       "group-id": "43",

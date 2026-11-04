@@ -234,6 +234,7 @@ void R_BrushModelDrawEntity(entity_t *e)
 	vec3_t mins, maxs;
 	model_t *clmodel;
 	qbool rotated;
+	float model_scale;
 	float oldMatrix[16];
 	extern cvar_t gl_brush_polygonoffset;
 	qbool caustics = false;
@@ -250,16 +251,17 @@ void R_BrushModelDrawEntity(entity_t *e)
 		return;
 	}
 
+	model_scale = R_EntityScale(e);
 	if (e->angles[0] || e->angles[1] || e->angles[2]) {
 		rotated = true;
-		if (R_CullSphere(e->origin, clmodel->radius)) {
+		if (R_CullSphere(e->origin, model_scale * clmodel->radius)) {
 			return;
 		}
 	}
 	else {
 		rotated = false;
-		VectorAdd(e->origin, clmodel->mins, mins);
-		VectorAdd(e->origin, clmodel->maxs, maxs);
+		VectorMA(e->origin, model_scale, clmodel->mins, mins);
+		VectorMA(e->origin, model_scale, clmodel->maxs, maxs);
 
 		if (R_CullBox(mins, maxs)) {
 			return;
@@ -279,17 +281,21 @@ void R_BrushModelDrawEntity(entity_t *e)
 		modelorg[1] = -DotProduct(temp, right);
 		modelorg[2] = DotProduct(temp, up);
 	}
+	if (model_scale != 1) {
+		// modelorg is the view origin in model space, undo the uniform scale
+		VectorScale(modelorg, 1.0f / model_scale, modelorg);
+	}
 
 	// calculate dynamic lighting for bmodel if it's not an instanced model
 	if (clmodel->firstmodelsurface) {
 		for (li = 0; li < MAX_DLIGHTS / 32; li++) {
 			if (cl_dlight_active[li]) {
 				for (lj = 0; lj < 32; lj++) {
-					if ((cl_dlight_active[li] & (1 << lj)) && li * 32 + lj < MAX_DLIGHTS) {
+					if ((cl_dlight_active[li] & (1u << lj)) && li * 32 + lj < MAX_DLIGHTS) {
 						k = li * 32 + lj;
 
 						if (!gl_flashblend.integer || (cl_dlights[k].bubble && gl_flashblend.integer != 2)) {
-							R_MarkLights(&cl_dlights[k], 1 << k, clmodel->nodes + clmodel->firstnode);
+							R_MarkLights(&cl_dlights[k], 1u << k, clmodel->nodes + clmodel->firstnode);
 						}
 					}
 				}
@@ -317,8 +323,7 @@ void R_BrushModelDrawEntity(entity_t *e)
 					vec3_t midpoint;
 
 					VectorAdd(clmodel->mins, clmodel->maxs, midpoint);
-					VectorScale(midpoint, 0.5f, midpoint);
-					VectorAdd(midpoint, e->origin, midpoint);
+					VectorMA(e->origin, 0.5f * model_scale, midpoint, midpoint);
 
 					caustics = R_PointIsUnderwater(midpoint);
 				}

@@ -21,6 +21,8 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #ifndef CLIENTONLY
 #include "qwsvdef.h"
+#include <limits.h>
+#include <stddef.h>
 
 // minimal cache which can be used for demos, must be few times greater than DEMO_FLUSH_CACHE_IF_LESS_THAN_THIS
 #define DEMO_CACHE_MIN_SIZE 0x1000000
@@ -46,9 +48,9 @@ cvar_t  sv_demoExtraNames   = {"sv_demoExtraNames", "0"};
 cvar_t	sv_demoPrefix		= {"sv_demoPrefix",		""};
 cvar_t	sv_demoSuffix		= {"sv_demoSuffix",		""};
 cvar_t	sv_demotxt			= {"sv_demotxt",		"1"};
-cvar_t	sv_onrecordfinish	= {"sv_onRecordFinish", ""};
+cvar_t	sv_onrecordfinish	= {"sv_onRecordFinish", "", CVAR_NOTFROMSERVER};
 
-cvar_t	sv_ondemoremove		= {"sv_onDemoRemove",	""};
+cvar_t	sv_ondemoremove		= {"sv_onDemoRemove",	"", CVAR_NOTFROMSERVER};
 cvar_t	sv_demoRegexp		= {"sv_demoRegexp",		"\\.mvd(\\.(gz|bz2|rar|zip))?$"};
 
 cvar_t	sv_silentrecord		= {"sv_silentrecord",   "0"};
@@ -1143,7 +1145,7 @@ qbool SV_MVD_Record (mvddest_t *dest, qbool mapchange)
 
     	// and here we memset() not whole demo_t struct, but part,
     	// so demo.dest and demo.pendingdest is not overwriten
-		memset(&demo, 0, (int)((uintptr_t)&(((demo_t *)0)->mem_set_point)));
+		memset(&demo, 0, offsetof(demo_t, mem_set_point));
 
 		for (i = 0; i < UPDATE_BACKUP; i++)
 		{
@@ -1177,6 +1179,42 @@ qbool SV_MVD_Record (mvddest_t *dest, qbool mapchange)
 	return true;
 }
 
+static void SV_MVD_ReservePrecacheLists(mvddest_t *dest)
+{
+	size_t reserve = 65536;
+	mvddest_t *d;
+	int i;
+
+	/* Initial gamestate is queued before streams are flushed. Keep the old
+	 * allowance for other state, plus names and worst-case per-chunk framing. */
+	for (i = 1; i < MAX_SOUNDS && sv.sound_precache[i]; ++i) {
+		reserve += strlen(sv.sound_precache[i]) + 16;
+	}
+	for (i = 1; i < MAX_MODELS && sv.model_precache[i]; ++i) {
+		reserve += strlen(sv.model_precache[i]) + 16;
+	}
+	for (d = demo.dest; d; d = d->nextdest) {
+		size_t needed;
+		char *cache;
+
+		if (d->desttype != DEST_STREAM || (dest && dest != d)) {
+			continue;
+		}
+		needed = reserve + d->cacheused;
+		if (needed > INT_MAX) {
+			SV_Error("MVD precache lists exceed stream cache limit");
+		}
+		if (needed <= (size_t)d->maxcachesize) {
+			continue;
+		}
+		cache = Q_malloc(needed);
+		memcpy(cache, d->cache, d->cacheused);
+		Q_free(d->cache);
+		d->cache = cache;
+		d->maxcachesize = (int)needed;
+	}
+}
+
 void SV_MVD_SendInitialGamestate(mvddest_t* dest)
 {
 	sizebuf_t	buf;
@@ -1188,9 +1226,12 @@ void SV_MVD_SendInitialGamestate(mvddest_t* dest)
 	edict_t* ent;
 	char* gamedir;
 	int i;
+	int sound_count = SV_SoundPrecacheCount(sv.sound_precache, MAX_SOUNDS);
 
 	if (!demo.dest)
 		return;
+
+	SV_MVD_ReservePrecacheLists(dest);
 
 	sv.mvdrecording = true; // NOTE:  afaik set to false on map change, so restore it here
 	demo.pingtime = demo.time = sv.time;
@@ -1215,6 +1256,14 @@ void SV_MVD_SendInitialGamestate(mvddest_t* dest)
 #endif
 #ifdef FTE_PEXT_MODELDBL
 	demo.recorder.fteprotocolextensions |= FTE_PEXT_MODELDBL;
+#endif
+#ifdef FTE_PEXT_SOUNDDBL
+	if (sound_count >= MAX_SOUNDS_LEGACY) {
+		demo.recorder.fteprotocolextensions |= FTE_PEXT_SOUNDDBL;
+	}
+	else {
+		demo.recorder.fteprotocolextensions &= ~FTE_PEXT_SOUNDDBL;
+	}
 #endif
 #ifdef FTE_PEXT_ENTITYDBL
 	demo.recorder.fteprotocolextensions |= FTE_PEXT_ENTITYDBL;
@@ -1303,42 +1352,25 @@ void SV_MVD_SendInitialGamestate(mvddest_t* dest)
 	SZ_Clear (&buf);
 
 	// soundlist
-	MSG_WriteByte (&buf, svc_soundlist);
-	MSG_WriteByte (&buf, 0);
-
 	n = 0;
-	s = sv.sound_precache[n+1];
-	while (s)
-	{
-		MSG_WriteString (&buf, s);
-		if (buf.cursize > MAX_MSGLEN/2)
-		{
-			MSG_WriteByte (&buf, 0);
-			MSG_WriteByte (&buf, n);
-			SV_WriteRecordMVDMessage (&buf);
-			SZ_Clear (&buf);
-			MSG_WriteByte (&buf, svc_soundlist);
-			MSG_WriteByte (&buf, n + 1);
-		}
-		n++;
-		s = sv.sound_precache[n+1];
-	}
+	do {
+		int next;
 
-	if (buf.cursize)
-	{
-		MSG_WriteByte (&buf, 0);
-		MSG_WriteByte (&buf, 0);
-		SV_WriteRecordMVDMessage (&buf);
-		SZ_Clear (&buf);
-	}
+		if (!MSG_WriteSoundListChunk(&buf, sv.sound_precache, sound_count,
+		                            n, MAX_MSGLEN / 2, &next)) {
+			SV_Error("Unable to write MVD soundlist chunk");
+		}
+		SV_WriteRecordMVDMessage(&buf);
+		SZ_Clear(&buf);
+		n = next;
+	} while (n);
 
 	// modellist
 	MSG_WriteByte (&buf, svc_modellist);
 	MSG_WriteByte (&buf, 0);
 
 	n = 0;
-	s = sv.model_precache[n+1];
-	while (s)
+	while (n + 1 < MAX_MODELS && (s = sv.model_precache[n+1]))
 	{
 		MSG_WriteString (&buf, s);
 		if (buf.cursize > MAX_MSGLEN/2 && n & 0xff)
@@ -1359,7 +1391,6 @@ void SV_MVD_SendInitialGamestate(mvddest_t* dest)
 			}
 		}
 		n++;
-		s = sv.model_precache[n+1];
 	}
 
 	if (buf.cursize)

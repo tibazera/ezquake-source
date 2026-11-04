@@ -34,6 +34,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include "r_buffers.h"
 #include "r_program.h"
 #include "r_renderer.h"
+#include "gl_texture_internal.h"
 
 void GLM_StateBeginAliasModelZPassBatch(void);
 void GLM_StateBeginAliasModelBatch(qbool translucent, qbool additive);
@@ -78,6 +79,7 @@ typedef struct aliasmodel_draw_data_s {
 	texture_ref bound_textures[MAXIMUM_ALIASMODEL_DRAWCALLS][MAXIMUM_MATERIAL_SAMPLERS];
 	int num_textures[MAXIMUM_ALIASMODEL_DRAWCALLS];
 	int num_cmds[MAXIMUM_ALIASMODEL_DRAWCALLS];
+	int total_cmds;
 	int num_calls;
 	int current_call;
 
@@ -100,7 +102,7 @@ typedef struct uniform_block_aliasmodel_s {
 	int materialSamplerMapping;
 	float lerpFraction;
 	float minLumaMix;
-	float outline_normal_scale;
+	int pose2Offset;             // vertices from the drawn pose to the pose being lerped towards
 } uniform_block_aliasmodel_t;
 
 typedef struct block_aliasmodels_s {
@@ -116,8 +118,28 @@ extern float r_framelerp;
 #define DRAW_INSTANCED            (1 << 5)
 
 static uniform_block_aliasmodels_t aliasdata;
+static texture_ref alias_model_textures[MAX_STANDARD_ENTITIES]; // bound for models drawn individually
 
 static int cached_mode;
+
+// Without SSBOs (OpenGL < 4.3) the model data is read through a uniform block holding a
+// section of MAX_ALIASMODEL_UNIFORM_BLOCK_MODELS models, and without base instance the
+// model is picked with a uniform, so each model is drawn on its own.
+static qbool GLM_AliasModelsDrawnIndividually(void)
+{
+	return !GL_ShaderBindingsSupported() || !GL_Supported(R_SUPPORT_INSTANCED_RENDERING);
+}
+
+// The section size (64 * 144 bytes) satisfies GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT.
+static int bound_model_section;
+
+static void GLM_BindAliasModelSection(int section)
+{
+	uintptr_t section_size = sizeof(aliasdata.models[0]) * MAX_ALIASMODEL_UNIFORM_BLOCK_MODELS;
+
+	buffers.BindRange(r_buffer_aliasmodel_model_data, EZQ_STORAGE_BLOCK_BINDING(EZQ_GL_BINDINGPOINT_ALIASMODEL_DRAWDATA), buffers.BufferOffset(r_buffer_aliasmodel_model_data) + section * section_size, section_size);
+	bound_model_section = section;
+}
 
 #define GET_COLOR_VALUES(colr) (float[]){(float)gl_outline_color_##colr.color[0] / 255.0f,(float)gl_outline_color_##colr.color[1] / 255.0f,(float)gl_outline_color_##colr.color[2] / 255.0f}
 
@@ -146,8 +168,17 @@ static void R_SetAliasModelUniforms(int mode)
 #undef GET_COLOR_VALUES
 
 static int material_samplers_max;
+static int material_sampler_units; // material samplers declared in the shader
 static int TEXTURE_UNIT_MATERIAL;
 static int TEXTURE_UNIT_CAUSTICS;
+static const int TEXTURE_UNIT_POSES = 0;
+
+// Buffer texture over the vertex data, so the vertex shader can read any second pose
+texture_ref aliasmodel_pose_texture;
+
+#ifdef C_ASSERT
+C_ASSERT(sizeof(vbo_model_vert_t) == 16 * AM_VERTEX_TEXELS);
+#endif
 
 qbool GLM_CompileAliasModelProgram(void)
 {
@@ -157,29 +188,38 @@ qbool GLM_CompileAliasModelProgram(void)
 		(r_refdef2.drawCaustics ? DRAW_CAUSTIC_TEXTURES : 0) |
 		(r_lerpmuzzlehack.integer ? DRAW_LERP_MUZZLEHACK : 0) |
 		(gl_smoothmodels.integer ? 0 : DRAW_FLAT_SHADING) |
-		(GL_Supported(R_SUPPORT_INSTANCED_RENDERING) ? DRAW_INSTANCED : 0);
+		(GLM_AliasModelsDrawnIndividually() ? 0 : DRAW_INSTANCED);
 
 	if (R_ProgramRecompileNeeded(r_program_aliasmodel, drawAlias_desiredOptions)) {
 		static char included_definitions[1024];
 
 		included_definitions[0] = '\0';
+		strlcat(included_definitions, va("#define SAMPLER_POSE_TEXTURE %d\n", TEXTURE_UNIT_POSES), sizeof(included_definitions));
 		if (drawAlias_desiredOptions & DRAW_CAUSTIC_TEXTURES) {
-			material_samplers_max = glConfig.texture_units - 1;
-			TEXTURE_UNIT_CAUSTICS = 0;
-			TEXTURE_UNIT_MATERIAL = 1;
+			material_samplers_max = glConfig.texture_units - 2;
+			TEXTURE_UNIT_CAUSTICS = 1;
+			TEXTURE_UNIT_MATERIAL = 2;
 
 			strlcat(included_definitions, "#define DRAW_CAUSTIC_TEXTURES\n", sizeof(included_definitions));
-			strlcat(included_definitions, "#define SAMPLER_CAUSTIC_TEXTURE 0\n", sizeof(included_definitions));
-			strlcat(included_definitions, "#define SAMPLER_MATERIAL_TEXTURE_START 1\n", sizeof(included_definitions));
+			strlcat(included_definitions, "#define SAMPLER_CAUSTIC_TEXTURE 1\n", sizeof(included_definitions));
+			strlcat(included_definitions, "#define SAMPLER_MATERIAL_TEXTURE_START 2\n", sizeof(included_definitions));
 		}
 		else {
-			material_samplers_max = glConfig.texture_units;
-			TEXTURE_UNIT_MATERIAL = 0;
+			material_samplers_max = glConfig.texture_units - 1;
+			TEXTURE_UNIT_MATERIAL = 1;
 
-			strlcat(included_definitions, "#define SAMPLER_MATERIAL_TEXTURE_START 0\n", sizeof(included_definitions));
+			strlcat(included_definitions, "#define SAMPLER_MATERIAL_TEXTURE_START 1\n", sizeof(included_definitions));
 		}
 
-		strlcat(included_definitions, va("#define SAMPLER_COUNT %d\n", material_samplers_max), sizeof(included_definitions));
+		if (GLM_AliasModelsDrawnIndividually()) {
+			// Models are drawn one at a time with their texture bound, and the driver sets up
+			// every sampler the program declares for each draw, so declare just one
+			material_sampler_units = 1;
+		}
+		else {
+			material_sampler_units = material_samplers_max;
+		}
+		strlcat(included_definitions, va("#define SAMPLER_COUNT %d\n", material_sampler_units), sizeof(included_definitions));
 		if (drawAlias_desiredOptions & DRAW_LERP_MUZZLEHACK) {
 			strlcat(included_definitions, "#define EZQ_ALIASMODEL_MUZZLEHACK\n", sizeof(included_definitions));
 		}
@@ -190,13 +230,14 @@ qbool GLM_CompileAliasModelProgram(void)
 		// Initialise program for drawing image
 		R_ProgramCompileWithInclude(r_program_aliasmodel, included_definitions);
 
-		// Set sampler uniforms for GL < 4.2 (no layout(binding=N) support)
-		if (!GL_VersionAtLeast(4, 2) && R_ProgramReady(r_program_aliasmodel)) {
+		// Set sampler uniforms for GL < 4.3 (no layout(binding=N) support)
+		if (!GL_ShaderBindingsSupported() && R_ProgramReady(r_program_aliasmodel)) {
 			R_ProgramUse(r_program_aliasmodel);
+			R_ProgramUniform1i(r_program_uniform_aliasmodel_posetex, TEXTURE_UNIT_POSES);
 			if (drawAlias_desiredOptions & DRAW_CAUSTIC_TEXTURES) {
 				R_ProgramUniform1i(r_program_uniform_aliasmodel_causticstex, TEXTURE_UNIT_CAUSTICS);
 			}
-			R_ProgramUniform1iArrayBase(r_program_uniform_aliasmodel_samplers, material_samplers_max, TEXTURE_UNIT_MATERIAL);
+			R_ProgramUniform1iArrayBase(r_program_uniform_aliasmodel_samplers, material_sampler_units, TEXTURE_UNIT_MATERIAL);
 		}
 
 		R_ProgramSetCustomOptions(r_program_aliasmodel, drawAlias_desiredOptions);
@@ -222,10 +263,24 @@ void GLM_CreateAliasModelVAO(void)
 	GLM_ConfigureVertexAttribPointer(vao_aliasmodel, r_buffer_aliasmodel_vertex_data, 1, 2, GL_FLOAT, GL_FALSE, sizeof(vbo_model_vert_t), VBO_FIELDOFFSET(vbo_model_vert_t, texture_coords), 0);
 	GLM_ConfigureVertexAttribPointer(vao_aliasmodel, r_buffer_aliasmodel_vertex_data, 2, 3, GL_FLOAT, GL_FALSE, sizeof(vbo_model_vert_t), VBO_FIELDOFFSET(vbo_model_vert_t, normal), 0);
 	GLM_ConfigureVertexAttribIPointer(vao_aliasmodel, r_buffer_instance_number, 3, 1, GL_UNSIGNED_INT, sizeof(GLuint), 0, 1);
-	GLM_ConfigureVertexAttribPointer(vao_aliasmodel, r_buffer_aliasmodel_vertex_data, 4, 3, GL_FLOAT, GL_FALSE, sizeof(vbo_model_vert_t), VBO_FIELDOFFSET(vbo_model_vert_t, direction), 0);
-	GLM_ConfigureVertexAttribIPointer(vao_aliasmodel, r_buffer_aliasmodel_vertex_data, 5, 1, GL_UNSIGNED_INT, sizeof(vbo_model_vert_t), VBO_FIELDOFFSET(vbo_model_vert_t, flags), 0);
 
 	R_BindVertexArray(vao_none);
+
+	// The vertex data was (re)created, point the pose texture at it
+	{
+		GLint max_texels = 0;
+
+		if (!R_TextureReferenceIsValid(aliasmodel_pose_texture)) {
+			GL_CreateTexturesWithIdentifier(texture_type_buffer, 1, &aliasmodel_pose_texture, "aliasmodel-poses");
+			R_TextureSetFlag(aliasmodel_pose_texture, TEX_NO_TEXTUREMODE);
+		}
+
+		glGetIntegerv(GL_MAX_TEXTURE_BUFFER_SIZE, &max_texels);
+		if (buffers.Size(r_buffer_aliasmodel_vertex_data) / 16 > (size_t)max_texels ||!GL_TexBuffer(aliasmodel_pose_texture, GL_RGBA32F, r_buffer_aliasmodel_vertex_data)) {
+			Con_Printf("Alias model vertex data can't be read as a buffer texture, frames won't be interpolated\n");
+			R_DeleteTexture(&aliasmodel_pose_texture);
+		}
+	}
 }
 
 static int AssignSampler(aliasmodel_draw_instructions_t* instr, texture_ref texture)
@@ -283,11 +338,13 @@ static void GLM_QueueDrawCall(aliasmodel_draw_type_t type, int vbo_start, int vb
 		GLM_NextAliasModelDrawCall(instr, false);
 	}
 
-	if (instr->num_cmds[instr->current_call] >= sizeof(instr->indirect_buffer) / sizeof(instr->indirect_buffer[0])) {
+	if (instr->total_cmds >= sizeof(instr->indirect_buffer) / sizeof(instr->indirect_buffer[0])) {
 		return;
 	}
 
-	pos = instr->num_cmds[instr->current_call]++;
+	// Each call's commands follow the previous call's
+	pos = instr->total_cmds++;
+	instr->num_cmds[instr->current_call]++;
 	indirect = &instr->indirect_buffer[pos];
 	indirect->instanceCount = 1;
 	indirect->baseInstance = instance;
@@ -297,7 +354,7 @@ static void GLM_QueueDrawCall(aliasmodel_draw_type_t type, int vbo_start, int vb
 
 static void GLM_QueueAliasModelDrawImpl(
 	entity_t* ent, model_t* model, float* color, int vbo_start, int vbo_count, texture_ref texture,
-	int effects, float lerpFraction, int lerpFrameVertOffset, qbool outline, int render_effects
+	int effects, float lerpFraction, int poseVertIndex2, qbool outline, int render_effects
 )
 {
 	qbool shell = (effects & (EF_RED | EF_BLUE | EF_GREEN)) && R_TextureReferenceIsValid(shelltexture) && Ruleset_AllowPowerupShell(model);
@@ -341,7 +398,7 @@ static void GLM_QueueAliasModelDrawImpl(
 	}
 
 	// Assign samplers - if we're over limit, need to flush and try again
-	textureSampler = AssignSampler(instr, texture);
+	textureSampler = (GLM_AliasModelsDrawnIndividually() ? 0 : AssignSampler(instr, texture));
 	if (textureSampler < 0) {
 		if (!GLM_NextAliasModelDrawCall(instr, true)) {
 			return;
@@ -364,18 +421,22 @@ static void GLM_QueueAliasModelDrawImpl(
 		(ent->scoreboard != NULL ? ent->scoreboard->teammate ? AMF_TEAMMATE : 0 : 0) |
 		(ent->renderfx & RF_BEHINDWALL ? AMF_BEHINDWALL : 0) |
 		(ent->renderfx & RF_PLAYERMODEL ? AMF_PLAYERMODEL : 0) |
-		(ent->renderfx & RF_VWEPMODEL ? AMF_VWEPMODEL : 0);
+		(ent->renderfx & RF_VWEPMODEL ? AMF_VWEPMODEL : 0) |
+		(model->renderfx & RF_LIMITLERP ? AMF_LIMITLERP : 0);
 	uniform->yaw_angle_rad = ent->angles[YAW] * M_PI / 180.0;
 	uniform->shadelight = ent->shadelight;
 	uniform->ambientlight = ent->ambientlight;
-	uniform->lerpFraction = lerpFraction;
+	if (R_TextureReferenceIsValid(aliasmodel_pose_texture)) {
+		uniform->lerpFraction = lerpFraction;
+		uniform->pose2Offset = poseVertIndex2 - vbo_start;
+	}
 	uniform->color[0] = color[0];
 	uniform->color[1] = color[1];
 	uniform->color[2] = color[2];
 	uniform->color[3] = color[3];
 	uniform->materialSamplerMapping = textureSampler;
+	alias_model_textures[alias_draw_count] = texture;
 	uniform->minLumaMix = 1.0f - (ent->full_light ? bound(0, gl_fb_models.integer, 1) : 0);
-	uniform->outline_normal_scale = ent->outlineScale;
 	if(ent->scoreboard != NULL) {
 		int tc = 16 * (bound(0, ent->scoreboard->topcolor, 13)) + 8;
 		int bc = 16 * (bound(0, ent->scoreboard->bottomcolor, 13)) + 8;
@@ -466,16 +527,20 @@ void GLM_PrepareAliasModelBatches(void)
 
 	// Update VBO with data about each entity
 	buffers.Update(r_buffer_aliasmodel_model_data, sizeof(aliasdata.models[0]) * alias_draw_count, aliasdata.models);
-	buffers.BindRange(r_buffer_aliasmodel_model_data, EZQ_STORAGE_BLOCK_BINDING(EZQ_GL_BINDINGPOINT_ALIASMODEL_DRAWDATA), buffers.BufferOffset(r_buffer_aliasmodel_model_data), sizeof(aliasdata.models[0]) * alias_draw_count);
+	if (GL_ShaderBindingsSupported()) {
+		buffers.BindRange(r_buffer_aliasmodel_model_data, EZQ_STORAGE_BLOCK_BINDING(EZQ_GL_BINDINGPOINT_ALIASMODEL_DRAWDATA), buffers.BufferOffset(r_buffer_aliasmodel_model_data), sizeof(aliasdata.models[0]) * alias_draw_count);
+	}
+	else {
+		GLM_BindAliasModelSection(0);
+	}
 
-	// Build & update list of indirect calls
-	{
-		int i, j;
+	// Build & update list of indirect calls, not read when the models are drawn individually
+	if (!GLM_AliasModelsDrawnIndividually()) {
+		int i;
 		int offset = 0;
 
 		for (i = 0; i < aliasmodel_draw_max; ++i) {
 			aliasmodel_draw_instructions_t* instr = &alias_draw_instructions[i];
-			int total_cmds = 0;
 			int size;
 
 			if (!instr->num_calls) {
@@ -483,11 +548,7 @@ void GLM_PrepareAliasModelBatches(void)
 			}
 
 			instr->indirect_buffer_offset = offset;
-			for (j = 0; j < instr->num_calls; ++j) {
-				total_cmds += instr->num_cmds[j];
-			}
-
-			size = sizeof(instr->indirect_buffer[0]) * total_cmds;
+			size = sizeof(instr->indirect_buffer[0]) * instr->total_cmds;
 			buffers.UpdateSection(r_buffer_aliasmodel_drawcall_indirect, offset, size, instr->indirect_buffer);
 			offset += size;
 		}
@@ -496,24 +557,76 @@ void GLM_PrepareAliasModelBatches(void)
 	R_TraceLeaveNamedRegion();
 }
 
-// GL 4.1 fallback: no baseInstance, so use instanceOffset uniform to index correct model
-static int GLM_DrawAliasModelsNoBaseInstance(aliasmodel_draw_instructions_t* instr, int cmd_start, int call_index)
+// Each command is drawn with the instanceOffset uniform picking its model, but consecutive
+// models drawn with the same pose & texture are drawn instanced, the _instanceId vertex
+// attribute counting up from 0 (there's no base instance) picking each model in the run.
+static int GLM_DrawAliasModelsIndividually(aliasmodel_draw_instructions_t* instr, int cmd_start, int call_index, qbool bind_materials)
 {
-	int j;
+	DrawArraysIndirectCommand_t* cmds = &instr->indirect_buffer[cmd_start];
+	int num_cmds = instr->num_cmds[call_index];
+	qbool sections = !GL_ShaderBindingsSupported();
+	int j, run;
 
-	for (j = 0; j < instr->num_cmds[call_index]; ++j) {
-		DrawArraysIndirectCommand_t* cmd = &instr->indirect_buffer[cmd_start + j];
+	for (j = 0; j < num_cmds; j += run) {
+		DrawArraysIndirectCommand_t* cmd = &cmds[j];
+		int model = cmd->baseInstance;
+		int section = 0;
 
-		// Without baseInstance support, _instanceId vertex attribute is always 0.
-		// Use instanceOffset uniform so shader reads models[0 + baseInstance].
-		R_ProgramUniform1i(r_program_uniform_aliasmodel_instanceOffset, cmd->baseInstance);
+		if (sections) {
+			section = model / MAX_ALIASMODEL_UNIFORM_BLOCK_MODELS;
+			if (section != bound_model_section) {
+				GLM_BindAliasModelSection(section);
+			}
+			model -= section * MAX_ALIASMODEL_UNIFORM_BLOCK_MODELS;
+		}
 
-		GL_DrawArrays(GL_TRIANGLES, cmd->first, cmd->count);
+		for (run = 1; j + run < num_cmds && GL_DrawArraysInstancedAvailable(); ++run) {
+			DrawArraysIndirectCommand_t* next = &cmds[j + run];
+
+			if (next->first != cmd->first || next->count != cmd->count || next->baseInstance != cmd->baseInstance + run) {
+				break;
+			}
+			if (sections && next->baseInstance / MAX_ALIASMODEL_UNIFORM_BLOCK_MODELS != section) {
+				break;
+			}
+			if (bind_materials && !R_TextureReferenceEqual(alias_model_textures[next->baseInstance], alias_model_textures[cmd->baseInstance])) {
+				break;
+			}
+		}
+
+		if (bind_materials && R_TextureReferenceIsValid(alias_model_textures[cmd->baseInstance])) {
+			renderer.TextureUnitBind(TEXTURE_UNIT_MATERIAL, alias_model_textures[cmd->baseInstance]);
+		}
+		R_ProgramUniform1i(r_program_uniform_aliasmodel_instanceOffset, model);
+
+		if (run > 1) {
+			GL_DrawArraysInstanced(GL_TRIANGLES, cmd->first, cmd->count, run);
+		}
+		else {
+			GL_DrawArrays(GL_TRIANGLES, cmd->first, cmd->count);
+		}
 	}
 
-	// Reset for potential use with baseInstance path
-	R_ProgramUniform1i(r_program_uniform_aliasmodel_instanceOffset, 0);
+	return num_cmds;
+}
 
+// Draws the models queued in one call, returns the number of commands drawn
+static int GLM_DrawAliasModelCall(aliasmodel_draw_instructions_t* instr, int cmd_start, int call_index, uintptr_t extra_offset, qbool bind_materials)
+{
+	if (GLM_AliasModelsDrawnIndividually()) {
+		return GLM_DrawAliasModelsIndividually(instr, cmd_start, call_index, bind_materials);
+	}
+
+	if (bind_materials && instr->num_textures[call_index]) {
+		renderer.TextureUnitMultiBind(TEXTURE_UNIT_MATERIAL, instr->num_textures[call_index], instr->bound_textures[call_index]);
+	}
+
+	GL_MultiDrawArraysIndirect(
+		GL_TRIANGLES,
+		(const void*)(uintptr_t)(instr->indirect_buffer_offset + extra_offset + cmd_start * sizeof(instr->indirect_buffer[0])),
+		instr->num_cmds[call_index],
+		0
+	);
 	return instr->num_cmds[call_index];
 }
 
@@ -526,19 +639,21 @@ static void GLM_RenderPreparedEntities(aliasmodel_draw_type_t type)
 	qbool translucent = (type != aliasmodel_draw_std && type != aliasmodel_draw_postscene_additive);
 	qbool additive = (type == aliasmodel_draw_postscene_additive);
 	qbool shells = (type == aliasmodel_draw_shells || type == aliasmodel_draw_postscene_shells);
-	qbool no_base_instance = !GL_Supported(R_SUPPORT_INSTANCED_RENDERING);
 
 	if (!instr->num_calls || !GLM_CompileAliasModelProgram()) {
 		return;
 	}
 
-	if (!no_base_instance) {
+	if (!GLM_AliasModelsDrawnIndividually()) {
 		buffers.Bind(r_buffer_aliasmodel_drawcall_indirect);
 		extra_offset = buffers.BufferOffset(r_buffer_aliasmodel_drawcall_indirect);
 	}
 
 	R_ProgramUse(r_program_aliasmodel);
 	R_SetAliasModelUniforms(mode);
+	if (R_TextureReferenceIsValid(aliasmodel_pose_texture)) {
+		renderer.TextureUnitBind(TEXTURE_UNIT_POSES, aliasmodel_pose_texture);
+	}
 	// We have prepared the draw calls earlier in the frame so very trival logic here
 	if (r_refdef2.drawCaustics) {
 		renderer.TextureUnitBind(TEXTURE_UNIT_CAUSTICS, underwatertexture);
@@ -552,38 +667,14 @@ static void GLM_RenderPreparedEntities(aliasmodel_draw_type_t type)
 		GLM_StateBeginAliasModelZPassBatch();
 		call_start = 0;
 		for (i = 0; i < instr->num_calls; ++i) {
-			if (no_base_instance) {
-				call_start += GLM_DrawAliasModelsNoBaseInstance(instr, call_start, i);
-			}
-			else {
-				GL_MultiDrawArraysIndirect(
-					GL_TRIANGLES,
-					(const void*)(uintptr_t)(instr->indirect_buffer_offset + extra_offset),
-					instr->num_cmds[i],
-					0
-				);
-			}
+			call_start += GLM_DrawAliasModelCall(instr, call_start, i, extra_offset, false);
 		}
 	}
 
 	GLM_StateBeginAliasModelBatch(translucent, additive);
 	call_start = 0;
 	for (i = 0; i < instr->num_calls; ++i) {
-		if (!shells && instr->num_textures[i]) {
-			renderer.TextureUnitMultiBind(TEXTURE_UNIT_MATERIAL, instr->num_textures[i], instr->bound_textures[i]);
-		}
-
-		if (no_base_instance) {
-			call_start += GLM_DrawAliasModelsNoBaseInstance(instr, call_start, i);
-		}
-		else {
-			GL_MultiDrawArraysIndirect(
-				GL_TRIANGLES,
-				(const void*)(uintptr_t)(instr->indirect_buffer_offset + extra_offset),
-				instr->num_cmds[i],
-				0
-			);
-		}
+		call_start += GLM_DrawAliasModelCall(instr, call_start, i, extra_offset, !shells);
 	}
 
 	if (type == aliasmodel_draw_std && alias_draw_instructions[aliasmodel_draw_outlines_spec].num_calls) {
@@ -596,17 +687,7 @@ static void GLM_RenderPreparedEntities(aliasmodel_draw_type_t type)
 
 		call_start = 0;
 		for (i = 0; i < instr->num_calls; ++i) {
-			if (no_base_instance) {
-				call_start += GLM_DrawAliasModelsNoBaseInstance(instr, call_start, i);
-			}
-			else {
-				GL_MultiDrawArraysIndirect(
-						GL_TRIANGLES,
-						(const void*)(uintptr_t)(instr->indirect_buffer_offset + extra_offset),
-						instr->num_cmds[i],
-						0
-				);
-			}
+			call_start += GLM_DrawAliasModelCall(instr, call_start, i, extra_offset, false);
 		}
 		R_TraceLeaveNamedRegion();
 	}
@@ -621,17 +702,7 @@ static void GLM_RenderPreparedEntities(aliasmodel_draw_type_t type)
 
 		call_start = 0;
 		for (i = 0; i < instr->num_calls; ++i) {
-			if (no_base_instance) {
-				call_start += GLM_DrawAliasModelsNoBaseInstance(instr, call_start, i);
-			}
-			else {
-				GL_MultiDrawArraysIndirect(
-					GL_TRIANGLES,
-					(const void*)(uintptr_t)(instr->indirect_buffer_offset + extra_offset),
-					instr->num_cmds[i],
-					0
-				);
-			}
+			call_start += GLM_DrawAliasModelCall(instr, call_start, i, extra_offset, false);
 		}
 		R_TraceLeaveNamedRegion();
 	}

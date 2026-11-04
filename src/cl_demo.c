@@ -117,9 +117,9 @@ static char tempqwz_name[MAX_PATH] = { 0 };
 
 static vfsfile_t *CL_Open_Demo_File(const char *name, qbool searchpaks, char **fullpath);
 static void OnChange_demo_dir(cvar_t *var, char *string, qbool *cancel);
-cvar_t demo_dir = {"demo_dir", "", 0, OnChange_demo_dir};
+cvar_t demo_dir = {"demo_dir", "", CVAR_NOTFROMSERVER, OnChange_demo_dir};
 cvar_t demo_benchmarkdumps = {"demo_benchmarkdumps", "1"};
-cvar_t cl_startupdemo = {"cl_startupdemo", ""};
+cvar_t cl_startupdemo = {"cl_startupdemo", "", CVAR_NOTFROMSERVER};
 cvar_t demo_jump_rewind = { "demo_jump_rewind", "-10" };
 cvar_t cl_demo_qwd_delta = { "cl_demo_qwd_delta", "1" };
 cvar_t demo_jump_skip_messages = { "demo_jump_skip_messages", "1" };
@@ -409,6 +409,31 @@ static char *TrimModelName (const char *full)
 	return shortn;
 }
 
+/* QWD and MVD startup records must retain extended ambient sound IDs. */
+static void CL_WriteStaticSound(sizebuf_t *msg, const static_sound_t *ss)
+{
+	int i;
+
+	if (ss->sound_num > 255) {
+		MSG_WriteByte(msg, svc_fte_spawnstaticsound2);
+		MSG_WriteByte(msg, STATIC_SOUND_LARGEINDEX);
+	}
+	else {
+		MSG_WriteByte(msg, svc_spawnstaticsound);
+	}
+	for (i = 0; i < 3; ++i) {
+		MSG_WriteCoord(msg, ss->org[i]);
+	}
+	if (ss->sound_num > 255) {
+		MSG_WriteShort(msg, ss->sound_num);
+	}
+	else {
+		MSG_WriteByte(msg, ss->sound_num);
+	}
+	MSG_WriteByte(msg, ss->vol);
+	MSG_WriteByte(msg, ss->atten);
+}
+
 void CL_WriteServerdata (sizebuf_t *msg)
 {
 	int ignore_extensions;
@@ -489,6 +514,85 @@ void CL_WriteServerdata (sizebuf_t *msg)
 	MSG_WriteFloat(msg, cl.entgravity);
 }
 
+/* Adapt the client-owned names to the shared signon/demo chunk encoder. */
+static int CL_WriteSoundListChunk(sizebuf_t *buf, int cursor)
+{
+	char *sounds[MAX_SOUNDS];
+	int count = 0, next;
+
+	while (count + 1 < MAX_SOUNDS && cl.sound_name[count + 1][0]) {
+		++count;
+		sounds[count] = cl.sound_name[count];
+	}
+	if (!MSG_WriteSoundListChunk(buf, sounds, count, cursor, MAX_MSGLEN / 2, &next)) {
+		Host_Error("Unable to write demo soundlist chunk");
+	}
+	return next;
+}
+
+static void CL_WriteDemoStaticEntity(sizebuf_t *buf, const entity_t *ent, int modelindex)
+{
+	int j;
+
+	if (modelindex > 255) {
+		entity_state_t from = { 0 }, to = { 0 };
+		if ((cls.fteprotocolextensions & (FTE_PEXT_SPAWNSTATIC2 | FTE_PEXT_MODELDBL))
+				!= (FTE_PEXT_SPAWNSTATIC2 | FTE_PEXT_MODELDBL))
+			return;
+		to.number = 1;
+		to.modelindex = modelindex;
+		to.frame = ent->frame;
+		to.skinnum = ent->skinnum;
+		VectorCopy(ent->origin, to.origin);
+		VectorCopy(ent->angles, to.angles);
+		MSG_WriteByte(buf, svc_fte_spawnstatic2);
+		MSG_WriteDeltaEntity(&from, &to, buf, true, cls.fteprotocolextensions, cls.mvdprotocolextensions1);
+		return;
+	}
+
+	MSG_WriteByte(buf, svc_spawnstatic);
+	MSG_WriteByte(buf, modelindex);
+	MSG_WriteByte(buf, ent->frame);
+	MSG_WriteByte(buf, 0);
+	MSG_WriteByte(buf, ent->skinnum);
+	for (j = 0; j < 3; j++) {
+		MSG_WriteCoord(buf, ent->origin[j]);
+		MSG_WriteAngle(buf, ent->angles[j]);
+	}
+}
+
+static void CL_WriteDemoBaseline(sizebuf_t *buf, int entity, const entity_state_t *state)
+{
+	int j;
+
+	if ((unsigned)state->modelindex >= MAX_MODELS)
+		return;
+	if (state->modelindex > 255) {
+		entity_state_t from = { 0 }, to;
+		if (!entity)
+			return;
+		if ((cls.fteprotocolextensions & (FTE_PEXT_SPAWNSTATIC2 | FTE_PEXT_MODELDBL))
+				!= (FTE_PEXT_SPAWNSTATIC2 | FTE_PEXT_MODELDBL))
+			return;
+		to = *state;
+		to.number = entity;
+		MSG_WriteByte(buf, svc_fte_spawnbaseline2);
+		MSG_WriteDeltaEntity(&from, &to, buf, true, cls.fteprotocolextensions, cls.mvdprotocolextensions1);
+		return;
+	}
+
+	MSG_WriteByte(buf, svc_spawnbaseline);
+	MSG_WriteShort(buf, entity);
+	MSG_WriteByte(buf, state->modelindex);
+	MSG_WriteByte(buf, state->frame);
+	MSG_WriteByte(buf, state->colormap);
+	MSG_WriteByte(buf, state->skinnum);
+	for (j = 0; j < 3; j++) {
+		MSG_WriteCoord(buf, state->origin[j]);
+		MSG_WriteAngle(buf, state->angles[j]);
+	}
+}
+
 //
 // Write startup data to demo (called when demo started and cls.state == ca_active)
 //
@@ -529,48 +633,12 @@ static void CL_WriteStartupData (void)
 	//
 	// Write the soundlist.
 	//
-	MSG_WriteByte (&buf, svc_soundlist);
-	MSG_WriteByte (&buf, 0);
-
-	// Loop through all sounds and write them to the demo.
 	n = 0;
-	s = cl.sound_name[n + 1];
-	while (*s)
-	{
-		// Write the sound name to the buffer.
-		MSG_WriteString (&buf, s);
-
-		// If the buffer is half full, flush it.
-		if (buf.cursize > MAX_MSGLEN / 2)
-		{
-			// End of the partial sound list.
-			MSG_WriteByte (&buf, 0);
-
-			// Write how many sounds we've listed so far.
-			MSG_WriteByte (&buf, n);
-
-			// Flush the buffer to the demo file and clear the buffer.
-			CL_WriteStartupDemoMessage (&buf, seq++);
-			SZ_Clear (&buf);
-
-			// Start on a new sound list and continue writing the
-			// remaining sounds.
-			MSG_WriteByte (&buf, svc_soundlist);
-			MSG_WriteByte (&buf, n + 1);
-		}
-
-		n++;
-		s = cl.sound_name[n+1];
-	}
-
-	// If the buffer isn't empty flush and clear it.
-	if (buf.cursize)
-	{
-		MSG_WriteByte (&buf, 0);
-		MSG_WriteByte (&buf, 0);
-		CL_WriteStartupDemoMessage (&buf, seq++);
-		SZ_Clear (&buf);
-	}
+	do {
+		n = CL_WriteSoundListChunk(&buf, n);
+		CL_WriteStartupDemoMessage(&buf, seq++);
+		SZ_Clear(&buf);
+	} while (n);
 
 	// Vwep modellist
 	if (cl.vwep_enabled && cl.vw_model_name[0][0]) 
@@ -603,14 +671,14 @@ static void CL_WriteStartupData (void)
 
 	// Loop through the models
 	n = 0;
-	s = cl.model_name[n + 1];
-	while (*s)
+	while (n + 1 < MAX_MODELS && cl.model_name[n + 1][0])
 	{
+		s = cl.model_name[n + 1];
 		// Write the model name to the buffer.
 		MSG_WriteString (&buf, s);
 
 		// If the buffer is half full, flush it.
-		if (buf.cursize	> MAX_MSGLEN / 2)
+		if (buf.cursize	> MAX_MSGLEN / 2 && (n & 0xff))
 		{
 			// End of partial model list.
 			MSG_WriteByte (&buf, 0);
@@ -623,11 +691,15 @@ static void CL_WriteStartupData (void)
 			SZ_Clear (&buf);
 
 			// Start on a new partial model list and continue.
-			MSG_WriteByte (&buf, svc_modellist);
-			MSG_WriteByte (&buf, n + 1);
+			if (n + 1 > 0xff) {
+				MSG_WriteByte (&buf, svc_fte_modellistshort);
+				MSG_WriteShort (&buf, n + 1);
+			} else {
+				MSG_WriteByte (&buf, svc_modellist);
+				MSG_WriteByte (&buf, n + 1);
+			}
 		}
 		n++;
-		s = cl.model_name[n + 1];
 	}
 
 	// Flush the buffer if it's not empty.
@@ -647,9 +719,6 @@ static void CL_WriteStartupData (void)
 		// Get the next static entity.
 		ent = cl_static_entities + i;
 
-		// Write ID for static entities.
-		MSG_WriteByte (&buf, svc_spawnstatic);
-
 		// Find if the model is precached or not.
 		for (j = 1; j < MAX_MODELS; j++)
 		{
@@ -657,23 +726,7 @@ static void CL_WriteStartupData (void)
 				break;
 		}
 
-		// Write if the model is precached.
-		if (j == MAX_MODELS)
-			MSG_WriteByte (&buf, 0);
-		else
-			MSG_WriteByte (&buf, j);
-
-		// Write the entities frame and skin number.
-		MSG_WriteByte (&buf, ent->frame);
-		MSG_WriteByte (&buf, 0);
-		MSG_WriteByte (&buf, ent->skinnum);
-
-		// Write the coordinate and angles.
-		for (j = 0; j < 3; j++)
-		{
-			MSG_WriteCoord (&buf, ent->origin[j]);
-			MSG_WriteAngle (&buf, ent->angles[j]);
-		}
+		CL_WriteDemoStaticEntity(&buf, ent, j == MAX_MODELS ? 0 : j);
 
 		// Flush the buffer if it's half full.
 		if (buf.cursize > MAX_MSGLEN / 2)
@@ -687,12 +740,7 @@ static void CL_WriteStartupData (void)
 	for (i = 0; i < cl.num_static_sounds; i++) 
 	{
 		static_sound_t *ss = &cl.static_sounds[i];
-		MSG_WriteByte (&buf, svc_spawnstaticsound);
-		for (j = 0; j < 3; j++)
-			MSG_WriteCoord (&buf, ss->org[j]);
-		MSG_WriteByte (&buf, ss->sound_num);
-		MSG_WriteByte (&buf, ss->vol);
-		MSG_WriteByte (&buf, ss->atten);
+		CL_WriteStaticSound(&buf, ss);
 
 		if (buf.cursize > MAX_MSGLEN/2) 
 		{
@@ -714,22 +762,7 @@ static void CL_WriteStartupData (void)
 		//
 		if (memcmp(es, &blankes, sizeof(blankes)))
 		{
-			// Write ID.
-			MSG_WriteByte (&buf, svc_spawnbaseline);
-			MSG_WriteShort (&buf, i);
-
-			// Write model info.
-			MSG_WriteByte (&buf, es->modelindex);
-			MSG_WriteByte (&buf, es->frame);
-			MSG_WriteByte (&buf, es->colormap);
-			MSG_WriteByte (&buf, es->skinnum);
-
-			// Write coordinates and angles.
-			for (j = 0; j < 3; j++)
-			{
-				MSG_WriteCoord(&buf, es->origin[j]);
-				MSG_WriteAngle(&buf, es->angles[j]);
-			}
+			CL_WriteDemoBaseline(&buf, i, es);
 
 			// Flush to demo file if buffer is half full.
 			if (buf.cursize > MAX_MSGLEN / 2)
@@ -951,6 +984,14 @@ void CL_WriteMVDStartupData(void)
 	}
 	#endif // PROTOCOL_VERSION_FTE2
 
+	#ifdef PROTOCOL_VERSION_MVD1
+	if (cls.mvdprotocolextensions1)
+	{
+		MSG_WriteLong (&buf, PROTOCOL_VERSION_MVD1);
+		MSG_WriteLong (&buf, cls.mvdprotocolextensions1);
+	}
+	#endif // PROTOCOL_VERSION_MVD1
+
 	MSG_WriteLong (&buf, PROTOCOL_VERSION);
 	MSG_WriteLong (&buf, cl.servercount);
 
@@ -996,34 +1037,12 @@ void CL_WriteMVDStartupData(void)
 	//
 	// Soundlist.
 	//
-	MSG_WriteByte (&buf, svc_soundlist);
-	MSG_WriteByte (&buf, 0);
-
 	n = 0;
-	s = cl.sound_name[n + 1];
-	while (*s)
-	{
-		MSG_WriteString (&buf, s);
-		if (buf.cursize > MAX_MSGLEN/2)
-		{
-			MSG_WriteByte (&buf, 0);
-			MSG_WriteByte (&buf, n);
-			CL_WriteRecordMVDMessage (&buf);
-			SZ_Clear (&buf);
-			MSG_WriteByte (&buf, svc_soundlist);
-			MSG_WriteByte (&buf, n + 1);
-		}
-		n++;
-		s = cl.sound_name[n + 1];
-	}
-
-	if (buf.cursize)
-	{
-		MSG_WriteByte (&buf, 0);
-		MSG_WriteByte (&buf, 0);
-		CL_WriteRecordMVDMessage (&buf);
-		SZ_Clear (&buf);
-	}
+	do {
+		n = CL_WriteSoundListChunk(&buf, n);
+		CL_WriteRecordMVDMessage(&buf);
+		SZ_Clear(&buf);
+	} while (n);
 
 	//
 	// Modellist.
@@ -1032,21 +1051,25 @@ void CL_WriteMVDStartupData(void)
 	MSG_WriteByte (&buf, 0);
 
 	n = 0;
-	s = cl.model_name[n+1];
-	while (*s)
+	while (n + 1 < MAX_MODELS && cl.model_name[n+1][0])
 	{
+		s = cl.model_name[n+1];
 		MSG_WriteString (&buf, s);
-		if (buf.cursize > MAX_MSGLEN/2)
+		if (buf.cursize > MAX_MSGLEN/2 && (n & 0xff))
 		{
 			MSG_WriteByte (&buf, 0);
 			MSG_WriteByte (&buf, n);
 			CL_WriteRecordMVDMessage (&buf);
 			SZ_Clear (&buf);
-			MSG_WriteByte (&buf, svc_modellist);
-			MSG_WriteByte (&buf, n + 1);
+			if (n + 1 > 0xff) {
+				MSG_WriteByte (&buf, svc_fte_modellistshort);
+				MSG_WriteShort (&buf, n + 1);
+			} else {
+				MSG_WriteByte (&buf, svc_modellist);
+				MSG_WriteByte (&buf, n + 1);
+			}
 		}
 		n++;
-		s = cl.model_name[n+1];
 	}
 
 	if (buf.cursize)
@@ -1065,9 +1088,6 @@ void CL_WriteMVDStartupData(void)
 		// Get the next static entity.
 		ent = cl_static_entities + i;
 
-		// Write ID for static entities.
-		MSG_WriteByte (&buf, svc_spawnstatic);
-
 		// Find if the model is precached or not.
 		for (j = 1; j < MAX_MODELS; j++)
 		{
@@ -1075,23 +1095,7 @@ void CL_WriteMVDStartupData(void)
 				break;
 		}
 
-		// Write if the model is precached.
-		if (j == MAX_MODELS)
-			MSG_WriteByte (&buf, 0);
-		else
-			MSG_WriteByte (&buf, j);
-
-		// Write the entities frame and skin number.
-		MSG_WriteByte (&buf, ent->frame);
-		MSG_WriteByte (&buf, 0);
-		MSG_WriteByte (&buf, ent->skinnum);
-
-		// Write the coordinate and angles.
-		for (j = 0; j < 3; j++)
-		{
-			MSG_WriteCoord (&buf, ent->origin[j]);
-			MSG_WriteAngle (&buf, ent->angles[j]);
-		}
+		CL_WriteDemoStaticEntity(&buf, ent, j == MAX_MODELS ? 0 : j);
 
 		// Flush the buffer if it's half full.
 		if (buf.cursize > MAX_MSGLEN / 2)
@@ -1113,15 +1117,7 @@ void CL_WriteMVDStartupData(void)
 	for (i = 0; i < cl.num_static_sounds; i++)
 	{
 		static_sound_t *ss = &cl.static_sounds[i];
-
-		MSG_WriteByte (&buf, svc_spawnstaticsound);
-
-		for (j = 0; j < 3; j++)
-			MSG_WriteCoord (&buf, ss->org[j]);
-
-		MSG_WriteByte (&buf, ss->sound_num);
-		MSG_WriteByte (&buf, ss->vol);
-		MSG_WriteByte (&buf, ss->atten);
+		CL_WriteStaticSound(&buf, ss);
 
 		if (buf.cursize > MAX_MSGLEN/2)
 		{
@@ -1150,22 +1146,7 @@ void CL_WriteMVDStartupData(void)
 		//
 		if (memcmp(es, &blankes, sizeof(blankes)))
 		{
-			// Write ID.
-			MSG_WriteByte (&buf, svc_spawnbaseline);
-			MSG_WriteShort (&buf, i);
-
-			// Write model info.
-			MSG_WriteByte (&buf, es->modelindex);
-			MSG_WriteByte (&buf, es->frame);
-			MSG_WriteByte (&buf, es->colormap);
-			MSG_WriteByte (&buf, es->skinnum);
-
-			// Write coordinates and angles.
-			for (j = 0; j < 3; j++)
-			{
-				MSG_WriteCoord(&buf, es->origin[j]);
-				MSG_WriteAngle(&buf, es->angles[j]);
-			}
+			CL_WriteDemoBaseline(&buf, i, es);
 
 			// Flush to demo file if buffer is half full.
 			if (buf.cursize > MAX_MSGLEN / 2)
@@ -3442,7 +3423,7 @@ void CL_StopPlayback(void)
 			bin_ms[TIMEDEMO_BIN_COUNT - 1] = worst_ms * 10.0;
 
 			for (j = 0; j < TIMEDEMO_BIN_COUNT; ++j) {
-				Con_Printf("  %6.3f%: %4.1fms\n", bin_percentages[j], (bin_ms[j] / 10.0));
+				Con_Printf("  %7.3f%%: %4.1fms\n", bin_percentages[j] * 100.0, (bin_ms[j] / 10.0));
 			}
 		}
 		cls.timedemo = false;
@@ -4692,7 +4673,11 @@ void CL_QTVPlay_f (void)
 	// (QTV proxies can be chained, so we must get the last @)
 	// In other words split stream and host part
 
-	strlcpy(stream_host, connrequest, sizeof(stream_host));
+	// Chain through qtv_proxyaddr unless the address is already chained (has more than one @).
+	if (qtv_proxyaddr.string[0] && strncmp(connrequest, "tcp:", 4) && strchr(connrequest, '@') == strchrrev(connrequest, '@'))
+		snprintf(stream_host, sizeof(stream_host), "tcp:%s@%s", connrequest, qtv_proxyaddr.string);
+	else
+		strlcpy(stream_host, connrequest, sizeof(stream_host));
 
 	connrequest = strchrrev(stream_host, '@');
 	if (connrequest)

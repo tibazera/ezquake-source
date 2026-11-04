@@ -70,6 +70,7 @@ typedef struct
 	double		physicstime;		// last time physics was run
 
 	int			lastcheck;			// used by PF_checkclient
+	byte		*checkpvs;			// map-owned copy for the current checkclient selection
 	double		lastchecktime;			// for monster ai
 
 	qbool		paused;				// are we paused?
@@ -87,9 +88,9 @@ typedef struct
 	unsigned	map_checksum;
 	unsigned	map_checksum2;
 	cmodel_t	*worldmodel;
-	char		*model_precache[MAX_MODELS];	// NULL terminated
-	char		*vw_model_name[MAX_VWEP_MODELS];	// NULL terminated
-	char		*sound_precache[MAX_SOUNDS];	// NULL terminated
+	char		*model_precache[MAX_MODELS];	// may be full; bound scans by MAX_MODELS
+	char		*vw_model_name[MAX_VWEP_MODELS];	// may be full; bound scans by MAX_VWEP_MODELS
+	char		*sound_precache[MAX_SOUNDS];	// may be full; bound scans by MAX_SOUNDS
 	char		*lightstyles[MAX_LIGHTSTYLES];
 	cmodel_t	*models[MAX_MODELS];
 
@@ -710,6 +711,7 @@ typedef struct
 extern	cvar_t	sv_paused; // 1 - normal, 2 - auto (single player), 3 - both
 extern	cvar_t	sv_maxspeed;
 extern	cvar_t	sv_mintic, sv_maxtic, sv_maxfps;
+extern	cvar_t	sv_calcphs;
 extern	cvar_t	sv_antilag, sv_antilag_no_pred, sv_antilag_projectiles;
 
 extern	int current_skill;
@@ -872,6 +874,13 @@ qbool SV_AddToRedirect(char *msg);
 void SV_Multicast(vec3_t origin, int to);
 void SV_MulticastEx(vec3_t origin, int to, const char *cl_reliable_key);
 void SV_StartParticle(vec3_t org, vec3_t dir, int color, int count, int replacement_te, int replacement_count);
+/* Count a dense sound catalog without reading beyond a full precache array. */
+int SV_SoundPrecacheCount(char *const *sounds, int capacity);
+// Resolve a precached ambient sample without reordering the catalog; -1 if missing.
+int SV_AmbientSoundIndex(const char *sample);
+/* Write a complete static sound record using the current coordinate format. */
+void SV_WriteStaticSound(sizebuf_t *msg, const float origin[3], int sound_id,
+                         int volume, int attenuation);
 void SV_StartSound(edict_t *entity, int channel, char *sample, int volume, float attenuation);
 void SV_ClientPrintf(client_t *cl, int level, char *fmt, ...);
 void SV_ClientPrintf2(client_t *cl, int level, char *fmt, ...);
@@ -891,6 +900,8 @@ void SV_FindModelNumbers (void);
 //
 // sv_user.c
 //
+/* Enforce the current map's sound capability before signon and after map load. */
+qbool SV_CheckClientSoundSupport(client_t *client);
 void SV_ExecuteClientMessage (client_t *cl);
 void SV_UserInit (void);
 void SV_TogglePause (const char *msg, int bit);

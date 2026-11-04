@@ -100,26 +100,26 @@ void CL_ParseHiddenDataMessage(void);
 
 static void AuthUsernameChanged(cvar_t* var, char* value, qbool* cancel);
 
-cvar_t	allow_scripts = {"allow_scripts", "2", 0, Rulesets_OnChange_allow_scripts};
-cvar_t	rcon_password = {"rcon_password", ""};
-cvar_t	rcon_address = {"rcon_address", ""};
-cvar_t	cl_crypt_rcon = {"cl_crypt_rcon", "1"};
+cvar_t	allow_scripts = {"allow_scripts", "2", CVAR_NOTFROMSERVER, Rulesets_OnChange_allow_scripts};
+cvar_t	rcon_password = {"rcon_password", "", CVAR_NOTFROMSERVER};
+cvar_t	rcon_address = {"rcon_address", "", CVAR_NOTFROMSERVER};
+cvar_t	cl_crypt_rcon = {"cl_crypt_rcon", "1", CVAR_NOTFROMSERVER};
 
-cvar_t	cl_timeout = {"cl_timeout", "60"};
+cvar_t	cl_timeout = {"cl_timeout", "60", CVAR_NOTFROMSERVER};
 
 cvar_t  cl_ping = { "cl_ping", "0", 0, Rulesets_OnChange_cl_ping };
 cvar_t  cl_ping_dev = { "cl_ping_dev", "0", 0, Rulesets_OnChange_cl_ping };
 
 cvar_t	cl_shownet = {"cl_shownet", "0"};	// can be 0, 1, or 2
 #if defined(PROTOCOL_VERSION_FTE) || defined(PROTOCOL_VERSION_FTE2) || defined(PROTOCOL_VERSION_MVD1)
-cvar_t  cl_pext = {"cl_pext", "1"};					// allow/disallow protocol extensions at all.
+cvar_t  cl_pext = {"cl_pext", "1", CVAR_NOTFROMSERVER};					// allow/disallow protocol extensions at all.
 													// some extensions can be explicitly controlled.
-cvar_t  cl_pext_limits = { "cl_pext_limits", "1" }; // enhanced protocol limits
-cvar_t  cl_pext_other = {"cl_pext_other", "0"};		// extensions which does not have own variables should be controlled by this variable.
-cvar_t  cl_pext_warndemos = { "cl_pext_warndemos", "1" }; // if set, user will be warned when saving demos that are not backwards compatible
-cvar_t  cl_pext_lagteleport = { "cl_pext_lagteleport", "1" }; // server-side adjustment of yaw angle through teleports
+cvar_t  cl_pext_limits = { "cl_pext_limits", "1", CVAR_NOTFROMSERVER }; // enhanced protocol limits
+cvar_t  cl_pext_other = {"cl_pext_other", "0", CVAR_NOTFROMSERVER};		// extensions which does not have own variables should be controlled by this variable.
+cvar_t  cl_pext_warndemos = { "cl_pext_warndemos", "1", CVAR_NOTFROMSERVER }; // if set, user will be warned when saving demos that are not backwards compatible
+cvar_t  cl_pext_lagteleport = { "cl_pext_lagteleport", "1", CVAR_NOTFROMSERVER }; // server-side adjustment of yaw angle through teleports
 #ifdef MVD_PEXT1_SERVERSIDEWEAPON
-cvar_t  cl_pext_serversideweapon = { "cl_pext_serversideweapon", "0", 0, onchange_pext_serversideweapon }; // server-side weapon selection
+cvar_t  cl_pext_serversideweapon = { "cl_pext_serversideweapon", "0", CVAR_NOTFROMSERVER, onchange_pext_serversideweapon }; // server-side weapon selection
 #endif
 #ifdef FTE_PEXT_CSQC
 cvar_t  cl_pext_ezcsqc = { "cl_pext_ezcsqc", "1" }; // native CSQC/EZCSQC weapon and projectile prediction
@@ -127,23 +127,27 @@ cvar_t  cl_ezcsqc_debug = { "cl_ezcsqc_debug", "0" }; // print native CSQC/EZCSQ
 #endif
 #endif
 #ifdef FTE_PEXT_256PACKETENTITIES
-cvar_t	cl_pext_256packetentities = {"cl_pext_256packetentities", "1"};
+cvar_t	cl_pext_256packetentities = {"cl_pext_256packetentities", "1", CVAR_NOTFROMSERVER};
 #endif
 #ifdef FTE_PEXT_CHUNKEDDOWNLOADS
-cvar_t  cl_pext_chunkeddownloads  = {"cl_pext_chunkeddownloads", "1"};
+cvar_t  cl_pext_chunkeddownloads  = {"cl_pext_chunkeddownloads", "1", CVAR_NOTFROMSERVER};
 cvar_t  cl_chunksperframe  = {"cl_chunksperframe", "30"};
 #endif
 
 #ifdef FTE_PEXT_FLOATCOORDS
-cvar_t  cl_pext_floatcoords  = {"cl_pext_floatcoords", "1"};
+cvar_t  cl_pext_floatcoords  = {"cl_pext_floatcoords", "1", CVAR_NOTFROMSERVER};
+#endif
+
+#ifdef FTE_PEXT_SCALE
+cvar_t cl_pext_scale = {"cl_pext_scale", "1", CVAR_NOTFROMSERVER};
 #endif
 
 #ifdef FTE_PEXT_TRANS
-cvar_t cl_pext_alpha = {"cl_pext_alpha", "1"};
+cvar_t cl_pext_alpha = {"cl_pext_alpha", "1", CVAR_NOTFROMSERVER};
 #endif
 
 #ifdef FTE_PEXT_COLOURMOD
-cvar_t cl_pext_colourmod = {"cl_pext_colourmod", "1"};
+cvar_t cl_pext_colourmod = {"cl_pext_colourmod", "1", CVAR_NOTFROMSERVER};
 #endif
 
 #ifdef CLIENTONLY
@@ -167,6 +171,7 @@ cvar_t	cl_solid_players = {"cl_solid_players", "1"};
 cvar_t	cl_predict_half = {"cl_predict_half", "0"};
 cvar_t	cl_predict_scale = {"cl_predict_scale", "1"};
 cvar_t	cl_predict_lerp = {"cl_predict_lerp", "1"};
+cvar_t	cl_predict_lerp_time = {"_cl_predict_lerp_time", "40"};
 cvar_t	cl_debug_remote_prediction_errors = {"cl_debug_remote_prediction_errors", "0"};
 
 cvar_t	hud_fps_min_reset_interval = {"hud_fps_min_reset_interval", "30"};
@@ -194,8 +199,8 @@ cvar_t	cl_chatsound = {"s_chat_custom", "1"};
 cvar_t	cl_confirmquit = {"cl_confirmquit", "0"}; // , CVAR_INIT
 cvar_t	cl_fakename = {"cl_fakename", ""};
 cvar_t	cl_fakename_suffix = {"cl_fakename_suffix", ": "};
-cvar_t	qizmo_dir = {"qizmo_dir", "qizmo"};
-cvar_t	qwdtools_dir = {"qwdtools_dir", "qwdtools"};
+cvar_t	qizmo_dir = {"qizmo_dir", "qizmo", CVAR_NOTFROMSERVER};
+cvar_t	qwdtools_dir = {"qwdtools_dir", "qwdtools", CVAR_NOTFROMSERVER};
 void OnChangeColorForcing (cvar_t *var, char *value, qbool *cancel);
 void OnChangeDemoTeamplay (cvar_t *var, char *value, qbool *cancel);
 cvar_t  cl_demoteamplay = {"cl_demoteamplay", "0", 0, OnChangeDemoTeamplay};	// for NQ demos where we need to say it is teamplay rather than FFA
@@ -208,8 +213,8 @@ cvar_t cl_floodprot			= {"cl_floodprot", "0"};
 cvar_t cl_fp_messages		= {"cl_fp_messages", "4"};
 cvar_t cl_fp_persecond		= {"cl_fp_persecond", "4"};
 cvar_t cl_cmdline			= {"cl_cmdline", "", CVAR_ROM};
-cvar_t cl_useproxy			= {"cl_useproxy", "0"};
-cvar_t cl_proxyaddr         = {"cl_proxyaddr", ""};
+cvar_t cl_useproxy			= {"cl_useproxy", "0", CVAR_NOTFROMSERVER};
+cvar_t cl_proxyaddr         = {"cl_proxyaddr", "", CVAR_NOTFROMSERVER};
 cvar_t cl_window_caption	= {"cl_window_caption", "1"};
 cvar_t cl_window_caption_delimiter = {"cl_window_caption_delimiter", " | "};
 
@@ -249,7 +254,7 @@ cvar_t r_lightmap_lateupload    = {"r_lightmap_lateupload", "0"};
 cvar_t r_lightmap_packbytexture = {"r_lightmap_packbytexture", "2"};
 
 // info mirrors
-cvar_t  password                = {"password", "", CVAR_USERINFO};
+cvar_t  password                = {"password", "", CVAR_USERINFO | CVAR_NOTFROMSERVER};
 cvar_t  spectator               = {"spectator", "", CVAR_USERINFO_NO_CFG_RESET };
 void CL_OnChange_name_validate(cvar_t *var, char *val, qbool *cancel);
 cvar_t  name                    = {"name", "player", CVAR_USERINFO, CL_OnChange_name_validate};
@@ -267,11 +272,11 @@ cvar_t  b_switch                = {"b_switch", "", CVAR_USERINFO};
 cvar_t  railcolor               = {"railcolor", "", CVAR_USERINFO};
 cvar_t  gender                  = {"gender", "", CVAR_USERINFO};
 
-cvar_t  cl_mediaroot            = {"cl_mediaroot", "0"};
+cvar_t  cl_mediaroot            = {"cl_mediaroot", "0", CVAR_NOTFROMSERVER};
 
 cvar_t  msg_filter              = {"msg_filter", "0"};
 
-cvar_t  cl_onload               = {"cl_onload", "menu"};
+cvar_t  cl_onload               = {"cl_onload", "menu", CVAR_NOTFROMSERVER};
 
 #ifdef WIN32
 cvar_t cl_verify_qwprotocol     = {"cl_verify_qwprotocol", "1"};
@@ -280,7 +285,7 @@ cvar_t cl_verify_qwprotocol     = {"cl_verify_qwprotocol", "1"};
 cvar_t demo_autotrack           = {"demo_autotrack", "0"}; // use or not autotrack info from mvd demos
 
 // Authentication
-cvar_t cl_username              = {"cl_username", "", CVAR_QUEUED_TRIGGER, AuthUsernameChanged};
+cvar_t cl_username              = {"cl_username", "", CVAR_QUEUED_TRIGGER | CVAR_NOTFROMSERVER, AuthUsernameChanged};
 static void CL_Authenticate_f(void);
 
 // antilag debugging
@@ -495,6 +500,10 @@ unsigned int CL_SupportedFTEExtensions (void)
 		fteprotextsupported |= FTE_PEXT_FLOATCOORDS;
 #endif
 
+#ifdef FTE_PEXT_SCALE
+	if (cl_pext_scale.value)
+		fteprotextsupported |= FTE_PEXT_SCALE;
+#endif
 #ifdef FTE_PEXT_TRANS
 	if (cl_pext_alpha.value)
 		fteprotextsupported |= FTE_PEXT_TRANS;
@@ -507,6 +516,9 @@ unsigned int CL_SupportedFTEExtensions (void)
 	if (cl_pext_limits.value) {
 #ifdef FTE_PEXT_MODELDBL
 		fteprotextsupported |= FTE_PEXT_MODELDBL;
+#endif
+#ifdef FTE_PEXT_SOUNDDBL
+		fteprotextsupported |= FTE_PEXT_SOUNDDBL;
 #endif
 #ifdef FTE_PEXT_ENTITYDBL
 		fteprotextsupported |= FTE_PEXT_ENTITYDBL;
@@ -1242,16 +1254,20 @@ void CL_DNS_f(void)
 		*s = 0;
 	addr.s_addr = inet_addr(address);
 	
-	if (inet_addr(address) == INADDR_NONE) 
+	if (inet_addr(address) == INADDR_NONE)
 	{
+		struct addrinfo hints = { 0 }, *res;
+
 		// Forward lookup
-		if (!(h = gethostbyname(address))) 
+		hints.ai_family = AF_INET;
+		if (getaddrinfo(address, NULL, &hints, &res) != 0)
 		{
 			Com_Printf("Couldn't resolve %s\n", address);
-		} 
-		else 
+		}
+		else
 		{
-			addr.s_addr = *(int *) h->h_addr_list[0];
+			addr = ((struct sockaddr_in *)res->ai_addr)->sin_addr;
+			freeaddrinfo(res);
 			Com_Printf("Resolved %s to %s\n", address, inet_ntoa(addr));
 		}
 		return;
@@ -1498,7 +1514,10 @@ void CL_Reconnect_f (void)
 		return; // Change map during qtv playback.
 	}
 
-	if (cls.state == ca_connected) 
+	// A second local map change can interrupt signon, including after fresh
+	// serverdata from a late request. Keep the netchan: a full reconnect would
+	// call Host_EndGame and shut down the listen server.
+	if (cls.state == ca_connected || (com_serveractive && cls.state == ca_onserver))
 	{
 		Com_Printf ("reconnecting...\n");
 		MSG_WriteChar (&cls.netchan.message, clc_stringcmd);
@@ -2002,6 +2021,7 @@ static void CL_InitLocal(void)
 	Cvar_Register(&cl_predict_half);
 	Cvar_Register(&cl_predict_scale);
 	Cvar_Register(&cl_predict_lerp);
+	Cvar_Register(&cl_predict_lerp_time);
 	Cvar_Register(&cl_debug_remote_prediction_errors);
 	Cvar_Register(&cl_timeout);
 	Cvar_Register(&cl_useproxy);
@@ -2041,6 +2061,9 @@ static void CL_InitLocal(void)
 	Cvar_Register(&cl_pext_floatcoords);
 #endif
 
+#ifdef FTE_PEXT_SCALE
+	Cvar_Register(&cl_pext_scale);
+#endif
 #ifdef FTE_PEXT_TRANS
 	Cvar_Register(&cl_pext_alpha);
 #endif
@@ -2289,6 +2312,8 @@ void CL_Init (void)
 
 void CL_BeginLocalConnection (void) 
 {
+	int i;
+
 	S_StopAllSounds();
 
 	// make sure we're not connected to an external server,
@@ -2296,7 +2321,15 @@ void CL_BeginLocalConnection (void)
 	if (!com_serveractive)
 		CL_Disconnect ();
 
+	// SV_SpawnServer frees brush models (Host_ClearMemory), so drop them here:
+	// if it fails, CL_Disconnect walks these lists
 	cl.worldmodel = NULL;
+	for (i = 0; i < MAX_MODELS; i++)
+		if (cl.model_precache[i] && cl.model_precache[i]->type == mod_brush)
+			cl.model_precache[i] = NULL;
+	for (i = 0; i < MAX_VWEP_MODELS; i++)
+		if (cl.vw_model_precache[i] && cl.vw_model_precache[i]->type == mod_brush)
+			cl.vw_model_precache[i] = NULL;
 
 	if (cls.state == ca_active)
 		cls.state = ca_connected;
@@ -2334,10 +2367,12 @@ static double CL_MinFrameTime (void)
 		return 0;
 
 	if ((cls.state == ca_disconnected) || (Minimized && !cls.download))
+	{
 		if (cl_maxfps_menu.value >= 30)
 			return 1 / cl_maxfps_menu.value;
 		else
 			return 1 / (r_displayRefresh.autoString ? atoi(r_displayRefresh.autoString) : 30.0);
+	}
 
 	if (cls.demoplayback)
 	{

@@ -43,7 +43,7 @@ void CL_FindModelNumbers (void);
 void TP_NewMap (void);
 void CL_ParseBaseline (entity_state_t *es);
 void CL_ParseStatic (qbool extended);
-void CL_ParseStaticSound (void);
+void CL_ParseStaticSound (unsigned int flags);
 
 #define	NQ_PROTOCOL_VERSION	15
 
@@ -235,7 +235,7 @@ static void NQD_ParseClientdata (int bits)
 	{	// set flash times
 		Sbar_Changed ();
 		for (j=0 ; j<32 ; j++)
-			if ( (i & (1<<j)) && !(cl.stats[STAT_ITEMS] & (1<<j)))
+			if ( (i & (1u<<j)) && !(cl.stats[STAT_ITEMS] & (1u<<j)))
 				cl.item_gettime[j] = cl.time;
 		cl.stats[STAT_ITEMS] = i;
 	}
@@ -540,7 +540,7 @@ static void NQD_ParseServerData(void)
 		if (!str[0]) {
 			break;
 		}
-		if (numsounds == MAX_SOUNDS) {
+		if (numsounds == MAX_SOUNDS_LEGACY) {
 			Host_Error("Server sent too many sound precaches");
 		}
 		strlcpy(cl.sound_name[numsounds], str, sizeof(cl.sound_name[0]));
@@ -548,7 +548,7 @@ static void NQD_ParseServerData(void)
 	}
 
 	// now we try to load everything else until a cache allocation fails
-	cl.clipmodels[1] = CM_LoadMap(cl.model_name[1], true, NULL, &cl.map_checksum2);
+	cl.clipmodels[1] = CM_LoadMap(cl.model_name[1], true, CM_VIS_AUTO, NULL, &cl.map_checksum2);
 	if (!com_serveractive) {
 		Cvar_ForceSet(&host_mapname, mapname);
 	}
@@ -1293,7 +1293,7 @@ static void NQD_ParseServerMessage (void)
 			break;
 
 		case svc_spawnstaticsound:
-			CL_ParseStaticSound ();
+			CL_ParseStaticSound (0);
 			break;
 
 		case svc_cdtrack:

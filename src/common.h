@@ -75,7 +75,8 @@ typedef enum
 #define MAX_MODELS              4096    // can't encode more than this, see SV_WriteDelta
 #define MAX_STATIC_ENTITIES     2048
 #define MAX_VWEP_MODELS         32	    // could be increased to 256
-#define MAX_SOUNDS              256	    // so they cannot be blindly increased
+#define MAX_SOUNDS_LEGACY       256     // byte sound indices, including reserved slot 0
+#define MAX_SOUNDS              4096    // SOUNDDBL sound indices, including reserved slot 0
 
 #define	SAVEGAME_COMMENT_LENGTH 39
 
@@ -134,7 +135,7 @@ typedef enum
 #define	IT_SIGIL1               (1<<28)
 #define	IT_SIGIL2               (1<<29)
 #define	IT_SIGIL3               (1<<30)
-#define	IT_SIGIL4               (1<<31)
+#define	IT_SIGIL4               (1u<<31)
 
 //
 // entity effects
@@ -379,6 +380,9 @@ struct usercmd_s;
 extern struct usercmd_s nullcmd;
 
 void MSG_WriteChar (sizebuf_t *sb, int c);
+/* Shared signon/demo soundlist framing; refuses an undersized chunk atomically. */
+qbool MSG_WriteSoundListChunk(sizebuf_t *msg, char *const *sounds,
+                             int count, int cursor, int limit, int *next);
 void MSG_WriteByte (sizebuf_t *sb, int c);
 void MSG_WriteShort (sizebuf_t *sb, int c);
 void MSG_WriteLong (sizebuf_t *sb, int c);

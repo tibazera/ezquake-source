@@ -144,6 +144,9 @@ typedef struct
 
 	int			flags;			// Dead, gib, etc.
 
+#ifdef FTE_PEXT_SCALE
+	byte		scale;			// 1/50 units, 0 = not sent (unscaled)
+#endif
 #ifdef FTE_PEXT_TRANS
 	byte		alpha;
 #endif
@@ -554,7 +557,7 @@ typedef struct
 	float		qtv_svversion;		///< version of qtvsv/proxy, note it float
 	int			qtv_ezquake_ext;	///< qtv ezquake extensions supported by qtvsv/proxy
 	qbool		qtv_donotbuffer;	///< do not try buffering even if not enough data
-	char        qtv_source[128];    ///< last qtv source sent (so we can re-send with challenge response)
+	char        qtv_source[256];    ///< last qtv source sent (so we can re-send with challenge response)
 
 	/// \brief Tells which players are affected by a demo message.
 	///	- If multiple players are affected (dem_multiple) this will be a

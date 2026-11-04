@@ -556,39 +556,23 @@ PF_ambientsound
 */
 void PF_ambientsound (void)
 {
-	char		**check;
 	char		*samp;
 	float		*pos;
 	float 		vol, attenuation;
-	int			i, soundnum;
+	int			soundnum;
 
 	pos = G_VECTOR (OFS_PARM0);
 	samp = G_STRING(OFS_PARM1);
 	vol = G_FLOAT(OFS_PARM2);
 	attenuation = G_FLOAT(OFS_PARM3);
 
-	// check to see if samp was properly precached
-	for (soundnum=0, check = sv.sound_precache ; *check ; check++, soundnum++)
-		if (!strcmp(*check,samp))
-			break;
-
-	if (!*check)
+	soundnum = SV_AmbientSoundIndex(samp);
+	if (soundnum < 0)
 	{
 		Con_Printf ("no precache: %s\n", samp);
 		return;
 	}
-
-	// add an svc_spawnambient command to the level signon packet
-
-	MSG_WriteByte (&sv.signon,svc_spawnstaticsound);
-	for (i=0 ; i<3 ; i++)
-		MSG_WriteCoord(&sv.signon, pos[i]);
-
-	MSG_WriteByte (&sv.signon, soundnum);
-
-	MSG_WriteByte (&sv.signon, vol*255);
-	MSG_WriteByte (&sv.signon, attenuation*64);
-
+	SV_WriteStaticSound(&sv.signon, pos, soundnum, vol * 255, attenuation * 64);
 }
 
 /*
@@ -694,10 +678,6 @@ void PF_checkpos (void)
 
 //============================================================================
 
-// Unlike Quake's Mod_LeafPVS, CM_LeafPVS returns a pointer to static data
-// uncompressed at load time, so it's safe to store for future use
-static byte	*checkpvs;
-
 int PF_newcheckclient (int check)
 {
 	int		i;
@@ -739,7 +719,7 @@ int PF_newcheckclient (int check)
 
 // get the PVS for the entity
 	VectorAdd (ent->v->origin, ent->v->view_ofs, org);
-	checkpvs = CM_LeafPVS (CM_PointInLeaf(org));
+	memcpy(sv.checkpvs, CM_LeafPVS(CM_PointInLeaf(org)), CM_PVSRowBytes());
 
 	return i;
 }
@@ -786,7 +766,7 @@ static void PF_checkclient (void)
 	self = PROG_TO_EDICT(pr_global_struct->self);
 	VectorAdd (self->v->origin, self->v->view_ofs, vieworg);
 	l = CM_Leafnum(CM_PointInLeaf(vieworg)) - 1;
-	if ( (l<0) || !(checkpvs[l>>3] & (1<<(l&7)) ) )
+	if ( (l<0) || !(sv.checkpvs[l>>3] & (1<<(l&7)) ) )
 	{
 		RETURN_EDICT(sv.edicts);
 		return;
@@ -1189,6 +1169,9 @@ void PF_cvar_set (void)
 		Con_Printf ("PF_cvar_set: variable %s not found\n", var_name);
 		return;
 	}
+
+	if (var->flags & CVAR_NOTFROMSERVER)
+		return;
 
 	Cvar_Set (var, val);
 }

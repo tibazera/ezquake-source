@@ -195,6 +195,25 @@ qbool PlayerCheckPing(void)
 	return true;
 }
 
+/* Reject unsupported network clients before signon or new-map gameplay. */
+qbool SV_CheckClientSoundSupport(client_t *client)
+{
+#ifdef USE_PR2
+	if (client->isBot) {
+		return true;
+	}
+#endif
+	if (SV_SoundPrecacheCount(sv.sound_precache, MAX_SOUNDS) < MAX_SOUNDS_LEGACY
+	    || (client->fteprotocolextensions & FTE_PEXT_SOUNDDBL)) {
+		return true;
+	}
+	SV_ClientPrintf(client, PRINT_HIGH,
+	                "Map %s requires extended sounds (PEXT_SOUNDDBL). "
+	                "Enable the extension or use a supporting client.\n", sv.mapname);
+	SV_DropClient(client);
+	return false;
+}
+
 /*
 ================
 Cmd_New_f
@@ -225,6 +244,10 @@ static void Cmd_New_f (void)
 	{
 		MSG_WriteByte (&sv_client->netchan.message, svc_stufftext);
 		MSG_WriteString (&sv_client->netchan.message, "cmd pext\n");
+		return;
+	}
+
+	if (!SV_CheckClientSoundSupport(sv_client)) {
 		return;
 	}
 
@@ -487,8 +510,7 @@ Cmd_Soundlist_f
 */
 static void Cmd_Soundlist_f (void)
 {
-	char		**s;
-	unsigned	n;
+	int n, count, next;
 
 	if (sv_client->state != cs_connected)
 	{
@@ -506,7 +528,8 @@ static void Cmd_Soundlist_f (void)
 	}
 
 	n = Q_atoi(Cmd_Argv(2));
-	if (n >= MAX_SOUNDS)
+	count = SV_SoundPrecacheCount(sv.sound_precache, MAX_SOUNDS);
+	if (n < 0 || n > count)
 	{
 		SV_ClearReliable (sv_client);
 		SV_ClientPrintf (sv_client, PRINT_HIGH,
@@ -524,20 +547,11 @@ static void Cmd_Soundlist_f (void)
 		SZ_Clear(&sv_client->netchan.message);
 	}
 
-	MSG_WriteByte (&sv_client->netchan.message, svc_soundlist);
-	MSG_WriteByte (&sv_client->netchan.message, n);
-	for (s = sv.sound_precache+1 + n ;
-	        *s && sv_client->netchan.message.cursize < (MAX_MSGLEN/2);
-	        s++, n++)
-		MSG_WriteString (&sv_client->netchan.message, *s);
-
-	MSG_WriteByte (&sv_client->netchan.message, 0);
-
-	// next msg
-	if (*s)
-		MSG_WriteByte (&sv_client->netchan.message, n);
-	else
-		MSG_WriteByte (&sv_client->netchan.message, 0);
+	if (!MSG_WriteSoundListChunk(&sv_client->netchan.message, sv.sound_precache,
+	                            count, n, MAX_MSGLEN / 2, &next)) {
+		SV_ClientPrintf(sv_client, PRINT_HIGH, "Unable to write soundlist chunk\n");
+		SV_DropClient(sv_client);
+	}
 }
 
 static char *TrimModelName (const char *full)
@@ -586,7 +600,13 @@ static void Cmd_Modellist_f (void)
 	}
 
 	n = Q_atoi(Cmd_Argv(2));
-	if (n >= MAX_MODELS) {
+	maxclientsupportedmodels = 256;
+#ifdef FTE_PEXT_MODELDBL
+	if (sv_client->fteprotocolextensions & FTE_PEXT_MODELDBL) {
+		maxclientsupportedmodels = MAX_MODELS;
+	}
+#endif
+	if (n >= maxclientsupportedmodels || n >= MAX_MODELS) {
 		SV_ClearReliable (sv_client);
 		SV_ClientPrintf (sv_client, PRINT_HIGH, "SV_Modellist_f: Invalid modellist index\n");
 		SV_DropClient (sv_client);
@@ -634,20 +654,13 @@ static void Cmd_Modellist_f (void)
 		MSG_WriteByte(&sv_client->netchan.message, n);
 	}
 
-	maxclientsupportedmodels = 256;
-#ifdef FTE_PEXT_MODELDBL
-	if (sv_client->fteprotocolextensions & FTE_PEXT_MODELDBL) {
-		maxclientsupportedmodels = MAX_MODELS;
-	}
-#endif
-
-	s = sv.model_precache + 1 + n;
-	for (i = 1 + n; i < maxclientsupportedmodels && *s && (((i-1)&255) == 0 || sv_client->netchan.message.cursize < (MAX_MSGLEN/2)); i++, s++) {
-		MSG_WriteString (&sv_client->netchan.message, *s);
+	for (i = 1 + n; i < maxclientsupportedmodels && i < MAX_MODELS && sv.model_precache[i]
+			&& (((i-1)&255) == 0 || sv_client->netchan.message.cursize < (MAX_MSGLEN/2)); i++) {
+		MSG_WriteString (&sv_client->netchan.message, sv.model_precache[i]);
 	}
 	n = i - 1;
 
-	if (!s[0] || n == maxclientsupportedmodels - 1) {
+	if (i >= maxclientsupportedmodels || i >= MAX_MODELS || !sv.model_precache[i]) {
 		n = 0;
 	}
 
@@ -954,8 +967,9 @@ static void Cmd_Begin_f (void)
 	unsigned pmodel = 0, emodel = 0;
 	int i;
 
-	if (sv_client->state == cs_spawned)
-		return; // don't begin again
+	if (sv_client->state != cs_connected) {
+		return;
+	}
 
 	// handle the case of a level changing while a client was connecting
 	if (Q_atoi(Cmd_Argv(1)) != svs.spawncount)
@@ -2990,7 +3004,7 @@ void SV_VoiceSendPacket(client_t *client, sizebuf_t *buf)
 
 		if (send)
 		{
-			if (buf->maxsize - buf->cursize < ring->datalen+5)
+			if (buf->maxsize - buf->cursize < ring->datalen+6)
 				break;
 			MSG_WriteByte(buf, svc_fte_voicechat);
 			MSG_WriteByte(buf, ring->sender);

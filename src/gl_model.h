@@ -24,8 +24,10 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include "spritegn.h"
 #include "bspfile.h"
 
-#define VBO_FIELDOFFSET(type, field) (void*)((uintptr_t)&(((type*)0)->field))
-#define VK_VBO_FIELDOFFSET(type, field) (uint32_t)((uintptr_t)&(((type*)0)->field))
+#include <stddef.h>
+
+#define VBO_FIELDOFFSET(type, field) ((void*)(uintptr_t)offsetof(type, field))
+#define VK_VBO_FIELDOFFSET(type, field) ((uint32_t)offsetof(type, field))
 
 /*
 d*_t structures are on-disk representations
@@ -77,6 +79,7 @@ typedef struct texture_s {
 	unsigned int        gl_texture_index;
 	float               gl_texture_scaleS;
 	float               gl_texture_scaleT;
+	int                 gl_material_index;           //number in the model, consecutive for textures in the same array
 
 	int                 index;
 } texture_t;
@@ -153,8 +156,6 @@ typedef struct vbo_model_vert_s {
 	int lightnormalindex;
 	vec3_t normal;
 	int padding2;
-	vec3_t direction;
-	int padding3;
 	float texture_coords[2];
 	unsigned int flags;
 	int padding4;
@@ -206,7 +207,7 @@ typedef struct msurface_s {
 
 	// lighting info
 	int                 dlightframe;
-	int                 dlightbits;
+	unsigned int        dlightbits;
 
 	// This is not an OpenGL texture name, it's the lightmap index
 	int                 lightmaptexturenum;
@@ -340,9 +341,6 @@ typedef struct maliasframedesc_s {
 	float				radius;
 	int					frame;
 	char				name[16];
-	char                groupname[16];
-	int                 groupnumber;
-	int                 nextpose;
 } maliasframedesc_t;
 
 typedef struct maliasgroupframedesc_s {
@@ -543,6 +541,10 @@ typedef struct model_s {
 
 	byte*               visdata;
 	int                 visdata_length;
+	int                 vis_rowbytes;       // aligned width of map-owned visibility scratch
+	byte*               vis_novis;          // all-visible row, including padding
+	byte*               vis_decompressed;   // borrowed until the next row decode
+	byte*               vis_merged;         // separate mask for two-leaf water visibility
 	byte*               lightdata;
 	size_t              lightdatasamplesize;
 
@@ -582,7 +584,6 @@ typedef struct model_s {
 
 //============================================================================
 
-void	Mod_Init (void);
 void	Mod_ClearAll (void);
 model_t *Mod_ForName (const char *name, qbool crash);
 void	*Mod_Extradata (model_t *mod); // handles caching
@@ -626,7 +627,6 @@ extern model_t* cl_custommodels[custom_model_count];
 
 model_t* Mod_CustomModel(custom_model_id_t id, qbool crash);
 
-int Mod_ExpectedNextFrame(model_t* mod, int framenum, int framecount);
 
 // aliasmodels
 #define NUMVERTEXNORMALS    162

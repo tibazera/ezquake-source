@@ -127,6 +127,7 @@ static part_blend_info_t blend_options[NUMBER_OF_BLEND_TYPES] = {
 };
 
 #define MAX_BEAM_TRAIL 10
+#define QMB_SQRT2 1.4143f // rounded up, for culling
 #define TEXTURE_DETAILS(x) (R_UseModernOpenGL() ? x->tex_array : x->texnum),(x->tex_index)
 
 static float sint[7] = {0.000000, 0.781832, 0.974928, 0.433884, -0.433884, -0.974928, -0.781832};
@@ -179,13 +180,57 @@ qbool TraceLineN (vec3_t start, vec3_t end, vec3_t impact, vec3_t normal)
 	if (normal)
 		VectorCopy (trace.plane.normal, normal);
 
-	if (!trace.allsolid)
-		return false;
+	// Hit something, unless the line started inside it
+	return trace.fraction < 1 && !trace.startsolid;
+}
 
-	if (trace.startsolid)
-		return false;
+// Moves a particle that went into a wall back to where it hit it & reflects its velocity
+static qbool QMB_BounceParticle(particle_type_t* pt, particle_t* p, vec3_t oldorg)
+{
+	vec3_t stop, normal;
 
+	if (!TraceLineN(oldorg, p->org, stop, normal)) {
+		return false;
+	}
+
+	VectorCopy(stop, p->org);
+	VectorMA(p->vel, -pt->custom * DotProduct(p->vel, normal), normal, p->vel);
+
+	// The cached contents are for the point inside the wall
+	p->cached_distance = 0;
+	VectorClear(p->cached_movement);
 	return true;
+}
+
+// Particles look up the contents they moved into, and add a segment to their trail,
+// once per physics frame, at the 77 fps of QuakeWorld servers. They did both every
+// frame, which was a physics frame before independent physics, but at thousands of fps
+// the lookups were the most expensive part of particles, and each streak kept hundreds
+// of trail segments alive so a few filled the pool.
+#define QMB_PHYSICS_FPS 77
+
+static qbool qmb_physics_frame;
+
+// Looks up the contents a particle moved into, on physics frames only. Returns whether it
+// looked them up, and sets lastorg to where the particle was at the previous lookup.
+static qbool QMB_ParticleContents(particle_t* p, vec3_t movement, vec3_t lastorg, int* contents)
+{
+	VectorAdd(p->unchecked_movement, movement, p->unchecked_movement);
+	if (!qmb_physics_frame) {
+		return false;
+	}
+
+	VectorSubtract(p->org, p->unchecked_movement, lastorg);
+	*contents = ParticleContents(p, p->unchecked_movement);
+	VectorClear(p->unchecked_movement);
+	return true;
+}
+
+// Adds a segment to a particle's trail, from where the previous segment ended (endorg)
+static void QMB_AddTrailSegment(particle_t* p, float time)
+{
+	VX_ParticleTrail(p->endorg, p->org, p->size, time, p->color);
+	VectorCopy(p->org, p->endorg);
 }
 
 #define ADD_PARTICLE_TEXTURE(_ptex, _texnum, _texindex, _components, _s1, _t1, _s2, _t2)	\
@@ -396,10 +441,10 @@ void QMB_InitParticles(void)
 	}
 	ADD_PARTICLE_TEXTURE(ptex_shockwave, shockwave_texture, 0, 1, 0, 0, 256, 256);
 	ADD_PARTICLE_TEXTURE(ptex_lightning, lightning_texture, 0, 1, 0, 0, 256, 256);
-	ADD_PARTICLE_TEXTURE(ptex_spark, spark_texture, 0, 1, 0, 0, 32, 32);
+	ADD_PARTICLE_TEXTURE(ptex_spark, spark_texture, 0, 1, 0, 0, 256, 256);
 
 	QMB_AddParticleType(p_spark, pd_spark, BLEND_GL_SRC_ALPHA_GL_ONE, ptex_none, 255, -32, 0, pm_bounce, 1.3, 9, &count, "part:spark");
-	QMB_AddParticleType(p_sparkray, pd_sparkray, BLEND_GL_SRC_ALPHA_GL_ONE, ptex_none, 255, -0, 0, pm_nophysics, 0, 9, &count, "part:sparkray");
+	QMB_AddParticleType(p_sparkray, pd_sparkray, BLEND_GL_SRC_ALPHA_GL_ONE, ptex_none, 255, -0, 0, pm_normal, 0, 9, &count, "part:sparkray");
 	QMB_AddParticleType(p_gunblast, pd_spark, BLEND_GL_SRC_ALPHA_GL_ONE, ptex_none, 255, -16, 0, pm_bounce, 1.3, 9, &count, "part:gunblast");
 
 	QMB_AddParticleType(p_fire, pd_billboard, BLEND_GL_SRC_ALPHA_GL_ONE, ptex_generic, 204, 0, -2.95, pm_die, 0, 4, &count, "part:fire");
@@ -555,7 +600,7 @@ __inline static qbool CALCULATE_PARTICLE_BILLBOARD(particle_texture_t* ptex, par
 
 static void QMB_FillParticleVertexBuffer(void)
 {
-	vec3_t billboard[4], velcoord[4];
+	vec3_t billboard[4], velcoord[4], centre;
 	particle_type_t* pt;
 	particle_t* p;
 	int i, j, k;
@@ -582,7 +627,9 @@ static void QMB_FillParticleVertexBuffer(void)
 		switch (pt->drawtype) {
 		case pd_beam:
 			for (p = pt->start; p; p = p->next) {
-				particle_texture_t* ptex = &particle_textures[ptex_lightning];
+				particle_texture_t* ptex = &particle_textures[pt->texture];
+				// Untextured beams (streak trails) are drawn in solid colour
+				int tex_index = (R_TextureReferenceIsValid(ptex->texnum) ? ptex->tex_index : -1);
 				vec3_t right1, right2;
 				float half_t = (ptex->coords[0][1] + ptex->coords[0][3]) * 0.5f;
 				int trail_parts = min(amf_part_traildetail.integer, MAX_BEAM_TRAIL);
@@ -592,6 +639,13 @@ static void QMB_FillParticleVertexBuffer(void)
 				}
 
 				if (particle_time < p->start || particle_time >= p->die) {
+					continue;
+				}
+
+				// The beam runs from org to endorg, and is widest for the last trail part
+				VectorAdd(p->org, p->endorg, centre);
+				VectorScale(centre, 0.5f, centre);
+				if (R_CullSphere(centre, VectorDistance(p->org, p->endorg) * 0.5f + p->size / bound(0.01f, amf_part_trailwidth.value, 1))) {
 					continue;
 				}
 
@@ -609,23 +663,22 @@ static void QMB_FillParticleVertexBuffer(void)
 
 					R_CalcBeamVerts(varray_vertex, p->org, p->endorg, right1, right2, p->size / (l * amf_part_trailwidth.value));
 
-					QMB_BillboardAddVert(vert++, pt, varray_vertex[4], varray_vertex[5], varray_vertex[6], ptex->coords[0][2], ptex->coords[0][3], p->color, ptex->tex_index);
-					QMB_BillboardAddVert(vert++, pt, varray_vertex[8], varray_vertex[9], varray_vertex[10], ptex->coords[0][0], ptex->coords[0][3], p->color, ptex->tex_index);
+					QMB_BillboardAddVert(vert++, pt, varray_vertex[4], varray_vertex[5], varray_vertex[6], ptex->coords[0][2], ptex->coords[0][3], p->color, tex_index);
+					QMB_BillboardAddVert(vert++, pt, varray_vertex[8], varray_vertex[9], varray_vertex[10], ptex->coords[0][0], ptex->coords[0][3], p->color, tex_index);
 
 					// near center
-					QMB_BillboardAddVert(vert++, pt, (varray_vertex[0] + varray_vertex[4]) / 2, (varray_vertex[1] + varray_vertex[5]) / 2, (varray_vertex[2] + varray_vertex[6]) / 2, ptex->coords[0][2], half_t, p->color, ptex->tex_index);
+					QMB_BillboardAddVert(vert++, pt, (varray_vertex[0] + varray_vertex[4]) / 2, (varray_vertex[1] + varray_vertex[5]) / 2, (varray_vertex[2] + varray_vertex[6]) / 2, ptex->coords[0][2], half_t, p->color, tex_index);
 					// far center
-					QMB_BillboardAddVert(vert++, pt, (varray_vertex[8] + varray_vertex[12]) / 2, (varray_vertex[9] + varray_vertex[13]) / 2, (varray_vertex[10] + varray_vertex[14]) / 2, ptex->coords[0][0], half_t, p->color, ptex->tex_index);
+					QMB_BillboardAddVert(vert++, pt, (varray_vertex[8] + varray_vertex[12]) / 2, (varray_vertex[9] + varray_vertex[13]) / 2, (varray_vertex[10] + varray_vertex[14]) / 2, ptex->coords[0][0], half_t, p->color, tex_index);
 
-					QMB_BillboardAddVert(vert++, pt, varray_vertex[0], varray_vertex[1], varray_vertex[2], ptex->coords[0][2], ptex->coords[0][1], p->color, ptex->tex_index);
-					QMB_BillboardAddVert(vert++, pt, varray_vertex[12], varray_vertex[13], varray_vertex[14], ptex->coords[0][0], ptex->coords[0][1], p->color, ptex->tex_index);
+					QMB_BillboardAddVert(vert++, pt, varray_vertex[0], varray_vertex[1], varray_vertex[2], ptex->coords[0][2], ptex->coords[0][1], p->color, tex_index);
+					QMB_BillboardAddVert(vert++, pt, varray_vertex[12], varray_vertex[13], varray_vertex[14], ptex->coords[0][0], ptex->coords[0][1], p->color, tex_index);
 				}
 			}
 			break;
 		case pd_spark:
 		case pd_sparkray:
 			for (p = pt->start; p; p = p->next) {
-				vec3_t neworg;
 				float* point;
 				byte farColor[4];
 				particle_texture_t* ptex = &particle_textures[ptex_none];
@@ -643,10 +696,6 @@ static void QMB_FillParticleVertexBuffer(void)
 				vert = R_Sprite3DAddEntry(pt->billboard_type, pt->verts_per_primitive);
 				if (vert) {
 					vec3_t v;
-
-					if (!TraceLineN(p->endorg, p->org, neworg, NULL)) {
-						VectorCopy(p->org, neworg);
-					}
 
 					point = (pt->drawtype == pd_spark ? p->org : p->endorg);
 					farColor[0] = p->color[0] >> 1;
@@ -666,7 +715,7 @@ static void QMB_FillParticleVertexBuffer(void)
 					else {
 						for (j = 7; j >= 0; j--) {
 							for (k = 0; k < 3; k++) {
-								v[k] = neworg[k] + vright[k] * cost[j % 7] * p->size + vup[k] * sint[j % 7] * p->size;
+								v[k] = p->org[k] + vright[k] * cost[j % 7] * p->size + vup[k] * sint[j % 7] * p->size;
 							}
 							QMB_BillboardAddVert(vert++, pt, v[0], v[1], v[2], ptex->coords[0][0], ptex->coords[0][1], farColor, -1);
 						}
@@ -682,6 +731,15 @@ static void QMB_FillParticleVertexBuffer(void)
 
 				for (p = pt->start; p; p = p->next) {
 					if (particle_time < p->start || particle_time >= p->die) {
+						continue;
+					}
+
+					// The corners are size * (up +- right) from org, with up the length of
+					// vup (1) for billboards and of vel * custom for velocity billboards
+					if (pt->drawtype == pd_billboard && R_CullSphere(p->org, p->size * QMB_SQRT2)) {
+						continue;
+					}
+					else if (pt->drawtype == pd_billboard_vel && R_CullSphere(p->org, p->size * (VectorLength(p->vel) * fabs(pt->custom) + 1))) {
 						continue;
 					}
 
@@ -833,6 +891,12 @@ static void QMB_FillParticleVertexBuffer(void)
 						continue;
 					}
 
+					// Flames rise 4-44 units, drift 3 units to the side & are at most 7 units in size
+					VectorSet(centre, p->org[0], p->org[1], p->org[2] + 24);
+					if (R_CullSphere(centre, 21 + 7 * QMB_SQRT2)) {
+						continue;
+					}
+
 					if (first) {
 						R_Sprite3DInitialiseBatch(pt->billboard_type, pt->state, TEXTURE_DETAILS(ptex), r_primitive_triangle_strip);
 						first = false;
@@ -867,10 +931,9 @@ static void QMB_FillParticleVertexBuffer(void)
 void QMB_ProcessParticle(particle_type_t* pt, particle_t* p)
 {
 	float grav = movevars.gravity / 800.0;
-	vec3_t oldorg, stop, normal, movement;
+	vec3_t oldorg, movement;
 	int contents;
-	float bounce;
-	float lifetime;
+	float lifetime, slowdown;
 
 	p->size += p->growth * cls.frametime;
 
@@ -880,7 +943,9 @@ void QMB_ProcessParticle(particle_type_t* pt, particle_t* p)
 	}
 
 	//VULT PARTICLE
-	lifetime = ((p->die - particle_time) / (p->die - p->start));
+	// Particles spawned while parsing packets start at the new frame's time, but are
+	// processed once before particle time catches up with it
+	lifetime = min(1, (p->die - particle_time) / (p->die - p->start));
 	p->color[3] = p->initial_alpha * lifetime;
 
 	if (p->color[3] <= 0) {
@@ -957,10 +1022,9 @@ void QMB_ProcessParticle(particle_type_t* pt, particle_t* p)
 		case pm_static:
 			break;
 		case pm_normal:
-			VectorCopy(p->org, oldorg);
 			VectorScale(p->vel, cls.frametime, movement);
 			VectorAdd(p->org, movement, p->org);
-			if (ParticleContents(p, movement) == CONTENTS_SOLID) {
+			if (QMB_ParticleContents(p, movement, oldorg, &contents) && contents == CONTENTS_SOLID) {
 				p->hit = 1;
 				VectorCopy(oldorg, p->org);
 				VectorClear(p->vel);
@@ -968,10 +1032,10 @@ void QMB_ProcessParticle(particle_type_t* pt, particle_t* p)
 			break;
 		case pm_float:
 			VectorScale(p->vel, cls.frametime, movement);
-			movement[2] += p->size + 1;
 			VectorAdd(p->org, movement, p->org);
-			contents = ParticleContents(p, movement);
-			if (!ISUNDERWATER(contents)) {
+			// Look up the contents at the top of the bubble
+			p->org[2] += p->size + 1;
+			if (QMB_ParticleContents(p, movement, oldorg, &contents) && !ISUNDERWATER(contents)) {
 				p->die = 0;
 			}
 			p->org[2] -= p->size + 1;
@@ -982,49 +1046,40 @@ void QMB_ProcessParticle(particle_type_t* pt, particle_t* p)
 		case pm_die:
 			VectorScale(p->vel, cls.frametime, movement);
 			VectorAdd(p->org, movement, p->org);
-			if (CONTENTS_SOLID == ParticleContents(p, movement)) {
+			if (QMB_ParticleContents(p, movement, oldorg, &contents) && contents == CONTENTS_SOLID) {
 				p->die = 0;
 			}
 			break;
 		case pm_bounce:
 			if (!gl_bounceparticles.value || p->bounces) {
-				if (pt->id == p_smallspark) {
-					VectorCopy(p->org, p->endorg);
-				}
-
 				VectorScale(p->vel, cls.frametime, movement);
 				VectorAdd(p->org, movement, p->org);
-				if (CONTENTS_SOLID == ParticleContents(p, movement)) {
+				if (QMB_ParticleContents(p, movement, oldorg, &contents) && contents == CONTENTS_SOLID) {
 					p->die = 0;
 				}
 			}
 			else {
-				VectorCopy(p->org, oldorg);
-				if (pt->id == p_smallspark) {
-					VectorCopy(oldorg, p->endorg);
-				}
 				VectorScale(p->vel, cls.frametime, movement);
 				VectorAdd(p->org, movement, p->org);
-				if (CONTENTS_SOLID == ParticleContents(p, movement)) {
-					if (TraceLineN(oldorg, p->org, stop, normal)) {
-						VectorCopy(stop, p->org);
-						bounce = -pt->custom * DotProduct(p->vel, normal);
-						VectorMA(p->vel, bounce, normal, p->vel);
+				if (QMB_ParticleContents(p, movement, oldorg, &contents) && contents == CONTENTS_SOLID) {
+					if (QMB_BounceParticle(pt, p, oldorg)) {
 						p->bounces++;
-						if (pt->id == p_smallspark) {
-							VectorCopy(stop, p->endorg);
-						}
+					}
+					else {
+						// Started inside the wall, nothing to bounce off
+						p->die = 0;
 					}
 				}
+			}
+			if (pt->id == p_smallspark) {
+				VectorMA(p->org, -1.0f / QMB_PHYSICS_FPS, p->vel, p->endorg);
 			}
 			break;
 			//VULT PARTICLES
 		case pm_rain:
-			VectorCopy(p->org, oldorg);
 			VectorScale(p->vel, cls.frametime, movement);
 			VectorAdd(p->org, movement, p->org);
-			contents = ParticleContents(p, movement);
-			if (ISUNDERWATER(contents) || contents == CONTENTS_SOLID) {
+			if (QMB_ParticleContents(p, movement, oldorg, &contents) && (ISUNDERWATER(contents) || contents == CONTENTS_SOLID)) {
 				if (!amf_weather_rain_fast.value || amf_weather_rain_fast.value == 2) {
 					vec3_t rorg;
 					VectorCopy(oldorg, rorg);
@@ -1047,38 +1102,42 @@ void QMB_ProcessParticle(particle_type_t* pt, particle_t* p)
 						}
 					}
 					VectorCopy(rorg, p->org);
-					VX_ParticleTrail(oldorg, p->org, p->size, 0.2, p->color);
+					QMB_AddTrailSegment(p, 0.2);
 				}
 				p->die = 0;
 			}
-			else {
-				VX_ParticleTrail(oldorg, p->org, p->size, 0.2, p->color);
+			else if (qmb_physics_frame) {
+				QMB_AddTrailSegment(p, 0.2);
 			}
 			break;
 			//VULT PARTICLES
 		case pm_streak:
-			VectorCopy(p->org, oldorg);
 			VectorScale(p->vel, cls.frametime, movement);
 			VectorAdd(p->org, movement, p->org);
-			if (CONTENTS_SOLID == ParticleContents(p, movement)) {
-				if (TraceLineN(oldorg, p->org, stop, normal)) {
-					VectorCopy(stop, p->org);
-					bounce = -pt->custom * DotProduct(p->vel, normal);
-					VectorMA(p->vel, bounce, normal, p->vel);
+			if (QMB_ParticleContents(p, movement, oldorg, &contents) && contents == CONTENTS_SOLID) {
+				if (!QMB_BounceParticle(pt, p, oldorg)) {
+					// Started inside the wall, nothing to bounce off
+					p->die = 0;
+					break;
 				}
+				// End the segment where it bounced, so the trail doesn't cut the corner
+				QMB_AddTrailSegment(p, 0.2);
 			}
-			VX_ParticleTrail(oldorg, p->org, p->size, 0.2, p->color);
+			else if (qmb_physics_frame) {
+				QMB_AddTrailSegment(p, 0.2);
+			}
 			if (VectorLength(p->vel) == 0) {
 				p->die = 0;
 			}
 			break;
 		case pm_streakwave:
-			VectorCopy(p->org, oldorg);
 			VectorMA(p->org, cls.frametime, p->vel, p->org);
-			VX_ParticleTrail(oldorg, p->org, p->size, 0.5, p->color);
-			p->vel[0] = 19 * p->vel[0] / 20;
-			p->vel[1] = 19 * p->vel[1] / 20;
-			p->vel[2] = 19 * p->vel[2] / 20;
+			if (qmb_physics_frame) {
+				QMB_AddTrailSegment(p, 0.5);
+			}
+			// Loses 1/20 of its speed per physics frame, at any frame rate
+			slowdown = pow(19.0 / 20, cls.frametime * QMB_PHYSICS_FPS);
+			VectorScale(p->vel, slowdown, p->vel);
 			break;
 		default:
 			assert(!"QMB_UpdateParticles: unexpected pt->move");
@@ -1089,7 +1148,8 @@ void QMB_ProcessParticle(particle_type_t* pt, particle_t* p)
 // TODO: Split up
 static void QMB_UpdateParticles(void)
 {
-	int i;
+	static int trail_segment_tick;
+	int i, tick;
 	particle_type_t *pt;
 	particle_t *p;
 	particle_t **prev;
@@ -1097,6 +1157,11 @@ static void QMB_UpdateParticles(void)
 	if (!qmb_initialized) {
 		return;
 	}
+
+	// Contents and trails are updated whenever particle time passes into a new physics frame
+	tick = (int)(particle_time * QMB_PHYSICS_FPS);
+	qmb_physics_frame = (tick != trail_segment_tick);
+	trail_segment_tick = tick;
 
 	//VULT PARTICLES
 	WeatherEffect();

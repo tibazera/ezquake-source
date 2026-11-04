@@ -28,7 +28,7 @@ extern cvar_t       gl_flashblend;
 extern cvar_t       gl_rl_globe;
 
 // gl_rlight.c
-void R_MarkLights(dlight_t *light, int bit, mnode_t *node);
+void R_MarkLights(dlight_t *light, unsigned int bit, mnode_t *node);
 void R_AnimateLight(void);
 void R_RenderDlights(void);
 void R_LightEntity(entity_t* ent);
@@ -45,7 +45,7 @@ static const float rgb9e5tab[32] = {
 
 extern cvar_t r_dynamic;
 #define R_NoLighting()       (r_dynamic.integer == 0)
-#define R_HardwareLighting() (r_dynamic.integer == 2 && R_UseModernOpenGL())
+#define R_HardwareLighting() (r_dynamic.integer == 2 && R_UseModernOpenGL() && GL_Supported(R_SUPPORT_COMPUTE_SHADERS))
 #define R_SoftwareLighting() (r_dynamic.integer && !R_HardwareLighting())
 
 #endif // EZQUAKE_R_LOCAL_HEADER
