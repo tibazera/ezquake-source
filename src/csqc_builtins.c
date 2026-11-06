@@ -4472,6 +4472,34 @@ static void csqc_remove (void)
 }
 
 /* void(entity e, vector org) setorigin = #2 */
+/*
+ FTE World_LinkEdict parity: .absmin/.absmax = origin + mins/maxs, widened by 1
+ (by 15/15/1 for FL_ITEM). Rotated SOLID_BSP boxes are not rotated here.
+*/
+static void csqc_link_bounds (pr1vm_t *vm, int e)
+{
+	float *o, *mn, *mx, *amn, *amx, *fl;
+	float pad[3] = { 1, 1, 1 };
+	int i;
+	if (!vm || e <= 0)
+		return;
+	o = csqc_ent_ofs (vm, e, CSQC_Client_FieldOfs (vm, CSQC_FLD_ORIGIN));
+	mn = csqc_ent_ofs (vm, e, CSQC_Client_FieldOfs (vm, CSQC_FLD_MINS));
+	mx = csqc_ent_ofs (vm, e, CSQC_Client_FieldOfs (vm, CSQC_FLD_MAXS));
+	amn = csqc_ent_field (vm, e, "absmin");
+	amx = csqc_ent_field (vm, e, "absmax");
+	if (!o || !mn || !mx || !amn || !amx)
+		return;
+	fl = csqc_ent_ofs (vm, e, CSQC_Client_FieldOfs (vm, CSQC_FLD_FLAGS));
+	if (fl && ((int)*fl & 256))	// FL_ITEM
+		pad[0] = pad[1] = 15;
+	for (i = 0; i < 3; i++)
+	{
+		amn[i] = o[i] + mn[i] - pad[i];
+		amx[i] = o[i] + mx[i] + pad[i];
+	}
+}
+
 static void csqc_setorigin (void)
 {
 	pr1vm_t *vm = CSQCVM_Active ();
@@ -4485,6 +4513,7 @@ static void csqc_setorigin (void)
 		return;
 	o = &vm->globals[OFS_PARM0 + 3];
 	f[0] = o[0]; f[1] = o[1]; f[2] = o[2];
+	csqc_link_bounds (vm, e);
 }
 
 /*
@@ -4518,6 +4547,7 @@ static void csqc_model_bbox (pr1vm_t *vm, int e, model_t *model)
 		if (fmx) { fmx[0] = fmx[1] = fmx[2] = 0; }
 		if (fsz) { fsz[0] = fsz[1] = fsz[2] = 0; }
 	}
+	csqc_link_bounds (vm, e);
 }
 
 /* void(entity e, string m) setmodel = #3 */
@@ -4569,14 +4599,16 @@ static void csqc_setmodelindex (void)
 	// Resolve the sign-split index space -> .model + bbox. An unresolved index (0) ->
 	// .model is left untouched (FTE early-return parity). idx > 0 = server model,
 	// idx < 0 = csqc-only slot.
+	// FTE csqc_setmodel writes .model from the precache name even when the model
+	// is not loaded yet (e.g. a late server precache); only the bbox needs it.
+	name = (idx != 0) ? CSQC_Client_ModelNameForIndex (idx) : NULL;
+	slot = csqc_ent_slot (vm, e);
+	ofs = CSQC_Client_FieldOfs (vm, CSQC_FLD_MODEL);
+	if (ofs >= 0 && slot && name && name[0])
+		PR1VM_ClientSetString (vm, (string_t *)&slot[ofs], (char *)name);
 	model = (idx != 0) ? CSQC_Client_ModelForIndex (idx) : NULL;
 	if (!model)
 		return;
-	name = CSQC_Client_ModelNameForIndex (idx);
-	slot = csqc_ent_slot (vm, e);
-	ofs = CSQC_Client_FieldOfs (vm, CSQC_FLD_MODEL);
-	if (ofs >= 0 && slot && name)
-		PR1VM_ClientSetString (vm, (string_t *)&slot[ofs], (char *)name);
 	csqc_model_bbox (vm, e, model);
 }
 
@@ -4605,6 +4637,7 @@ static void csqc_setsize (void)
 		fsz[1] = mx[1] - mn[1];
 		fsz[2] = mx[2] - mn[2];
 	}
+	csqc_link_bounds (vm, e);
 }
 
 /* entity(entity e) nextent = #47 - module arena (network ones are not "used") */
