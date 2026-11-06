@@ -3846,6 +3846,13 @@ static void csqc_calltimeofday (void)
 	vm->globals[OFS_PARM3] = (float)ltm->tm_mday;
 	vm->globals[OFS_PARM4] = (float)(ltm->tm_mon + 1);
 	vm->globals[OFS_PARM5] = (float)(ltm->tm_year + 1900);
+	{
+		// FTE PF_calltimeofday also passes the date string in PARM6
+		// (COM_TimeOfDay: "%a %b %d, %H:%M:%S %Y").
+		char date[128];
+		strftime (date, sizeof (date), "%a %b %d, %H:%M:%S %Y", ltm);
+		PR1VM_ClientSetString (vm, (string_t *)&vm->globals[OFS_PARM6], date);
+	}
 	PR1VM_ExecuteProgram (vm, (func_t)(f - vm->functions));
 }
 
@@ -5803,8 +5810,14 @@ static void csqc_deltalisten (void)
 		return;
 	model = CSQC_Client_GetString (vm, *(int *)&vm->globals[OFS_PARM0]);
 	func = *(int *)&vm->globals[OFS_PARM1];
+	// FTE PF_DeltaListen: a bad function index is reported and ignored; it does
+	// not unregister the existing listener (func 0 still means "remove").
 	if (func < 0 || func >= vm->progs->numfunctions)
-		func = 0;	// invalid pointer - removal/no-op
+	{
+		Con_Printf ("deltalisten: bad function index\n");
+		vm->globals[OFS_RETURN] = 0;
+		return;
+	}
 	CSQC_Client_DeltaListen (model, func, (int)vm->globals[OFS_PARM2]);
 	vm->globals[OFS_RETURN] = 0;
 }
