@@ -2563,12 +2563,33 @@ static void csqc_getplayerkeyvalue (void)
 		return;
 	pnum = (int)vm->globals[OFS_PARM0];
 	key = CSQCVM_Str (OFS_PARM1);
+	// FTE PF_cs_getplayerkeystring: a negative index -n is the n-th player in the
+	// frag-sorted scoreboard (spectators included, no team sort).
+	if (pnum < 0)
+	{
+		int sorted[MAX_CLIENTS], n = 0, i, j, t;
+		for (i = 0; i < MAX_CLIENTS; i++)
+			if (cl.players[i].name[0])
+				sorted[n++] = i;
+		for (i = 0; i < n; i++)
+			for (j = i + 1; j < n; j++)
+				if (cl.players[sorted[j]].frags > cl.players[sorted[i]].frags)
+					t = sorted[i], sorted[i] = sorted[j], sorted[j] = t;
+		pnum = (pnum >= -n) ? sorted[-(pnum + 1)] : -1;
+	}
 	if (pnum < 0 || pnum >= MAX_CLIENTS || !key || !key[0])
 	{
 		CSQCVM_SetRetStr ("");
 		return;
 	}
 	pi = &cl.players[pnum];
+	// FTE answers "viewentity" before the empty-slot check (DP compat).
+	if (!strcmp (key, "viewentity"))
+	{
+		snprintf (buf, sizeof (buf), "%d", pnum + 1);
+		CSQCVM_SetRetStr (buf);
+		return;
+	}
 	if (!pi->name[0])
 	{
 		CSQCVM_SetRetStr ("");	// empty slot - no player
