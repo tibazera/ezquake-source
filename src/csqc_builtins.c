@@ -1267,10 +1267,19 @@ static void csqc_precache_pic (void)
 	if (!vm)
 		return;
 	name = CSQCVM_Str (OFS_PARM0);
-	if (name && CSQC_Client_PrecachePic (name))
-		CSQCVM_SetRetStr (name);
-	else
+	// FTE PF_CL_precache_pic returns the name even when the pic is not loaded
+	// (it may load or download later); only PRECACHE_PIC_TEST (512) asks for ""
+	// on failure.
+	if (!name)
+	{
 		CSQCVM_SetRetStr ("");
+		return;
+	}
+	if (!CSQC_Client_PrecachePic (name) && vm->argc > 1
+		&& ((int)vm->globals[OFS_PARM1] & 512))
+		CSQCVM_SetRetStr ("");
+	else
+		CSQCVM_SetRetStr (name);
 }
 
 /*
@@ -5645,18 +5654,25 @@ static void csqc_findkeysforcommand (void)
 	pr1vm_t *vm = CSQCVM_Active ();
 	char *cmd = CSQCVM_Str (OFS_PARM0);
 	char buf[512];
-	int i, o = 0;
+	int i, n = 0, o = 0;
 	if (!vm)
 		return;
 	buf[0] = 0;
+	// FTE PF_cl_findkeysforcommand: at most 16 keys, and always at least two
+	// entries, padded with '-1' (callers test argv(0)/argv(1) against -1).
 	if (cmd && cmd[0])
 	{
-		for (i = 0; i < UNKNOWN + 256 && o < (int)sizeof (buf) - 8; i++)
+		for (i = 0; i < UNKNOWN + 256 && n < 16 && o < (int)sizeof (buf) - 16; i++)
 		{
 			if (keybindings[i] && !strcmp (keybindings[i], cmd))
+			{
 				o += snprintf (buf + o, sizeof (buf) - o, " '%d'", CSQC_Client_KeynumToQC (i));
+				n++;
+			}
 		}
 	}
+	for (; n < 2; n++)
+		o += snprintf (buf + o, sizeof (buf) - o, " '-1'");
 	CSQCVM_SetRetStr (buf);
 }
 
