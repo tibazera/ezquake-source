@@ -251,7 +251,9 @@ void CSQC_Client_SetCursorMode (qbool usecursor, const char *image,
 	float hotspot_x, float hotspot_y, float scale);
 qbool CSQC_Client_CSQCCursor (void);		// usecursor=1 && module loaded && in game
 void CSQC_Client_DrawCursor (void);			// draw the module cursor (SCR_DrawCursor)
-void CSQC_Client_GetCursorPos (float *x, float *y);	// pointer position (#344)
+void CSQC_Client_GetCursorPos (float *x, float *y);
+void CSQC_Client_AccumMouseDelta (float dx, float dy);
+void CSQC_Client_TakeMouseDelta (float *dx, float *dy);	// pointer position (#344)
 void CSQC_Client_ScaleCursorDelta (float *x, float *y);	// render-2D -> vid.conwidth (mouse delta)
 void CSQC_Client_SetSensitivityScale (float scale);	// #346 setsensitivityscaler
 float CSQC_Client_SensitivityScale (void);	// sensitivity multiplier (1 when inactive)

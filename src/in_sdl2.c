@@ -145,11 +145,17 @@ void IN_MouseMove (usercmd_t *cmd)
 		// CSQC_Client_Update). Only when the module is in focus, key_dest == key_game
 		// (console/menu are not sent, as for keys). Handled -> not applied to
 		// look/strafe.
+		if (key_dest == key_game && !CSQC_Client_CSQCCursor ())
+		{
+			float dx = mx, dy = my;
+			// Deltas are in vid.conwidth units, while mx/my are in render-2D.
+			CSQC_Client_ScaleCursorDelta (&dx, &dy);
+			CSQC_Client_AccumMouseDelta (dx, dy);	// #344 getmousepos (relative mode)
+		}
 		if (key_dest == key_game && CSQC_Client_HasInputEvent ()
 			&& !CSQC_Client_CSQCCursor ())
 		{
 			float dx = mx, dy = my;
-			// Deltas are in vid.conwidth units, while mx/my are in render-2D.
 			CSQC_Client_ScaleCursorDelta (&dx, &dy);
 			if (CSQC_Client_InputEvent (IE_MOUSEDELTA, dx, dy, 0))
 			{

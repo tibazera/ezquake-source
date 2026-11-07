@@ -1301,12 +1301,32 @@ void CSQC_Client_SetCursorMode (qbool usecursor, const char *image,
 	// mechanics do not hand the mouse to the OS cursor (vid_sdl2.c), and
 	// SCR_DrawCursor draws the module's cursor.
 	s_cursormode.usecursor = usecursor;
+	// FTE PF_cl_setcursormode: the image/hotspot/scale change only when an image
+	// argument is passed (image == NULL keeps the previous cursor).
+	if (!image)
+		return;
 	s_cursormode.cursorimage[0] = 0;
-	if (image)
-		strlcpy (s_cursormode.cursorimage, image, sizeof (s_cursormode.cursorimage));
+	strlcpy (s_cursormode.cursorimage, image, sizeof (s_cursormode.cursorimage));
 	s_cursormode.hotspot[0] = hotspot_x;
 	s_cursormode.hotspot[1] = hotspot_y;
 	s_cursormode.scale = scale;
+}
+
+// Relative mouse motion since the last getmousepos (FTE mousemove_x/y), in
+// vid.conwidth units; read and reset by #344 when the cursor is not absolute.
+static float s_mousemove[2];
+
+void CSQC_Client_AccumMouseDelta (float dx, float dy)
+{
+	s_mousemove[0] += dx;
+	s_mousemove[1] += dy;
+}
+
+void CSQC_Client_TakeMouseDelta (float *dx, float *dy)
+{
+	*dx = s_mousemove[0];
+	*dy = s_mousemove[1];
+	s_mousemove[0] = s_mousemove[1] = 0;
 }
 
 qbool CSQC_Client_CSQCCursor (void)

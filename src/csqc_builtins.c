@@ -2642,8 +2642,7 @@ static void csqc_setcursormode (void)
 /*
  vector() getmousepos = #344
  Position of the CSQC cursor in ezquake 2D overlay coordinates (GetCursorPos); z = 0.
- FTE: with an absolute cursor - position, otherwise deltas with reset. Deviation:
- always the position (the module is in absolute mode).
+ FTE: with an absolute cursor - position, otherwise deltas since the last call.
 */
 static void csqc_getmousepos (void)
 {
@@ -2651,7 +2650,12 @@ static void csqc_getmousepos (void)
 	float x = 0, y = 0;
 	if (!vm)
 		return;
-	CSQC_Client_GetCursorPos (&x, &y);
+	// FTE PF_cl_getmousepos: the cursor position in setcursormode(1), otherwise the
+	// relative motion since the previous call (and reset it).
+	if (CSQC_Client_CSQCCursor ())
+		CSQC_Client_GetCursorPos (&x, &y);
+	else
+		CSQC_Client_TakeMouseDelta (&x, &y);
 	vm->globals[OFS_RETURN] = x;
 	vm->globals[OFS_RETURN + 1] = y;
 	vm->globals[OFS_RETURN + 2] = 0;
