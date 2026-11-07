@@ -139,6 +139,7 @@ void CSQC_Client_GetListener (float *origin, float *forward, float *right, float
 // in V_CalcRefdef (cl_view.c). Returns whether the property was recognized (1/0).
 qbool CSQC_Client_SetViewProperty (int prop, int argc, const float *args);
 void CSQC_Client_ApplyViewProps (void);
+void CSQC_Client_SnapshotEngineView (void);
 void CSQC_Client_ResetViewProps (void);	// #300 clearscene: reset view properties
 // Gates the engine sbar/HUD (#303 VF_DRAWENGINESBAR) and crosshair
 // (VF_DRAWCROSSHAIR) behind the CSQC takeover; clearscene defaults both to false.

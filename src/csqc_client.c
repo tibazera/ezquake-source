@@ -3181,6 +3181,19 @@ static void CSQC_Client_ViewReset (void)
 
 // #300 clearscene: FTE resets the view properties (the module calls clearscene every
 // CSQC_UpdateView; without the reset the #303 override would "stick" between frames).
+// Engine camera computed by V_CalcRefdef this frame, before the module's
+// VF_ORIGIN/VF_ANGLES override was applied (see cl_view.c). clearscene restores it,
+// like FTE clearscene re-running V_CalcRefdef (review S63).
+static vec3_t s_engine_vieworg, s_engine_viewangles;
+static qbool s_engine_view_valid;
+
+void CSQC_Client_SnapshotEngineView (void)
+{
+	VectorCopy (r_refdef.vieworg, s_engine_vieworg);
+	VectorCopy (r_refdef.viewangles, s_engine_viewangles);
+	s_engine_view_valid = true;
+}
+
 void CSQC_Client_ResetViewProps (void)
 {
 	// FTE clearscene (PF_R_ClearScene -> V_ClearRefdef + V_CalcRefdef) restores the
@@ -3192,6 +3205,13 @@ void CSQC_Client_ResetViewProps (void)
 	// scr_fullupdate) that we avoid in the common (no-override) case.
 	qbool had_vrect = s_vp_vrect_set;
 	qbool had_fov = s_vp_fovx_set || s_vp_fovy_set;
+	if (s_engine_view_valid)
+	{
+		if (s_vp_origin_set)
+			VectorCopy (s_engine_vieworg, r_refdef.vieworg);
+		if (s_vp_angles_set)
+			VectorCopy (s_engine_viewangles, r_refdef.viewangles);
+	}
 	CSQC_Client_ViewPropsReset ();
 	if (had_vrect || had_fov)
 		SCR_CalcRefdef ();
