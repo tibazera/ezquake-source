@@ -17,6 +17,8 @@
 #include <ctype.h>
 #include <math.h>
 #include <string.h>
+#include <stdint.h>
+#include <inttypes.h>
 #ifndef _WIN32
 #include <strings.h>
 #endif
@@ -214,7 +216,7 @@ static const char *s_secret_classes[] = {
  cvars (cl_timeout, cl_pext*, allow_scripts, ...) stay readable, unlike the
  CVAR_NOTFROMSERVER write-guard (which covers a wider set).
 */
-static qbool CSQC_CvarReadDenied (const char *name)
+qbool CSQC_CvarReadDenied (const char *name)
 {
 	static const char *denied[] = {
 		"rcon_password", "rcon_address", "password", "pq_password",
@@ -257,7 +259,9 @@ static void csqc_cvar (void)
 	pr1vm_t *vm = CSQCVM_Active ();
 	char *name = CSQCVM_Str (OFS_PARM0);
 	// #45 read-guard: a denied (rcon/password) name yields 0, like FTE CVAR_NOUNSAFEEXPAND.
-	vm->globals[OFS_RETURN] = (vm && name && name[0] && !CSQC_CvarReadDenied (name)) ? Cvar_Value (name) : 0;
+	if (!vm)
+		return;
+	vm->globals[OFS_RETURN] = (name && name[0] && !CSQC_CvarReadDenied (name)) ? Cvar_Value (name) : 0;
 }
 
 /*
@@ -804,8 +808,10 @@ static void csqc_getproperty (void)
 	prop = vm->globals[OFS_PARM0];
 	r = &vm->globals[OFS_RETURN];
 	r[0] = r[1] = r[2] = 0;
-	if (cls.state != ca_active)
-		return;
+	// No connection-state gate (FTE PF_cs_getproperty has none): every property
+	// reads plain vid/glConfig/r_refdef/cl globals, and CSQC_Init runs before
+	// cls.state reaches ca_active, so a module caching VF_SCREENVSIZE there
+	// would otherwise get 0x0.
 
 	switch ((int)prop)
 	{
@@ -1267,10 +1273,19 @@ static void csqc_precache_pic (void)
 	if (!vm)
 		return;
 	name = CSQCVM_Str (OFS_PARM0);
-	if (name && CSQC_Client_PrecachePic (name))
-		CSQCVM_SetRetStr (name);
-	else
+	// FTE PF_CL_precache_pic returns the name even when the pic is not loaded
+	// (it may load or download later); only PRECACHE_PIC_TEST (512) asks for ""
+	// on failure.
+	if (!name)
+	{
 		CSQCVM_SetRetStr ("");
+		return;
+	}
+	if (!CSQC_Client_PrecachePic (name) && vm->argc > 1
+		&& ((int)vm->globals[OFS_PARM1] & 512))
+		CSQCVM_SetRetStr ("");
+	else
+		CSQCVM_SetRetStr (name);
 }
 
 /*
@@ -1408,6 +1423,18 @@ static char *csqc_sprintf_put_int (char *f, int v)
 	while (n > 0)
 		*f++ = tmp[--n];
 	return f;
+}
+
+// Float -> int64 without UB: NaN -> 0, out-of-range values saturate.
+static int64_t csqc_sprintf_ftoi64 (float v)
+{
+	if (v != v)
+		return 0;
+	if (v >= 9.2233720368547758e18f)
+		return INT64_MAX;
+	if (v <= -9.2233720368547758e18f)
+		return INT64_MIN;
+	return (int64_t)v;
 }
 
 static void csqc_sprintf (void)
@@ -1575,31 +1602,53 @@ static void csqc_sprintf (void)
 			{
 			case 'd':
 			case 'i':
-				*f++ = 'd';
-				*f = 0;
+				// FTE formats float-domain integers as int64; (int) would be UB out of range.
 				if (isfloat)
-					snprintf (tmp, sizeof (tmp), formatbuf, (int)fv);
+				{
+					strcpy (f, PRId64);
+					snprintf (tmp, sizeof (tmp), formatbuf, csqc_sprintf_ftoi64 (fv));
+				}
 				else
+				{
+					*f++ = 'd';
+					*f = 0;
 					snprintf (tmp, sizeof (tmp), formatbuf, iv);
+				}
 				pn++;
 				break;
 			case 'u':
-				*f++ = 'u';
-				*f = 0;
-				snprintf (tmp, sizeof (tmp), formatbuf, isfloat ? (unsigned)(int)fv : (unsigned)iv);
+				if (isfloat)
+				{
+					strcpy (f, PRIu64);
+					snprintf (tmp, sizeof (tmp), formatbuf, (uint64_t)csqc_sprintf_ftoi64 (fv));
+				}
+				else
+				{
+					*f++ = 'u';
+					*f = 0;
+					snprintf (tmp, sizeof (tmp), formatbuf, (unsigned)iv);
+				}
 				pn++;
 				break;
 			case 'x':
 			case 'X':
-				*f++ = conv;
-				*f = 0;
-				snprintf (tmp, sizeof (tmp), formatbuf, isfloat ? (unsigned)(int)fv : (unsigned)iv);
+				if (isfloat)
+				{
+					strcpy (f, conv == 'x' ? PRIx64 : PRIX64);
+					snprintf (tmp, sizeof (tmp), formatbuf, (uint64_t)csqc_sprintf_ftoi64 (fv));
+				}
+				else
+				{
+					*f++ = conv;
+					*f = 0;
+					snprintf (tmp, sizeof (tmp), formatbuf, (unsigned)iv);
+				}
 				pn++;
 				break;
 			case 'c':
 				*f++ = 'c';
 				*f = 0;
-				snprintf (tmp, sizeof (tmp), formatbuf, isfloat ? (int)fv : iv);
+				snprintf (tmp, sizeof (tmp), formatbuf, isfloat ? (int)csqc_sprintf_ftoi64 (fv) : iv);
 				pn++;
 				break;
 			case 'f':
@@ -1998,6 +2047,23 @@ static void csqc_serverkey (void)
 }
 
 /*
+ float(string key, optional float assumevalue) serverkeyfloat = #0:serverkeyfloat
+ FTE's numeric counterpart to #354 serverkey. Keep the optional fallback so a
+ module cannot mistake a missing serverinfo key for a real zero value.
+*/
+static void csqc_serverkeyfloat (void)
+{
+	pr1vm_t *vm = CSQCVM_Active ();
+	char *key = CSQCVM_Str (OFS_PARM0);
+	const char *value;
+	if (!vm)
+		return;
+	value = Info_ValueForKey (cl.serverinfo, key ? key : "");
+	vm->globals[OFS_RETURN] = *value ? (float)strtod (value, NULL) :
+		(vm->argc >= 2 ? vm->globals[OFS_PARM1] : 0);
+}
+
+/*
  string(float playernum, string keyname) getplayerkeyvalue = #348
  Player scoreboard/userinfo values (cl.players[pnum]). Numeric keys
  frags/ping/userid/spectator - via formatting; name/team/topcolor/bottomcolor and
@@ -2023,8 +2089,8 @@ static void csqc_setsensitivityscaler (void)
  Fills the input_* globals from the sent usercmd history. seq is a mirror of
  cls.netchan.outgoing_sequence; valid range (servercommandframe, clientcommandframe]
  (the engine does not check the range), with a paused guard. Returns 0 if seq is
- outside the history ring (64) or paused. clientcommandframe is the last sent seq,
- so #345(clientcommandframe) returns the live pending frame outside CSQC_Input_Frame.
+ outside the sent-history ring (64) or paused. The frame equal to
+ clientcommandframe is still pending and may not have a history entry yet.
 */
 static void csqc_getinputstate (void)
 {
@@ -2258,6 +2324,23 @@ static const csqc_peffect_t s_peffects[] = {
 };
 #define CSQC_NPEFFECTS	((int)(sizeof (s_peffects) / sizeof (s_peffects[0])))
 
+// Standard Quake trail effects (FTE/DP TR_* names), drawn through the engine's
+// own R_ParticleTrail so classic/QMB particle settings apply. Handles follow the
+// colour effects: CSQC_NPEFFECTS + 1 + index.
+typedef struct { const char *name; trail_type_t type; } csqc_ptrail_t;
+static const csqc_ptrail_t s_ptrails[] = {
+	{ "TR_ROCKET",		ROCKET_TRAIL },
+	{ "TR_GRENADE",		GRENADE_TRAIL },
+	{ "TR_ALTROCKET",	ALT_ROCKET_TRAIL },
+	{ "TR_BLOOD",		BLOOD_TRAIL },
+	{ "TR_SLIGHTBLOOD",	BIG_BLOOD_TRAIL },	// same slot order as r_rockettrail 4/5
+	{ "TR_WIZSPIKE",	TRACER1_TRAIL },
+	{ "TR_KNIGHTSPIKE",	TRACER2_TRAIL },
+	{ "TR_VORESPIKE",	VOOR_TRAIL },
+	{ "TE_RAILTRAIL",	RAIL_TRAIL },
+};
+#define CSQC_NPTRAILS	((int)(sizeof (s_ptrails) / sizeof (s_ptrails[0])))
+
 // float(string effectname) particleeffectnum = #335
 static void csqc_particleeffectnum (void)
 {
@@ -2271,6 +2354,12 @@ static void csqc_particleeffectnum (void)
 		if (!strcmp (name, s_peffects[i].name))
 		{
 			vm->globals[OFS_RETURN] = i + 1;
+			return;
+		}
+	for (i = 0; name && i < CSQC_NPTRAILS; i++)
+		if (!strcasecmp (name, s_ptrails[i].name))
+		{
+			vm->globals[OFS_RETURN] = CSQC_NPEFFECTS + 1 + i;
 			return;
 		}
 	// FTE PF_cs_particleeffectnum (pr_csqc.c:3762-3775) returns -i for a client-only/
@@ -2297,6 +2386,15 @@ static void csqc_trailparticles (void)
 	if (!vm)
 		return;
 	g = vm->globals;
+	i = (int)g[OFS_PARM0] - (CSQC_NPEFFECTS + 1);
+	if (i >= 0 && i < CSQC_NPTRAILS)
+	{
+		vec3_t start, end;
+		VectorCopy (&g[OFS_PARM0 + 6], start);
+		VectorCopy (&g[OFS_PARM0 + 9], end);
+		R_ParticleTrail (start, end, s_ptrails[i].type);
+		return;
+	}
 	e = csqc_peffect_byhandle ((int)g[OFS_PARM0]);
 	if (!e)
 		return;
@@ -2388,7 +2486,7 @@ static void csqc_te_bloodshower (void)
 	vel[1] = 0;
 	vel[2] = -g[OFS_PARM0 + 6];	// FTE parity (pr_csqc.c:5069-5077): explosionspeed (PARM2), not a fixed -100
 	csqc_te_bbox_effect (&g[OFS_PARM0], &g[OFS_PARM0 + 3], vel,
-		bound (1, (int)g[OFS_PARM0 + 7], 4096), 73);
+		bound (1, (int)g[OFS_PARM0 + 9], 4096), 73);
 }
 // #407 te_explosionrgb
 static void csqc_te_explosionrgb (void)
@@ -2563,12 +2661,33 @@ static void csqc_getplayerkeyvalue (void)
 		return;
 	pnum = (int)vm->globals[OFS_PARM0];
 	key = CSQCVM_Str (OFS_PARM1);
+	// FTE PF_cs_getplayerkeystring: a negative index -n is the n-th player in the
+	// frag-sorted scoreboard (spectators included, no team sort).
+	if (pnum < 0)
+	{
+		int sorted[MAX_CLIENTS], n = 0, i, j, t;
+		for (i = 0; i < MAX_CLIENTS; i++)
+			if (cl.players[i].name[0])
+				sorted[n++] = i;
+		for (i = 0; i < n; i++)
+			for (j = i + 1; j < n; j++)
+				if (cl.players[sorted[j]].frags > cl.players[sorted[i]].frags)
+					t = sorted[i], sorted[i] = sorted[j], sorted[j] = t;
+		pnum = (pnum >= -n) ? sorted[-(pnum + 1)] : -1;
+	}
 	if (pnum < 0 || pnum >= MAX_CLIENTS || !key || !key[0])
 	{
 		CSQCVM_SetRetStr ("");
 		return;
 	}
 	pi = &cl.players[pnum];
+	// FTE answers "viewentity" before the empty-slot check (DP compat).
+	if (!strcmp (key, "viewentity"))
+	{
+		snprintf (buf, sizeof (buf), "%d", pnum + 1);
+		CSQCVM_SetRetStr (buf);
+		return;
+	}
 	if (!pi->name[0])
 	{
 		CSQCVM_SetRetStr ("");	// empty slot - no player
@@ -2616,6 +2735,24 @@ static void csqc_getplayerkeyvalue (void)
 }
 
 /*
+ float(float playernum, string keyname, optional float assumevalue) getplayerkeyfloat = #0:getplayerkeyfloat
+ FTE's numeric counterpart to #348 getplayerkeyvalue: the same keys, parsed as a
+ number, or assumevalue when the key is missing or empty.
+*/
+static void csqc_getplayerkeyfloat (void)
+{
+	pr1vm_t *vm = CSQCVM_Active ();
+	float assume;
+	const char *v;
+	if (!vm)
+		return;
+	assume = vm->argc >= 3 ? vm->globals[OFS_PARM2] : 0;
+	csqc_getplayerkeyvalue ();
+	v = CSQCVM_Str (OFS_RETURN);
+	vm->globals[OFS_RETURN] = (v && *v) ? (float)strtod (v, NULL) : assume;
+}
+
+/*
  void(float usecursor, optional string cursorimage, optional vector hotspot,
       optional float scale) setcursormode = #343
  FTE: releases/grabs the mouse and configures the cursor. ezquake: full implementation
@@ -2642,8 +2779,7 @@ static void csqc_setcursormode (void)
 /*
  vector() getmousepos = #344
  Position of the CSQC cursor in ezquake 2D overlay coordinates (GetCursorPos); z = 0.
- FTE: with an absolute cursor - position, otherwise deltas with reset. Deviation:
- always the position (the module is in absolute mode).
+ FTE: with an absolute cursor - position, otherwise deltas since the last call.
 */
 static void csqc_getmousepos (void)
 {
@@ -2651,7 +2787,12 @@ static void csqc_getmousepos (void)
 	float x = 0, y = 0;
 	if (!vm)
 		return;
-	CSQC_Client_GetCursorPos (&x, &y);
+	// FTE PF_cl_getmousepos: the cursor position in setcursormode(1), otherwise the
+	// relative motion since the previous call (and reset it).
+	if (CSQC_Client_CSQCCursor ())
+		CSQC_Client_GetCursorPos (&x, &y);
+	else
+		CSQC_Client_TakeMouseDelta (&x, &y);
 	vm->globals[OFS_RETURN] = x;
 	vm->globals[OFS_RETURN + 1] = y;
 	vm->globals[OFS_RETURN + 2] = 0;
@@ -2805,10 +2946,16 @@ static void csqc_bitshift (void)
 		return;
 	mask = (int)vm->globals[OFS_PARM0];
 	shift = (int)vm->globals[OFS_PARM1];
-	if (shift < 0)
+	// Shifts of 32 or more, and a left shift of a negative int, are UB in C; shift
+	// as unsigned and give 0 past the width (an arithmetic right shift keeps the sign).
+	if (shift <= -32)
+		mask = (mask < 0) ? -1 : 0;
+	else if (shift < 0)
 		mask >>= -shift;
+	else if (shift >= 32)
+		mask = 0;
 	else
-		mask <<= shift;
+		mask = (int)((unsigned int)mask << shift);
 	vm->globals[OFS_RETURN] = mask;
 }
 
@@ -3163,7 +3310,7 @@ static void csqc_strncmp (void)
 		aofs = alen;
 	if (bofs < 0 || (bofs && bofs > blen))
 		bofs = blen;
-	vm->globals[OFS_RETURN] = strncmp (a + aofs, b, len);
+	vm->globals[OFS_RETURN] = strncmp (a + aofs, b + bofs, len);
 }
 
 /*
@@ -3387,7 +3534,7 @@ static void csqc_strreplace (void)
 	replacelen = strlen (replace);
 	if (searchlen)
 	{
-		while (*sub && result < buf + sizeof (buf) - replacelen - 2)
+		while (*sub && (size_t)(result - buf) + replacelen + 2 < sizeof (buf))
 		{
 			if (!strncmp (sub, search, searchlen))
 			{
@@ -3419,7 +3566,7 @@ static void csqc_strireplace (void)
 	replacelen = strlen (replace);
 	if (searchlen)
 	{
-		while (*sub && result < buf + sizeof (buf) - replacelen - 2)
+		while (*sub && (size_t)(result - buf) + replacelen + 2 < sizeof (buf))
 		{
 			if (!strncasecmp (sub, search, searchlen))
 			{
@@ -3577,9 +3724,9 @@ static void csqc_registercvar (void)
  DP_TE_STANDARDEFFECTBUILTINS, FTE_TE_STANDARDEFFECTBUILTINS.
  Deliberately NOT advertised (no entry in the map below, regardless of whether the
  members are implemented): FRIK_FILE, FTE_QC_INTCONV, _DP_TE_FLAMEJET/
- _DP_TE_PLASMABURN, DP_QC_STRINGBUFFERS, DP_QC_FS_SEARCH(_PACKFILE),
- DP_QC_GETSURFACE, DP_QC_FINDCHAIN(FLOAT)/FINDFLAGS/FINDCHAINFLAGS,
- DP_QC_COPYENTITY, DP_QC_WHICHPACK, DP_QC_URI_ESCAPE, KRIMZON_SV_PARSECLIENTCOMMAND.
+ _DP_TE_PLASMABURN, DP_QC_STRINGBUFFERS (strbuf semantics still differ from
+ FTE), DP_QC_FS_SEARCH(_PACKFILE), DP_QC_GETSURFACE, DP_QC_WHICHPACK,
+ DP_QC_URI_ESCAPE, KRIMZON_SV_PARSECLIENTCOMMAND.
 */
 struct csqc_ext_map_s
 {
@@ -3622,6 +3769,12 @@ static const int csqc_ext_te_smallflash[] = { 416 };
 static const int csqc_ext_te_customflash[] = { 417 };
 static const int csqc_ext_te_quadeffects[] = { 412, 413, 414, 415 };
 static const int csqc_ext_digest_sha1[] = { 639 };
+static const int csqc_ext_copyentity[] = { 400 };
+static const int csqc_ext_findchain[] = { 402 };
+static const int csqc_ext_findchainfloat[] = { 403 };
+static const int csqc_ext_findflags[] = { 449 };
+static const int csqc_ext_findchainflags[] = { 450 };
+static const int csqc_ext_checkcommand[] = { 294 };
 // FTE_STRINGS (fteqw pr_bgcmd.c:8513-8514): all 17 members are real (non-stub)
 // after #118/#119 are implemented, so the name moves out of the exceptions list
 // into the implementation-derived map.
@@ -3634,6 +3787,12 @@ static const int csqc_ext_strings[] = {
 
 static const struct csqc_ext_map_s csqc_ext_map[] =
 {
+	{ "DP_QC_COPYENTITY", csqc_ext_copyentity, CSQC_COUNTOF (csqc_ext_copyentity) },
+	{ "DP_QC_FINDCHAIN", csqc_ext_findchain, CSQC_COUNTOF (csqc_ext_findchain) },
+	{ "DP_QC_FINDCHAINFLOAT", csqc_ext_findchainfloat, CSQC_COUNTOF (csqc_ext_findchainfloat) },
+	{ "DP_QC_FINDFLAGS", csqc_ext_findflags, CSQC_COUNTOF (csqc_ext_findflags) },
+	{ "DP_QC_FINDCHAINFLAGS", csqc_ext_findchainflags, CSQC_COUNTOF (csqc_ext_findchainflags) },
+	{ "FTE_QC_CHECKCOMMAND", csqc_ext_checkcommand, CSQC_COUNTOF (csqc_ext_checkcommand) },
 	{ "DP_QC_SINCOSSQRTPOW", csqc_ext_sincossqrtpow, CSQC_COUNTOF (csqc_ext_sincossqrtpow) },
 	{ "DP_QC_MINMAXBOUND", csqc_ext_minmaxbound, CSQC_COUNTOF (csqc_ext_minmaxbound) },
 	{ "DP_QC_RANDOMVEC", csqc_ext_randomvec, CSQC_COUNTOF (csqc_ext_randomvec) },
@@ -3706,7 +3865,8 @@ static void csqc_checkextension (void)
 	vm->globals[OFS_RETURN] = 0;
 	if (!ext)
 		return;
-	if (!strcmp (ext, "EXT_CSQC"))		// protocol, not builtins
+	// protocol, not builtins; FTE gates EXT_CSQC_SHARED on the same bit (pr_bgcmd.c:8369)
+	if (!strcmp (ext, "EXT_CSQC") || !strcmp (ext, "EXT_CSQC_SHARED"))
 	{
 		vm->globals[OFS_RETURN] = (cls.fteprotocolextensions & FTE_PEXT_CSQC) ? 1 : 0;
 		return;
@@ -3786,6 +3946,8 @@ static const struct
 {
 	{ "checkbuiltin", CSQC_BUILTIN_CHECKBUILTIN },
 	{ "argc", CSQC_BUILTIN_ARGC },
+	{ "serverkeyfloat", CSQC_BUILTIN_SERVERKEYFLOAT },
+	{ "getplayerkeyfloat", CSQC_BUILTIN_GETPLAYERKEYFLOAT },
 	{ NULL, 0 }
 };
 
@@ -3846,6 +4008,13 @@ static void csqc_calltimeofday (void)
 	vm->globals[OFS_PARM3] = (float)ltm->tm_mday;
 	vm->globals[OFS_PARM4] = (float)(ltm->tm_mon + 1);
 	vm->globals[OFS_PARM5] = (float)(ltm->tm_year + 1900);
+	{
+		// FTE PF_calltimeofday also passes the date string in PARM6
+		// (COM_TimeOfDay: "%a %b %d, %H:%M:%S %Y").
+		char date[128];
+		strftime (date, sizeof (date), "%a %b %d, %H:%M:%S %Y", ltm);
+		PR1VM_ClientSetString (vm, (string_t *)&vm->globals[OFS_PARM6], date);
+	}
 	PR1VM_ExecuteProgram (vm, (func_t)(f - vm->functions));
 }
 
@@ -4069,25 +4238,75 @@ static void csqc_breakpoint (void)
 }
 
 /*
+ S_PrecacheSound for module-supplied names. S_FindName Sys_Errors (quits the
+ client) once known_sfx (MAX_SFX) is full, so every module sound path goes through
+ the distinct-name cap (CSQC_Client_AllowModuleSound) and, as a backstop, refuses a
+ new name when no room is left for the server's own MAX_SOUNDS (the cap alone does
+ not guarantee that: module + server + engine sounds can still exceed MAX_SFX).
+*/
+static sfx_t *csqc_precache_sfx (char *name)
+{
+	if (!name || !name[0])
+		return NULL;
+	if (!CSQC_Client_AllowModuleSound (name) || !S_SfxSlotAvailable (name))
+	{
+		Con_DPrintf ("CSQC: no room to precache sound %s\n", name);
+		return NULL;
+	}
+	return S_PrecacheSound (name);
+}
+
+/*
  void(entity e, float chan, string samp, float vol, float atten) sound = #8
- Deviation: no positional sound at the entity (no origin field without the arena);
- precache + local playback like #177 (volume vol).
+ Played on the entity's channel through S_StartSound, so a new sound replaces
+ the previous one on that channel like engine sounds do. A networked entity uses
+ its .entnum. A csqc-only entity played with ATTN_NONE (e.g. a predicted view
+ model) uses the local player at the view origin, so its channels match the
+ engine's own weapon sounds. Any other csqc-only entity is positional like FTE
+ PF_cs_sound: its .origin, with its own (negative) sound entity -slot, so it
+ falls off with distance and replaces only its own channel.
 */
 static void csqc_sound (void)
 {
 	pr1vm_t *vm = CSQCVM_Active ();
 	char *n = CSQCVM_Str (OFS_PARM2);
-	float vol = 1;
-	if (!vm)
+	int e, chan, num = 0;
+	float vol = 1, atten = 1, *f;	// 1 = ATTN_NORM
+	sfx_t *sfx;
+	vec3_t org;
+
+	if (!vm || !n || !n[0])
 		return;
 	if (vm->argc > 3)
-		vol = vm->globals[OFS_PARM0 + 9];
-	if (n && n[0])
+		vol = vm->globals[OFS_PARM3];
+	if (vm->argc > 4)
+		atten = vm->globals[OFS_PARM4];
+	if (vol <= 0 || !(sfx = csqc_precache_sfx (n)))
+		return;
+	chan = (int)vm->globals[OFS_PARM1];
+	e = csqc_ent_of (vm, OFS_PARM0);
+	if (e > 0 && (f = csqc_ent_field (vm, e, "entnum")))
+		num = (int)f[0];
+	if (num > 0)
 	{
-		S_PrecacheSound (n);
-		if (vol > 0)
-			S_LocalSoundWithVol (n, vol);
+		f = csqc_ent_ofs (vm, e, CSQC_Client_FieldOfs (vm, CSQC_FLD_ORIGIN));
+		if (f)
+			VectorCopy (f, org);
+		else
+			VectorCopy (r_refdef.vieworg, org);
 	}
+	else if (e > 0 && atten > 0
+		&& (f = csqc_ent_ofs (vm, e, CSQC_Client_FieldOfs (vm, CSQC_FLD_ORIGIN))))
+	{
+		num = -e;	// FTE: S_StartSound(-entity->entnum, ...); never a network number
+		VectorCopy (f, org);
+	}
+	else
+	{
+		num = cl.playernum + 1;
+		VectorCopy (r_refdef.vieworg, org);
+	}
+	S_StartSound (num, chan, sfx, org, bound (0, vol, 1), atten);
 }
 
 /*
@@ -4101,7 +4320,7 @@ static void csqc_precache_sound (void)
 	char *n = CSQCVM_Str (OFS_PARM0);
 	if (vm && n && n[0])
 	{
-		S_PrecacheSound (n);
+		csqc_precache_sfx (n);
 		// FTE parity: queue the missing sound (`sound/<name>`); the shared helper
 		// owns the single-slot guard, the dl_single type and the in-flight marker.
 		// `*` = sexed sound (not downloadable). The distinct-name cap keeps
@@ -4204,7 +4423,7 @@ static void csqc_ambientsound (void)
 		vol = vm->globals[OFS_PARM0 + 6];
 	if (n && n[0])
 	{
-		S_PrecacheSound (n);
+		csqc_precache_sfx (n);
 		if (vol > 0)
 			S_LocalSoundWithVol (n, vol);
 	}
@@ -4303,6 +4522,7 @@ static void csqc_add_one_entity (int e, qbool run_predraw)
 	model_t *model;
 	int ofs;
 	int playernum = -1;	// network player index (colormap 1..MAX_CLIENTS)
+	qbool viewmodel = false;	// CSQCRF_VIEWMODEL: view-relative, never culled
 
 	if (!vm || e <= 0 || !CSQC_Client_EntUsed (e))
 		return;
@@ -4391,6 +4611,17 @@ static void csqc_add_one_entity (int e, qbool run_predraw)
 			ent.framelerp = -1;
 		}
 	}
+	else if ((f = csqc_ent_ofs (vm, e, CSQC_Client_FieldOfs (vm, CSQC_FLD_LERPFRAC))) && f[0] > 0)
+	{
+		// FTE .frame2/.lerpfrac: lerpfrac is the weight of frame2, ezq framelerp
+		// the progress from oldframe to frame.
+		float *f2 = csqc_ent_ofs (vm, e, CSQC_Client_FieldOfs (vm, CSQC_FLD_FRAME2));
+		if (f2)
+		{
+			ent.oldframe = (int)f2[0];
+			ent.framelerp = 1 - bound (0, f[0], 1);
+		}
+	}
 	// cl_deadbodyFilter for CSQC-owned players. The engine player filter
 	// (CL_LinkPlayers) is skipped for owned players, so apply the same semantics
 	// here. TF exception for mode 3 (!cl.teamfortress) mirrors the engine.
@@ -4426,7 +4657,33 @@ static void csqc_add_one_entity (int e, qbool run_predraw)
 	{
 		int rflags = (int)f[0];
 		if (rflags & 1)		// CSQCRF_VIEWMODEL
+		{
+			// FTE draws it relative to the view (x forward, y left, z up). Place it
+			// from the engine's own gun pose, which already carries bob,
+			// r_viewmodeloffset and the fov fudge (V_AddViewWeapon).
+			centity_t *gun = CL_WeaponModelForView ();
+			vec3_t fwd, right, up, o, base;
+
+			VectorCopy (ent.origin, o);
+			AngleVectors (r_refdef.viewangles, fwd, right, up);
+			if (gun && gun->current.modelindex)
+			{
+				VectorCopy (gun->current.origin, base);
+				VectorAdd (ent.angles, gun->current.angles, ent.angles);
+			}
+			else
+			{
+				VectorCopy (r_refdef.vieworg, base);
+				ent.angles[PITCH] -= r_refdef.viewangles[PITCH];
+				ent.angles[YAW] += r_refdef.viewangles[YAW];
+				ent.angles[ROLL] += r_refdef.viewangles[ROLL];
+			}
+			VectorMA (base, o[0], fwd, ent.origin);
+			VectorMA (ent.origin, -o[1], right, ent.origin);
+			VectorMA (ent.origin, o[2], up, ent.origin);
 			ent.renderfx |= RF_WEAPONMODEL;
+			viewmodel = true;
+		}
 		if (rflags & 32)	// CSQCRF_NOSHADOW
 			ent.renderfx |= RF_NOSHADOW;
 		if (rflags & 8)		// CSQCRF_ADDITIVE
@@ -4435,8 +4692,9 @@ static void csqc_add_one_entity (int e, qbool run_predraw)
 
 	// PVS/leaf + bbox culling, FTE EdictInFatPVS parity.
 	// R_CSQC_BeginCull marks the leaves/frustum for this frame (once per frame).
+	// A view model is always visible (FTE pvscache.num_leafs = -1).
 	R_CSQC_BeginCull ();
-	if (!R_CSQC_EntityVisible (&ent))
+	if (!viewmodel && !R_CSQC_EntityVisible (&ent))
 		return;
 
 	CL_AddEntity (&ent);
@@ -4457,9 +4715,15 @@ static void csqc_addentity (void)
 static void csqc_spawn (void)
 {
 	pr1vm_t *vm = CSQCVM_Active ();
+	int slot;
 	if (!vm)
 		return;
-	csqc_ret_entity (vm, CSQC_Client_EntAlloc (vm));
+	slot = CSQC_Client_EntAlloc (vm);
+	// FTE ED_Alloc errors when the pool is full. Returning world would make the
+	// module write its new entity's fields into edict 0 (S82).
+	if (!slot)
+		PR_RunError ("spawn: no free edicts");
+	csqc_ret_entity (vm, slot);
 }
 
 /* void(entity e) remove = #15 */
@@ -4472,6 +4736,34 @@ static void csqc_remove (void)
 }
 
 /* void(entity e, vector org) setorigin = #2 */
+/*
+ FTE World_LinkEdict parity: .absmin/.absmax = origin + mins/maxs, widened by 1
+ (by 15/15/1 for FL_ITEM). Rotated SOLID_BSP boxes are not rotated here.
+*/
+static void csqc_link_bounds (pr1vm_t *vm, int e)
+{
+	float *o, *mn, *mx, *amn, *amx, *fl;
+	float pad[3] = { 1, 1, 1 };
+	int i;
+	if (!vm || e <= 0)
+		return;
+	o = csqc_ent_ofs (vm, e, CSQC_Client_FieldOfs (vm, CSQC_FLD_ORIGIN));
+	mn = csqc_ent_ofs (vm, e, CSQC_Client_FieldOfs (vm, CSQC_FLD_MINS));
+	mx = csqc_ent_ofs (vm, e, CSQC_Client_FieldOfs (vm, CSQC_FLD_MAXS));
+	amn = csqc_ent_field (vm, e, "absmin");
+	amx = csqc_ent_field (vm, e, "absmax");
+	if (!o || !mn || !mx || !amn || !amx)
+		return;
+	fl = csqc_ent_ofs (vm, e, CSQC_Client_FieldOfs (vm, CSQC_FLD_FLAGS));
+	if (fl && ((int)*fl & 256))	// FL_ITEM
+		pad[0] = pad[1] = 15;
+	for (i = 0; i < 3; i++)
+	{
+		amn[i] = o[i] + mn[i] - pad[i];
+		amx[i] = o[i] + mx[i] + pad[i];
+	}
+}
+
 static void csqc_setorigin (void)
 {
 	pr1vm_t *vm = CSQCVM_Active ();
@@ -4485,6 +4777,7 @@ static void csqc_setorigin (void)
 		return;
 	o = &vm->globals[OFS_PARM0 + 3];
 	f[0] = o[0]; f[1] = o[1]; f[2] = o[2];
+	csqc_link_bounds (vm, e);
 }
 
 /*
@@ -4518,6 +4811,7 @@ static void csqc_model_bbox (pr1vm_t *vm, int e, model_t *model)
 		if (fmx) { fmx[0] = fmx[1] = fmx[2] = 0; }
 		if (fsz) { fsz[0] = fsz[1] = fsz[2] = 0; }
 	}
+	csqc_link_bounds (vm, e);
 }
 
 /* void(entity e, string m) setmodel = #3 */
@@ -4569,14 +4863,16 @@ static void csqc_setmodelindex (void)
 	// Resolve the sign-split index space -> .model + bbox. An unresolved index (0) ->
 	// .model is left untouched (FTE early-return parity). idx > 0 = server model,
 	// idx < 0 = csqc-only slot.
+	// FTE csqc_setmodel writes .model from the precache name even when the model
+	// is not loaded yet (e.g. a late server precache); only the bbox needs it.
+	name = (idx != 0) ? CSQC_Client_ModelNameForIndex (idx) : NULL;
+	slot = csqc_ent_slot (vm, e);
+	ofs = CSQC_Client_FieldOfs (vm, CSQC_FLD_MODEL);
+	if (ofs >= 0 && slot && name && name[0])
+		PR1VM_ClientSetString (vm, (string_t *)&slot[ofs], (char *)name);
 	model = (idx != 0) ? CSQC_Client_ModelForIndex (idx) : NULL;
 	if (!model)
 		return;
-	name = CSQC_Client_ModelNameForIndex (idx);
-	slot = csqc_ent_slot (vm, e);
-	ofs = CSQC_Client_FieldOfs (vm, CSQC_FLD_MODEL);
-	if (ofs >= 0 && slot && name)
-		PR1VM_ClientSetString (vm, (string_t *)&slot[ofs], (char *)name);
 	csqc_model_bbox (vm, e, model);
 }
 
@@ -4605,6 +4901,7 @@ static void csqc_setsize (void)
 		fsz[1] = mx[1] - mn[1];
 		fsz[2] = mx[2] - mn[2];
 	}
+	csqc_link_bounds (vm, e);
 }
 
 /* entity(entity e) nextent = #47 - module arena (network ones are not "used") */
@@ -4906,8 +5203,56 @@ static void csqc_changeyaw (void)
 }
 
 /* void(entity e) makestatic = #69 - no-op (client does not track static ents) */
+extern entity_t cl_static_entities[MAX_STATIC_ENTITIES];
+
+/*
+ void(entity e) makestatic = #69 (review S28)
+ FTE PF_cs_makestatic: copy the entity into the engine's static list and remove
+ it. Same list and fill as svc_spawnstatic (CL_ParseStatic), so the renderer
+ draws it and a map change clears it. Removing frees the CSQC slot, which
+ otherwise leaked until spawn() ran out of slots.
+*/
+static float csqc_ent_float (pr1vm_t *vm, int e, int fld, float dflt)
+{
+	float *f = csqc_ent_ofs (vm, e, CSQC_Client_FieldOfs (vm, fld));
+	return f ? f[0] : dflt;
+}
+
 static void csqc_makestatic (void)
 {
+	pr1vm_t *vm = CSQCVM_Active ();
+	struct model_s *model;
+	entity_t *ent;
+	float *v, scale, alpha;
+	int e;
+
+	if (!vm)
+		return;
+	e = csqc_ent_of (vm, OFS_PARM0);
+	if (e <= 0)
+		return;
+	model = CSQC_Client_ModelForIndex ((int)csqc_ent_float (vm, e, CSQC_FLD_MODELINDEX, 0));
+	if (model && cl.num_statics < MAX_STATIC_ENTITIES)
+	{
+		ent = &cl_static_entities[cl.num_statics++];
+		memset (ent, 0, sizeof (*ent));
+		ent->entity_id = cl.num_statics;
+		ent->model = model;
+		ent->frame = (int)csqc_ent_float (vm, e, CSQC_FLD_FRAME, 0);
+		ent->colormap = vid.colormap;
+		ent->skinnum = (int)csqc_ent_float (vm, e, CSQC_FLD_SKIN, 0);
+		// QC .scale/.alpha: 0 means "unset" (1.0 / opaque), like the entity_t fields.
+		scale = csqc_ent_float (vm, e, CSQC_FLD_SCALE, 0);
+		ent->scale = (scale > 0 && scale != 1) ? scale : 0;
+		alpha = csqc_ent_float (vm, e, CSQC_FLD_ALPHA, 0);
+		ent->alpha = (alpha > 0 && alpha < 1) ? alpha : 0;
+		if ((v = csqc_ent_ofs (vm, e, CSQC_Client_FieldOfs (vm, CSQC_FLD_ORIGIN))))
+			VectorCopy (v, ent->origin);
+		if ((v = csqc_ent_ofs (vm, e, CSQC_Client_FieldOfs (vm, CSQC_FLD_ANGLES))))
+			VectorCopy (v, ent->angles);
+		R_AddEfrags (ent);
+	}
+	CSQC_Client_EntFree (vm, e);
 }
 
 /* string(entity e, string key) infokey = #80 - serverinfo (client has no per-ent userinfo) */
@@ -5010,6 +5355,7 @@ static trace_t csqc_world_trace (vec3_t start, vec3_t mins, vec3_t maxs, vec3_t 
 	hull_t *hull;
 	trace_t tr;
 	vec3_t offset, sl, el;
+	float width;
 	qbool box = (mins != NULL && maxs != NULL);
 
 	clip = cl.clipmodels[1];	// world clip model (BSP hulls)
@@ -5023,8 +5369,17 @@ static trace_t csqc_world_trace (vec3_t start, vec3_t mins, vec3_t maxs, vec3_t 
 		return CM_HullTrace (hull, start, end);
 	}
 
-	/* box: hull[1] (player-clip) with an offset by the passed mins/maxs */
-	hull = &clip->hulls[1];
+	/* box: pick the hull by width like SV_HullForEntity (point < 3, player <= 32,
+	   else the large hull), then offset by the chosen hull's clip_mins. A Q1 BSP
+	   only has these three box sizes, so larger/smaller boxes are approximated the
+	   same way the server approximates them. */
+	width = maxs[0] - mins[0];
+	if (width < 3)
+		hull = &clip->hulls[0];
+	else if (width <= 32)
+		hull = &clip->hulls[1];
+	else
+		hull = &clip->hulls[2];
 	VectorSubtract (hull->clip_mins, mins, offset);
 	VectorSubtract (start, offset, sl);
 	VectorSubtract (end, offset, el);
@@ -5315,7 +5670,16 @@ static void csqc_pointcontents (void)
 	vm->globals[OFS_RETURN] = CM_HullPointContents (hull, hull->firstclipnode,
 		&vm->globals[OFS_PARM0]);
 }
-/* float(float yaw, float dist) walkmove = #32 (self, own trace) */
+/* World trace with the entity's own .mins/.maxs box (a point when unset). */
+static trace_t csqc_ent_box_trace (pr1vm_t *vm, int entnum, vec3_t start, vec3_t end)
+{
+	float *mn = csqc_ent_field (vm, entnum, "mins");
+	float *mx = csqc_ent_field (vm, entnum, "maxs");
+	return csqc_world_trace (start, mn, mx, end);
+}
+
+/* float(float yaw, float dist) walkmove = #32 (self, own trace; entity box like
+   FTE, but no step-up/drop or FL_ONGROUND precondition) */
 static void csqc_walkmove (void)
 {
 	pr1vm_t *vm = CSQCVM_Active ();
@@ -5345,7 +5709,7 @@ static void csqc_walkmove (void)
 	end[0] = org[0] + cos (rad) * dist;
 	end[1] = org[1] + sin (rad) * dist;	// yaw 0 = +x, yaw 90 = +y
 	end[2] = org[2];
-	tr = csqc_world_trace (start, NULL, NULL, end);
+	tr = csqc_ent_box_trace (vm, entnum, start, end);
 	if (tr.fraction < 1)
 	{
 		vm->globals[OFS_RETURN] = 0;
@@ -5377,10 +5741,12 @@ static void csqc_droptofloor (void)
 		vm->globals[OFS_RETURN] = 0;
 		return;
 	}
+	// FTE PF_cs_droptofloor (pr_csqc.c): trace the entity box (.mins/.maxs) 512 units down; fail
+	// when nothing is hit or the box is stuck (allsolid).
 	VectorCopy (org, start);
 	end[0] = org[0]; end[1] = org[1]; end[2] = org[2] - 512;
-	tr = csqc_world_trace (start, NULL, NULL, end);
-	if (tr.fraction >= 1 || tr.fraction <= 0)
+	tr = csqc_ent_box_trace (vm, entnum, start, end);
+	if (tr.fraction >= 1 || tr.allsolid)
 	{
 		vm->globals[OFS_RETURN] = 0;
 		return;
@@ -5490,18 +5856,58 @@ static void csqc_strftime (void)
 		return;
 	t = time (NULL);
 	tm = (vm->globals[OFS_PARM0] != 0) ? localtime (&t) : gmtime (&t);
+	if (!tm)
+	{
+		CSQCVM_SetRetStr ("");
+		return;
+	}
+	// Copy the format with only the C89 conversions, which every CRT accepts: an
+	// unknown one (or a trailing '%') reaches the MSVC invalid-parameter handler
+	// and aborts the process. %R/%F/%T/%D are expanded (FTE does %R/%F the same
+	// way for msvc); anything else is escaped so it prints literally.
 	for (i = 1; i < vm->argc && o < (int)sizeof (buf) - 1; i++)
 	{
 		p = CSQC_Client_GetString (vm, *(int *)&vm->globals[OFS_PARM0 + i * 3]);
 		if (!p)
 			continue;
-		// msvc compatibility (like FTE): %R/%F
-		if (!strcmp (p, "%R"))
-			p = "%H:%M";
-		else if (!strcmp (p, "%F"))
-			p = "%Y-%m-%d";
-		o += snprintf (buf + o, sizeof (buf) - o, "%s", p);
+		for (; *p && o < (int)sizeof (buf) - 1; p++)
+		{
+			const char *rep = NULL;
+			char conv[4];
+
+			if (*p != '%')
+			{
+				buf[o++] = *p;
+				continue;
+			}
+			p++;
+			if (*p == 'R')
+				rep = "%H:%M";
+			else if (*p == 'F')
+				rep = "%Y-%m-%d";
+			else if (*p == 'T')
+				rep = "%H:%M:%S";
+			else if (*p == 'D')
+				rep = "%m/%d/%y";
+			else if (*p && strchr ("aAbBcdHIjmMpSUwWxXyYZ%", *p))
+			{
+				conv[0] = '%';
+				conv[1] = *p;
+				conv[2] = 0;
+				rep = conv;
+			}
+			else
+			{
+				rep = "%%";
+				p--;	// re-read the next character (or the terminator) as text
+			}
+			if (o + (int)strlen (rep) >= (int)sizeof (buf))
+				break;
+			strcpy (buf + o, rep);
+			o += (int)strlen (rep);
+		}
 	}
+	buf[o] = 0;
 	if (!o)
 	{
 		CSQCVM_SetRetStr ("");
@@ -5512,7 +5918,7 @@ static void csqc_strftime (void)
 		if (strftime (out, sizeof (out), buf, tm))
 			CSQCVM_SetRetStr (out);
 		else
-			CSQCVM_SetRetStr (buf);	// invalid format - return as is
+			CSQCVM_SetRetStr ("");
 	}
 }
 
@@ -5645,18 +6051,25 @@ static void csqc_findkeysforcommand (void)
 	pr1vm_t *vm = CSQCVM_Active ();
 	char *cmd = CSQCVM_Str (OFS_PARM0);
 	char buf[512];
-	int i, o = 0;
+	int i, n = 0, o = 0;
 	if (!vm)
 		return;
 	buf[0] = 0;
+	// FTE PF_cl_findkeysforcommand: at most 16 keys, and always at least two
+	// entries, padded with '-1' (callers test argv(0)/argv(1) against -1).
 	if (cmd && cmd[0])
 	{
-		for (i = 0; i < UNKNOWN + 256 && o < (int)sizeof (buf) - 8; i++)
+		for (i = 0; i < UNKNOWN + 256 && n < 16 && o < (int)sizeof (buf) - 16; i++)
 		{
 			if (keybindings[i] && !strcmp (keybindings[i], cmd))
+			{
 				o += snprintf (buf + o, sizeof (buf) - o, " '%d'", CSQC_Client_KeynumToQC (i));
+				n++;
+			}
 		}
 	}
+	for (; n < 2; n++)
+		o += snprintf (buf + o, sizeof (buf) - o, " '-1'");
 	CSQCVM_SetRetStr (buf);
 }
 
@@ -5737,7 +6150,7 @@ static void csqc_pointsound (void)
 	(void)pitchpct;
 	if (!sample || !sample[0])
 		return;
-	sfx = S_PrecacheSound (sample);
+	sfx = csqc_precache_sfx (sample);
 	if (sfx)
 		S_StartSound (0, 0, sfx, org, vm->globals[OFS_PARM0 + 6], vm->globals[OFS_PARM0 + 9]);
 }
@@ -5770,8 +6183,14 @@ static void csqc_deltalisten (void)
 		return;
 	model = CSQC_Client_GetString (vm, *(int *)&vm->globals[OFS_PARM0]);
 	func = *(int *)&vm->globals[OFS_PARM1];
+	// FTE PF_DeltaListen: a bad function index is reported and ignored; it does
+	// not unregister the existing listener (func 0 still means "remove").
 	if (func < 0 || func >= vm->progs->numfunctions)
-		func = 0;	// invalid pointer - removal/no-op
+	{
+		Con_Printf ("deltalisten: bad function index\n");
+		vm->globals[OFS_RETURN] = 0;
+		return;
+	}
 	CSQC_Client_DeltaListen (model, func, (int)vm->globals[OFS_PARM2]);
 	vm->globals[OFS_RETURN] = 0;
 }
@@ -5909,7 +6328,7 @@ static void csqc_bsp_nop_vec (void)
 }
 
 /*
- Introspection/console. Implemented: #294 checkcommand (cmd->1, cvar->3, no alias->0),
+ Introspection/console. Implemented: #294 checkcommand (cmd->1, alias->2, cvar->3),
  #295 argescape (own quoting), #607 isfunction. No-op: #391/#392/#393/#394 (FTE
  multi-console has no ezq analog), #605 callfunction (reentrant exec from a builtin
  is unsupported).
@@ -5924,6 +6343,8 @@ static void csqc_checkcommand (void)
 		return;
 	if (name && name[0] && Cmd_Exists (name))
 		vm->globals[OFS_RETURN] = 1;
+	else if (name && name[0] && Cmd_FindAlias (name))
+		vm->globals[OFS_RETURN] = 2;	// FTE PF_checkcommand: command 1, alias 2, cvar 3
 	else if (name && name[0] && Cvar_Find (name))
 		vm->globals[OFS_RETURN] = 3;
 	else
@@ -6004,6 +6425,20 @@ static void csqc_cl_rotatemoves (void)
  subsystems (`Mod_*Skin`, `CL_AddDecal`), readback pics or `lfield_*` constants for
  `cl_dlights[]`. Registered so the module does not hit "Bad builtin".
 */
+/*
+ float(string strname, float accessmode) fopen = #110
+ The client has no file I/O for modules, so every open fails. FTE's failure value is
+ -1; 0 is a valid FTE handle, and a module checking `fh >= 0` would think the
+ file opened.
+*/
+static void csqc_fopen_unavailable (void)
+{
+	pr1vm_t *vm = CSQCVM_Active ();
+	if (!vm)
+		return;
+	vm->globals[OFS_RETURN] = -1;
+}
+
 static void csqc_light_nop_ret0 (void)
 {
 	pr1vm_t *vm = CSQCVM_Active ();
@@ -6701,7 +7136,7 @@ void CSQCVM_RegisterBuiltins (pr1vm_t *vm)
 	PR1VM_RegisterBuiltin (vm, 741, (builtin_t)csqc_vmrest_nop); // #741 void() controller_rumble
 	PR1VM_RegisterBuiltin (vm, 742, (builtin_t)csqc_vmrest_nop); // #742 void() controller_rumbletriggers
 	// FLOAT0 stubs - type-correct no-op.
-	PR1VM_RegisterBuiltin (vm, 110, (builtin_t)csqc_light_nop_ret0); // #110 float(string strname, float accessmode) fopen (FRIK_FILE)
+	PR1VM_RegisterBuiltin (vm, 110, (builtin_t)csqc_fopen_unavailable); // #110 float(string strname, float accessmode) fopen (FRIK_FILE)
 	PR1VM_RegisterBuiltin (vm, 200, (builtin_t)csqc_getmodelindex); // #200 float(string modelname, optional float queryonly) getmodelindex
 	PR1VM_RegisterBuiltin (vm, 201, (builtin_t)csqc_light_nop_ret0); // #201 __variant(float prnum, string funcname, ...) externcall - no-op in classic v6: variant exchange between VMs (no v6 types)
 	PR1VM_RegisterBuiltin (vm, 202, (builtin_t)csqc_light_nop_ret0); // #202 float(string progsname) addprogs
@@ -6782,6 +7217,8 @@ void CSQCVM_RegisterBuiltins (pr1vm_t *vm)
 	PR1VM_RegisterBuiltin (vm, CSQC_BUILTIN_CHECKBUILTIN, (builtin_t)csqc_checkbuiltin); // #0 checkbuiltin
 	PR1VM_RegisterBuiltin (vm, CSQC_BUILTIN_NAMED_UNKNOWN, (builtin_t)csqc_named_unknown); // #0 unknown name: call aborts
 	PR1VM_RegisterBuiltin (vm, CSQC_BUILTIN_ARGC, (builtin_t)csqc_argc); // #0 float() argc
+	PR1VM_RegisterBuiltin (vm, CSQC_BUILTIN_SERVERKEYFLOAT, (builtin_t)csqc_serverkeyfloat); // #0 float(string key, optional float assumevalue) serverkeyfloat
+	PR1VM_RegisterBuiltin (vm, CSQC_BUILTIN_GETPLAYERKEYFLOAT, (builtin_t)csqc_getplayerkeyfloat); // #0 float(float playernum, string keyname, optional float assumevalue) getplayerkeyfloat
 	PR1VM_MarkBuiltinStub (vm, CSQC_BUILTIN_NAMED_UNKNOWN);	// unresolved name -> checkbuiltin must be 0 (FTE parity)
 
 	// Mark no-op stubs so checkbuiltin/checkextension are honest.

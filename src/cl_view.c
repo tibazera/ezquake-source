@@ -1054,6 +1054,7 @@ static void V_CalcRefdef(void)
 	// #303: apply the CSQC module's view properties before placing the viewmodel,
 	// otherwise the weapon takes the engine origin and lags behind the world
 	// (V_AddViewWeapon below).
+	CSQC_Client_SnapshotEngineView();	// clearscene restores this (S63)
 	CSQC_Client_ApplyViewProps();
 
 	// meag: really viewheight shouldn't be here, but it was incorrectly passed for years instead of bob,

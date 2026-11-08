@@ -28,6 +28,8 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include "input.h"
 #ifndef CLIENTONLY
 #include "csqc_client.h"
+// Keys whose last event reached the engine (Key_EventEx) as a key-down; see S62.
+static qbool s_engine_keydown[UNKNOWN + 256];
 #endif
 
 #ifdef _WIN32
@@ -2456,7 +2458,11 @@ void Key_Event (int key, qbool down)
 		{
 			if (key_dest == key_game)
 			{
-				if (CSQC_Client_InputEvent (down ? IE_KEYDOWN : IE_KEYUP, key, unichar, 0))
+				// A key-up the module swallows must still reach the engine when the
+				// engine saw the matching key-down: otherwise a +bind stays active
+				// and keydown[] (shift/ctrl/alt) goes stale (review S62).
+				if (CSQC_Client_InputEvent (down ? IE_KEYDOWN : IE_KEYUP, key, unichar, 0)
+					&& (down || !s_engine_keydown[key]))
 					return;
 			}
 			else if (!down)
@@ -2469,6 +2475,10 @@ void Key_Event (int key, qbool down)
 	}
 #endif
 
+#ifndef CLIENTONLY
+	if (key >= 0 && key < (int)(sizeof (s_engine_keydown) / sizeof (s_engine_keydown[0])))
+		s_engine_keydown[key] = down;
+#endif
 	Key_EventEx (key, unichar, down);
 
 	// Store this as we may need it for subsequent SDL_TextInput event

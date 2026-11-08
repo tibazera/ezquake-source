@@ -58,7 +58,7 @@ char *CSQC_Client_GetString (struct pr1vm_s *vm, int num);
 // network numbers are kept in a number->slot map (svc 76/92). Slot 0 = world.
 int CSQC_Client_EntAlloc (struct pr1vm_s *vm);			// first free pool slot (own) / 0
 int CSQC_Client_EntNum (struct pr1vm_s *vm, int raw);		// raw (N*edict_size) -> pool slot; OOB -> world(0)
-void CSQC_Client_EntFree (struct pr1vm_s *vm, int slot);	// free own entity (network untouched)
+void CSQC_Client_EntFree (struct pr1vm_s *vm, int slot);	// free a non-world entity (own or network; FTE PF_cs_remove)
 int CSQC_Client_NetAllocSlot (struct pr1vm_s *vm);		// slot without s_own (network receive; vm zeroes the slot)
 void CSQC_Client_NetFreeSlot (int slot, int number);		// free slot + numslot
 int CSQC_Client_NumToSlot (int number);					// number->slot map / 0
@@ -110,6 +110,8 @@ typedef enum
 	CSQC_FLD_FLAGS,
 	CSQC_FLD_OWNER,
 	CSQC_FLD_DRAWMASK,
+	CSQC_FLD_FRAME2,
+	CSQC_FLD_LERPFRAC,
 	CSQC_FLD_COUNT
 } csqc_field_id_t;
 
@@ -139,6 +141,7 @@ void CSQC_Client_GetListener (float *origin, float *forward, float *right, float
 // in V_CalcRefdef (cl_view.c). Returns whether the property was recognized (1/0).
 qbool CSQC_Client_SetViewProperty (int prop, int argc, const float *args);
 void CSQC_Client_ApplyViewProps (void);
+void CSQC_Client_SnapshotEngineView (void);
 void CSQC_Client_ResetViewProps (void);	// #300 clearscene: reset view properties
 // Gates the engine sbar/HUD (#303 VF_DRAWENGINESBAR) and crosshair
 // (VF_DRAWCROSSHAIR) behind the CSQC takeover; clearscene defaults both to false.
@@ -170,6 +173,7 @@ int CSQC_Client_Active (void);			// module loaded and not in error
 void CSQC_Client_ConnectCheck (void);	// after full serverinfo: load + CSQC_Init
 void CSQC_Client_Disconnect (void);		// CSQC_Shutdown + unload + command removal
 void CSQC_Client_Update (void);			// every 2D frame: WorldLoaded-once + UpdateView
+void CSQC_Client_PollDownload (void);		// every client frame: deferred csprogs load + module download queue
 
 // Renderscene takeover: when a CSQC module is active it owns the 3D scene as in
 // FTE -- CSQC_UpdateView runs in the 3D phase, #300/#301 build cl_visents, and
@@ -251,7 +255,9 @@ void CSQC_Client_SetCursorMode (qbool usecursor, const char *image,
 	float hotspot_x, float hotspot_y, float scale);
 qbool CSQC_Client_CSQCCursor (void);		// usecursor=1 && module loaded && in game
 void CSQC_Client_DrawCursor (void);			// draw the module cursor (SCR_DrawCursor)
-void CSQC_Client_GetCursorPos (float *x, float *y);	// pointer position (#344)
+void CSQC_Client_GetCursorPos (float *x, float *y);
+void CSQC_Client_AccumMouseDelta (float dx, float dy);
+void CSQC_Client_TakeMouseDelta (float *dx, float *dy);	// pointer position (#344)
 void CSQC_Client_ScaleCursorDelta (float *x, float *y);	// render-2D -> vid.conwidth (mouse delta)
 void CSQC_Client_SetSensitivityScale (float scale);	// #346 setsensitivityscaler
 float CSQC_Client_SensitivityScale (void);	// sensitivity multiplier (1 when inactive)
@@ -353,6 +359,10 @@ void CSQCVM_RegisterBuiltins (struct pr1vm_s *vm);
 #define CSQC_BUILTIN_CHECKBUILTIN	1023
 // `argc` (FTE exposes it only as a `#0` name, not as a numbered slot).
 #define CSQC_BUILTIN_ARGC			1021
+// `serverkeyfloat` is also exposed by FTE only as a `#0` name.
+#define CSQC_BUILTIN_SERVERKEYFLOAT	1020
+// `getplayerkeyfloat` likewise (FTE: #0 name only).
+#define CSQC_BUILTIN_GETPLAYERKEYFLOAT	1019
 // Aborting stub for an unknown `#0` name: calling it fails the module like FTE's
 // slot 0 (PF_Fixme); checkbuiltin still reports 0.
 #define CSQC_BUILTIN_NAMED_UNKNOWN	1022
@@ -376,6 +386,9 @@ void PR1VM_ClientSetString (struct pr1vm_s *vm, int *address, char *s);
 // a slot (soft no-op on a bad/repeated argument); FreeStringPool releases every slot
 // (called before the state memset on load/disconnect).
 qbool CSQC_Client_ZoneStore (struct pr1vm_s *vm, int *address, char *buf);
+// Sensitive-cvar read guard (rcon/password class), shared by the cvar builtins
+// and the autocvar_* globals.
+qbool CSQC_CvarReadDenied (const char *name);
 void CSQC_Client_UnzoneString (struct pr1vm_s *vm, int num);
 void CSQC_Client_FreeStringPool (void);
 
